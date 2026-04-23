@@ -121,6 +121,7 @@ TOOLTIPS = {
     "spoc_output_csv": "CSV path that the converter should write before the guided analysis starts.",
     "spoc_template": "Command template used to run the SPOC converter. Use {python}, {script}, {input}, and {output} placeholders.",
     "pol_csv": "Polarimetry CSV: either raw/basic polarimetry or a precomputed analysis-frame CSV.",
+    "use_polarimetry": "Guided mode only. When unchecked, run only the TESS frequency search and global multisinusoid fit, skipping all polarimetry steps.",
     "pol_product": "Polarimetry product to analyze: nm, resid_nm_pchip, or pw_resid_nm_pchip.",
     "save_generated_frame": "Save the generated analysis-frame CSV when the input polarimetry is raw/basic.",
     "generated_analysis_dir": "Optional directory for the generated analysis-frame CSV. Blank means next to the polarimetry file.",
@@ -271,6 +272,7 @@ class GuidedAnalysisGUI(tk.Tk):
         self._poll_log_queue()
         self._update_tess_mode_state()
         self._update_analysis_mode_state()
+        self._update_polarimetry_state()
         self._update_joint_weight_mode_state()
         self._update_phase_zero_mode_state()
         self._update_run_plan_preview()
@@ -299,6 +301,7 @@ class GuidedAnalysisGUI(tk.Tk):
         self.spoc_template = tk.StringVar(value="{python} -u {script} --input {input} --output {output}")
 
         # polarimetry / output
+        self.use_polarimetry = tk.BooleanVar(value=True)
         self.pol_csv = tk.StringVar(value="target_IND.csv")
         self.pol_product = tk.StringVar(value="resid_nm_pchip")
         self.save_generated_frame = tk.BooleanVar(value=True)
@@ -554,14 +557,16 @@ class GuidedAnalysisGUI(tk.Tk):
         pol.grid(row=1, column=0, sticky="ew", padx=8, pady=6)
         for c in range(4):
             pol.columnconfigure(c, weight=1)
-        self._entry(pol, "Polarimetry CSV", self.pol_csv, 0, 0, browse="file", tooltip_key="pol_csv", filetypes=[("CSV files", "*.csv"), ("All files", "*.*")])
-        self._combo(pol, "POL product", self.pol_product, ["nm", "resid_nm_pchip", "pw_resid_nm_pchip"], 1, 0, tooltip_key="pol_product")
-        self._check(pol, "Save generated analysis frame", self.save_generated_frame, 1, 2, tooltip_key="save_generated_frame", command=self._update_run_plan_preview)
-        self._entry(pol, "Generated analysis dir", self.generated_analysis_dir, 2, 0, browse="dir", tooltip_key="generated_analysis_dir")
-        self._entry(pol, "Output root", self.outroot, 3, 0, browse="dir", tooltip_key="outroot")
-        self._check(pol, "Inline plots", self.show_plots_inline, 3, 2, tooltip_key="show_inline", command=self._update_run_plan_preview)
-        self._spin(pol, "Verbose", self.verbose, 0, 5, 4, 0, tooltip_key="verbose")
-        self._spin(pol, "LSQ verbose", self.lsq_verbose, 0, 5, 4, 2, tooltip_key="lsq_verbose")
+        self.use_polarimetry_chk = self._check(pol, "Use polarimetry", self.use_polarimetry, 0, 0, tooltip_key="use_polarimetry", command=self._update_polarimetry_state, colspan=2)
+
+        self.pol_csv_entry = self._entry(pol, "Polarimetry CSV", self.pol_csv, 1, 0, browse="file", tooltip_key="pol_csv", filetypes=[("CSV files", "*.csv"), ("All files", "*.*")])
+        self.pol_product_combo = self._combo(pol, "POL product", self.pol_product, ["nm", "resid_nm_pchip", "pw_resid_nm_pchip"], 2, 0, tooltip_key="pol_product")
+        self.save_generated_frame_chk = self._check(pol, "Save generated analysis frame", self.save_generated_frame, 2, 2, tooltip_key="save_generated_frame", command=self._update_run_plan_preview)
+        self.generated_analysis_dir_entry = self._entry(pol, "Generated analysis dir", self.generated_analysis_dir, 3, 0, browse="dir", tooltip_key="generated_analysis_dir")
+        self._entry(pol, "Output root", self.outroot, 4, 0, browse="dir", tooltip_key="outroot")
+        self._check(pol, "Inline plots", self.show_plots_inline, 4, 2, tooltip_key="show_inline", command=self._update_run_plan_preview)
+        self._spin(pol, "Verbose", self.verbose, 0, 5, 5, 0, tooltip_key="verbose")
+        self._spin(pol, "LSQ verbose", self.lsq_verbose, 0, 5, 5, 2, tooltip_key="lsq_verbose")
 
         main = ttk.LabelFrame(root, text="Main analysis settings")
         main.grid(row=2, column=0, sticky="ew", padx=8, pady=6)
@@ -655,9 +660,15 @@ class GuidedAnalysisGUI(tk.Tk):
             "guided": [main, extras],
             "joint": [jointf],
         }
+        self.polarimetry_toggle_widgets = [
+            getattr(self, "pol_csv_entry", None),
+            getattr(self, "pol_product_combo", None),
+            getattr(self, "save_generated_frame_chk", None),
+            getattr(self, "generated_analysis_dir_entry", None),
+        ]
 
         self._trace_vars([
-            self.guided_script, self.joint_script, self.converter_script, self.analysis_mode,
+            self.guided_script, self.joint_script, self.converter_script, self.analysis_mode, self.use_polarimetry,
             self.pol_csv, self.pol_product, self.save_generated_frame, self.generated_analysis_dir,
             self.outroot, self.show_plots_inline, self.verbose, self.lsq_verbose,
             self.fmin, self.fmax, self.tess_grid_mode, self.tess_snr_stop, self.max_tess_modes,
@@ -674,6 +685,7 @@ class GuidedAnalysisGUI(tk.Tk):
             self.joint_scale_free_basis, self.joint_manual_w_tess, self.joint_manual_w_pol,
         ], self._update_run_plan_preview)
         self._trace_vars([self.analysis_mode], self._update_analysis_mode_state)
+        self._trace_vars([self.use_polarimetry], self._update_polarimetry_state)
         self._trace_vars([self.joint_weight_mode], self._update_joint_weight_mode_state)
         self._trace_vars([self.phase_zero_mode], self._update_phase_zero_mode_state)
 
@@ -872,6 +884,26 @@ class GuidedAnalysisGUI(tk.Tk):
 
         self._update_run_plan_preview()
 
+    def _update_polarimetry_state(self):
+        guided_mode = (self.analysis_mode.get().strip() == "guided_analysis")
+        use_pol = guided_mode and bool(self.use_polarimetry.get())
+        try:
+            self.use_polarimetry_chk.configure(state=("normal" if guided_mode else "disabled"))
+        except Exception:
+            pass
+        for w in getattr(self, "polarimetry_toggle_widgets", []):
+            if w is None:
+                continue
+            try:
+                if hasattr(w, "configure"):
+                    if w.__class__.__name__.lower().endswith("combobox"):
+                        w.configure(state=("readonly" if use_pol else "disabled"))
+                    else:
+                        w.configure(state=("normal" if use_pol else "disabled"))
+            except Exception:
+                pass
+        self._update_run_plan_preview()
+
     def _update_joint_weight_mode_state(self):
         mode = self.joint_weight_mode.get().strip().lower()
         scale_state = "normal" if mode == "scale_free" else "disabled"
@@ -933,7 +965,8 @@ class GuidedAnalysisGUI(tk.Tk):
 
     def _build_config(self) -> dict:
         channels = self._channels_list()
-        if not channels:
+        use_polarimetry_active = (self.analysis_mode.get().strip() == "guided_analysis") and bool(self.use_polarimetry.get())
+        if use_polarimetry_active and not channels:
             raise ValueError("Select at least one polarimetric channel.")
         cfg = {
             "guided_script": self.guided_script.get().strip(),
@@ -946,6 +979,7 @@ class GuidedAnalysisGUI(tk.Tk):
             "pipeline_recursive": bool(self.pipeline_recursive.get()),
             "pipeline_flux": self.pipeline_flux.get().strip(),
             "tess_force_y_col": self.tess_force_y_col.get().strip(),
+            "use_polarimetry": use_polarimetry_active,
             "pol_csv": self.pol_csv.get().strip(),
             "pol_product": self.pol_product.get().strip(),
             "save_generated_frame": bool(self.save_generated_frame.get()),
@@ -965,7 +999,7 @@ class GuidedAnalysisGUI(tk.Tk):
             "search_window_mult": float(self.search_window_mult.get()),
             "noise_ks": float(self.noise_ks.get()),
             "noise_bins": int(self.noise_bins.get()),
-            "channels": channels,
+            "channels": (channels if use_polarimetry_active else []),
             "use_offsets": bool(self.use_offsets.get()),
             "use_slopes": bool(self.use_slopes.get()),
             "group_mode": self.group_mode.get().strip(),
@@ -1008,7 +1042,7 @@ class GuidedAnalysisGUI(tk.Tk):
                 raise ValueError("Joint-search script path is empty.")
         else:
             raise ValueError(f"Unsupported analysis mode: {cfg['analysis_mode']}")
-        if not cfg["pol_csv"]:
+        if cfg["use_polarimetry"] and not cfg["pol_csv"]:
             raise ValueError("Polarimetry CSV path is empty.")
         if not cfg["outroot"]:
             raise ValueError("Output root is empty.")
@@ -1050,9 +1084,10 @@ class GuidedAnalysisGUI(tk.Tk):
                 lines.append("  " + quote_cmd(cfg["converter_command"]))
                 lines.append(f"Converted CSV: {cfg['tess_csv']}")
             lines.extend([
-                f"Polarimetry CSV: {cfg['pol_csv']}",
-                f"POL product: {cfg['pol_product']}",
-                f"Channels: {', '.join(cfg['channels'])}",
+                f"Use polarimetry: {cfg['use_polarimetry']}",
+                f"Polarimetry CSV: {cfg['pol_csv'] if cfg['use_polarimetry'] else '(not used)'}",
+                f"POL product: {cfg['pol_product'] if cfg['use_polarimetry'] else '(not used)'}",
+                f"Channels: {', '.join(cfg['channels']) if cfg['use_polarimetry'] else '(none)'}",
                 f"Output root: {cfg['outroot']}",
                 f"Phase zero: {cfg['phase_zero_mode']}" + (f" (BTJD={cfg['phase_zero_btjd']})" if cfg['phase_zero_mode']=='custom_btjd' else (" (absolute TESS BTJD=0.0)" if cfg['phase_zero_mode']=='btjd_zero' else "")),
             ])
@@ -1152,7 +1187,8 @@ if CFG["analysis_mode"] == "guided_analysis":
 
     mod.TESS_FORCE_Y_COL = CFG["tess_force_y_col"] if CFG["tess_force_y_col"] else None
 
-    mod.POL_CSV = Path(CFG["pol_csv"])
+    mod.USE_POLARIMETRY = bool(CFG["use_polarimetry"])
+    mod.POL_CSV = Path(CFG["pol_csv"]) if CFG["pol_csv"] else Path(".")
     mod.POL_PRODUCT = CFG["pol_product"]
     mod.POL_SAVE_GENERATED_ANALYSIS_FRAME = bool(CFG["save_generated_frame"])
     mod.POL_GENERATED_ANALYSIS_DIR = (None if not CFG["generated_analysis_dir"] else str(CFG["generated_analysis_dir"]))
@@ -1173,7 +1209,7 @@ if CFG["analysis_mode"] == "guided_analysis":
     mod.POL_SEARCH_WINDOW_MULT = float(CFG["search_window_mult"])
     mod.POL_LOCAL_NOISE_KS = float(CFG["noise_ks"])
     mod.POL_LOCAL_NOISE_SIDE_BINS = int(CFG["noise_bins"])
-    mod.POL_CHANNELS = list(CFG["channels"])
+    mod.POL_CHANNELS = list(CFG["channels"]) if CFG["use_polarimetry"] else []
     mod.USE_POL_NIGHT_OFFSETS = bool(CFG["use_offsets"])
     mod.USE_POL_NIGHT_SLOPES = bool(CFG["use_slopes"])
     mod.POL_NIGHT_GROUP_MODE = CFG["group_mode"]
