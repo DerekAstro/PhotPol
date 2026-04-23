@@ -1,6 +1,7 @@
 # Auto-exported companion script from notebook v6
 
 import argparse
+import matplotlib
 import numpy as np
 import pandas as pd
 from dataclasses import dataclass
@@ -952,6 +953,97 @@ def local_snr_from_power(freqs: np.ndarray, power: np.ndarray, f_fit: float, T: 
     snr = float(np.sqrt(W)) if np.isfinite(W) and W > 0 else np.nan
     return snr, W
 
+
+def make_local_frequency_grid(center: float, half_window: float, df: float,
+                              fmin: float = FMIN, fmax: float = FMAX,
+                              max_points: int = 1201) -> np.ndarray:
+    f_lo = max(float(fmin), float(center) - float(half_window))
+    f_hi = min(float(fmax), float(center) + float(half_window))
+    if not np.isfinite(df) or df <= 0:
+        raise ValueError("Local-grid spacing must be finite and positive.")
+    if f_hi <= f_lo:
+        return np.array([float(center)], dtype=float)
+    n = int(np.floor((f_hi - f_lo) / df)) + 1
+    n = max(n, 11)
+    if max_points is not None and n > int(max_points):
+        n = int(max_points)
+    return np.linspace(f_lo, f_hi, n, dtype=float)
+
+def local_noise_floor_from_local_periodogram(freqs: np.ndarray, power: np.ndarray, f_fit: float,
+                                             guard_half: float, side_half: float,
+                                             trim_top_frac: float = TRIM_TOP_FRAC,
+                                             min_points: int = 12) -> tuple[float, int]:
+    freqs = np.asarray(freqs, dtype=float)
+    power = np.asarray(power, dtype=float)
+    if freqs.size < 5 or power.size != freqs.size:
+        return np.nan, 0
+    expand = 1.0
+    n_used = 0
+    for _ in range(6):
+        outer = guard_half + expand * side_half
+        m = np.isfinite(power) & (np.abs(freqs - f_fit) >= guard_half) & (np.abs(freqs - f_fit) <= outer)
+        vals = power[m]
+        n_used = int(np.count_nonzero(np.isfinite(vals)))
+        noise = trimmed_median(vals, trim_top_frac=trim_top_frac)
+        if np.isfinite(noise) and (noise > 0) and (n_used >= min_points):
+            return float(noise), n_used
+        expand *= 1.5
+    return np.nan, n_used
+
+def joint_tess_local_snr_from_fit(ts: TimeSeries, f_fit: float, T_noise: float, ks: float,
+                                  trim_top_frac: float = TRIM_TOP_FRAC) -> tuple[float, float]:
+    T_noise = max(float(T_noise), 1e-8)
+    res = 1.0 / T_noise
+    guard_half = max(KFIT * (2.0 / T_noise), 2.0 * res)
+    side_half = max(float(ks) * res, 4.0 * res)
+    half_window = guard_half + side_half
+    df_local = max(res / 5.0, 1e-8)
+    freqs_local = make_local_frequency_grid(f_fit, half_window, df_local, max_points=1201)
+    power_local = lomb_scargle_power(ts, freqs_local)
+    if not np.isfinite(power_local).any():
+        return np.nan, np.nan
+    m_peak = np.isfinite(power_local) & (np.abs(freqs_local - f_fit) <= guard_half)
+    if np.any(m_peak):
+        p0 = float(np.nanmax(power_local[m_peak]))
+    else:
+        j = int(np.nanargmin(np.abs(freqs_local - f_fit)))
+        p0 = float(power_local[j])
+    noise, _ = local_noise_floor_from_local_periodogram(
+        freqs_local, power_local, f_fit=f_fit, guard_half=guard_half,
+        side_half=side_half, trim_top_frac=trim_top_frac
+    )
+    W = float(p0 / noise) if (np.isfinite(noise) and noise > 0) else np.nan
+    snr = float(np.sqrt(W)) if np.isfinite(W) and W > 0 else np.nan
+    return snr, W
+
+def joint_pol_local_snr_from_fit(ts: TimeSeries, f_fit: float, T_noise: float, ks: float,
+                                 baseline_matrix: np.ndarray,
+                                 trim_top_frac: float = TRIM_TOP_FRAC) -> tuple[float, float]:
+    T_noise = max(float(T_noise), 1e-8)
+    res = 1.0 / T_noise
+    # Slightly wider than the TESS version because the polarimetric window is nastier.
+    guard_half = max(KFIT * (2.0 / T_noise), 3.0 * res)
+    side_half = max(float(ks) * res, 6.0 * res)
+    half_window = guard_half + side_half
+    df_local = max(res / 5.0, 1e-8)
+    freqs_local = make_local_frequency_grid(f_fit, half_window, df_local, max_points=1601)
+    power_local = nuisance_periodogram(ts, freqs_local, baseline_matrix=baseline_matrix)
+    if not np.isfinite(power_local).any():
+        return np.nan, np.nan
+    m_peak = np.isfinite(power_local) & (np.abs(freqs_local - f_fit) <= guard_half)
+    if np.any(m_peak):
+        p0 = float(np.nanmax(power_local[m_peak]))
+    else:
+        j = int(np.nanargmin(np.abs(freqs_local - f_fit)))
+        p0 = float(power_local[j])
+    noise, _ = local_noise_floor_from_local_periodogram(
+        freqs_local, power_local, f_fit=f_fit, guard_half=guard_half,
+        side_half=side_half, trim_top_frac=trim_top_frac
+    )
+    W = float(p0 / noise) if (np.isfinite(noise) and noise > 0) else np.nan
+    snr = float(np.sqrt(W)) if np.isfinite(W) and W > 0 else np.nan
+    return snr, W
+
 def prewhiten(ts: TimeSeries, model: np.ndarray) -> TimeSeries:
     return TimeSeries(
         t=ts.t.copy(),
@@ -1277,10 +1369,8 @@ def run_joint_extraction_one(tess0: TimeSeries, pol0: TimeSeries, outdir: Path,
         fit_po = fit_frequency_with_design(pol, f0=f_n, T=T2, kfit=KFIT, fmin=FMIN, fmax=FMAX,
                                            baseline_matrix=B_po, n_steps=2001)
 
-        P1_loc = lomb_scargle_power(tess, freqs_coarse)
-        P2_loc = nuisance_periodogram(pol, freqs_coarse, baseline_matrix=B_po)
-        snr_te, W_te = local_snr_from_power(freqs_coarse, P1_loc, fit_te["best_f"], T=T1, ks=KS_TESS)
-        snr_po, W_po = local_snr_from_power(freqs_coarse, P2_loc, fit_po["best_f"], T=T2, ks=KS_POL)
+        snr_te, W_te = joint_tess_local_snr_from_fit(tess, fit_te["best_f"], T_noise=T1, ks=KS_TESS)
+        snr_po, W_po = joint_pol_local_snr_from_fit(pol, fit_po["best_f"], T_noise=T2, ks=KS_POL, baseline_matrix=B_po)
 
         if (np.isfinite(snr_te) and np.isfinite(snr_po)) and (snr_te < SNR_STOP) and (snr_po < SNR_STOP):
             print(f"[{pol.name} iter {n}] Both SNR < {SNR_STOP:.2f}; stopping.")
