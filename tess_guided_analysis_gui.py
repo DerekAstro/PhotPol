@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import re
 from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
@@ -125,6 +126,7 @@ TOOLTIPS = {
     "pol_product": "Polarimetry product to analyze: nm, resid_nm_pchip, or pw_resid_nm_pchip.",
     "save_generated_frame": "Save the generated analysis-frame CSV when the input polarimetry is raw/basic.",
     "generated_analysis_dir": "Optional directory for the generated analysis-frame CSV. Blank means next to the polarimetry file.",
+    "output_target_subdir": "If enabled, place analysis outputs inside a subdirectory named after the target to keep runs separated and reduce accidental overwriting.",
     "outroot": "Top-level output directory. The script writes subdirectories like tess/, q/, u/, p/, and optional preprocessing diagnostics here.",
     "show_inline": "Inline plots / interactively. Usually best left off in GUI mode.",
     "verbose": "General verbosity level printed by the guided-analysis script.",
@@ -212,6 +214,7 @@ class ToolTip:
             relief="solid",
             borderwidth=1,
             background="#fff8dc",
+            foreground="#111111",
             padx=6,
             pady=4,
             wraplength=self.wraplength,
@@ -306,6 +309,7 @@ class GuidedAnalysisGUI(tk.Tk):
         self.pol_product = tk.StringVar(value="resid_nm_pchip")
         self.save_generated_frame = tk.BooleanVar(value=True)
         self.generated_analysis_dir = tk.StringVar(value="")
+        self.output_target_subdir = tk.BooleanVar(value=False)
         self.outroot = tk.StringVar(value="tess_guided_outputs")
         self.show_plots_inline = tk.BooleanVar(value=False)
         self.verbose = tk.IntVar(value=1)
@@ -563,6 +567,7 @@ class GuidedAnalysisGUI(tk.Tk):
         self.pol_product_combo = self._combo(pol, "POL product", self.pol_product, ["nm", "resid_nm_pchip", "pw_resid_nm_pchip"], 2, 0, tooltip_key="pol_product")
         self.save_generated_frame_chk = self._check(pol, "Save generated analysis frame", self.save_generated_frame, 2, 2, tooltip_key="save_generated_frame", command=self._update_run_plan_preview)
         self.generated_analysis_dir_entry = self._entry(pol, "Generated analysis dir", self.generated_analysis_dir, 3, 0, browse="dir", tooltip_key="generated_analysis_dir")
+        self.output_target_subdir_chk = self._check(pol, "Place outputs in target subdirectory", self.output_target_subdir, 3, 2, tooltip_key="output_target_subdir", command=self._update_run_plan_preview, colspan=2)
         self._entry(pol, "Output root", self.outroot, 4, 0, browse="dir", tooltip_key="outroot")
         self._check(pol, "Inline plots", self.show_plots_inline, 4, 2, tooltip_key="show_inline", command=self._update_run_plan_preview)
         self._spin(pol, "Verbose", self.verbose, 0, 5, 5, 0, tooltip_key="verbose")
@@ -665,12 +670,13 @@ class GuidedAnalysisGUI(tk.Tk):
             getattr(self, "pol_product_combo", None),
             getattr(self, "save_generated_frame_chk", None),
             getattr(self, "generated_analysis_dir_entry", None),
+            getattr(self, "output_target_subdir_chk", None),
         ]
 
         self._trace_vars([
             self.guided_script, self.joint_script, self.converter_script, self.analysis_mode, self.use_polarimetry,
             self.pol_csv, self.pol_product, self.save_generated_frame, self.generated_analysis_dir,
-            self.outroot, self.show_plots_inline, self.verbose, self.lsq_verbose,
+            self.output_target_subdir, self.outroot, self.show_plots_inline, self.verbose, self.lsq_verbose,
             self.fmin, self.fmax, self.tess_grid_mode, self.tess_snr_stop, self.max_tess_modes,
             self.pol_snr_stop, self.max_pol_modes, self.guided_pol_fmin, self.search_window_mult,
             self.noise_ks, self.noise_bins, self.channel_q, self.channel_u, self.channel_p,
@@ -984,6 +990,7 @@ class GuidedAnalysisGUI(tk.Tk):
             "pol_product": self.pol_product.get().strip(),
             "save_generated_frame": bool(self.save_generated_frame.get()),
             "generated_analysis_dir": self.generated_analysis_dir.get().strip(),
+            "output_target_subdir": bool(self.output_target_subdir.get()),
             "outroot": self.outroot.get().strip(),
             "show_plots_inline": bool(self.show_plots_inline.get()),
             "verbose": int(self.verbose.get()),
@@ -1089,6 +1096,7 @@ class GuidedAnalysisGUI(tk.Tk):
                 f"POL product: {cfg['pol_product'] if cfg['use_polarimetry'] else '(not used)'}",
                 f"Channels: {', '.join(cfg['channels']) if cfg['use_polarimetry'] else '(none)'}",
                 f"Output root: {cfg['outroot']}",
+                f"Target subdirectory: {cfg['output_target_subdir']}",
                 f"Phase zero: {cfg['phase_zero_mode']}" + (f" (BTJD={cfg['phase_zero_btjd']})" if cfg['phase_zero_mode']=='custom_btjd' else (" (absolute TESS BTJD=0.0)" if cfg['phase_zero_mode']=='btjd_zero' else "")),
             ])
             if cfg["analysis_mode"] == "guided_analysis":
@@ -1194,6 +1202,7 @@ if CFG["analysis_mode"] == "guided_analysis":
     mod.POL_GENERATED_ANALYSIS_DIR = (None if not CFG["generated_analysis_dir"] else str(CFG["generated_analysis_dir"]))
     mod.OUTROOT = Path(CFG["outroot"])
     mod.OUTROOT.mkdir(parents=True, exist_ok=True)
+    mod.OUTPUT_TARGET_SUBDIR = bool(CFG["output_target_subdir"])
     mod.SHOW_PLOTS_INLINE = bool(CFG["show_plots_inline"])
     mod.VERBOSE = int(CFG["verbose"])
     mod.LSQ_VERBOSE = int(CFG["lsq_verbose"])
@@ -1598,7 +1607,7 @@ else:
                 "guided_script", "joint_script", "converter_script", "analysis_mode", "tess_input_mode", "tess_csv",
                 "pipeline_dir", "pipeline_pattern", "pipeline_recursive", "pipeline_flux", "tess_force_y_col",
                 "spoc_input", "spoc_output_csv", "spoc_template", "pol_csv", "pol_product",
-                "save_generated_frame", "generated_analysis_dir", "outroot", "show_plots_inline",
+                "save_generated_frame", "generated_analysis_dir", "output_target_subdir", "outroot", "show_plots_inline",
                 "verbose", "lsq_verbose", "fmin", "fmax", "tess_grid_mode", "tess_snr_stop",
                 "max_tess_modes", "pol_snr_stop", "max_pol_modes", "guided_pol_fmin",
                 "search_window_mult", "noise_ks", "noise_bins", "use_offsets", "use_slopes",

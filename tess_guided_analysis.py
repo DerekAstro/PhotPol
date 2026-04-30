@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import time
 import matplotlib.pyplot as plt
+import re
 
 try:
     from IPython.display import display
@@ -144,6 +145,63 @@ LSQ_VERBOSE = 0
 # --- Output ---
 OUTROOT = Path("tess_guided_phot_pol_outputs_v12")
 OUTROOT.mkdir(parents=True, exist_ok=True)
+OUTPUT_TARGET_SUBDIR = False
+
+
+POL_FILENAME_SUFFIXES = [
+    "_IND_nm_pchip_analysis_frame",
+    "_nm_pchip_analysis_frame",
+    "_analysis_frame",
+    "_IND",
+]
+
+def prefixed_output_name(prefix: str, basename: str) -> str:
+    prefix = str(prefix).strip()
+    return f"{prefix}_{basename}" if prefix else basename
+
+def infer_star_labels_from_pol_path(path: Path | str) -> tuple[str, str]:
+    stem = Path(path).stem
+    for suff in sorted(POL_FILENAME_SUFFIXES, key=len, reverse=True):
+        if stem.endswith(suff):
+            stem = stem[:-len(suff)]
+            break
+    stem = stem.strip(" _-")
+    display = re.sub(r"[_]+", " ", stem).strip()
+    display = re.sub(r"\s+", " ", display)
+    safe = re.sub(r"[^A-Za-z0-9.+-]+", "_", display).strip("_")
+    if not display:
+        display = "target"
+    if not safe:
+        safe = "target"
+    return display, safe
+
+def infer_star_labels_from_tess_input() -> tuple[str, str]:
+    if str(TESS_INPUT_MODE).lower() == "pipeline_dir":
+        patt = str(TESS_PIPELINE_PATTERN).strip()
+        if patt and ("*" not in patt) and ("?" not in patt) and ("[" not in patt):
+            stem = Path(patt).stem
+        else:
+            stem = Path(TESS_PIPELINE_DIR).name
+    else:
+        stem = Path(TESS_CSV).stem
+    for suff in ["_combined_filtered", "_combined", "_lc", "_lightcurve"]:
+        if stem.endswith(suff):
+            stem = stem[:-len(suff)]
+            break
+    stem = stem.strip(" _-")
+    display = re.sub(r"[_]+", " ", stem).strip()
+    display = re.sub(r"\s+", " ", display)
+    safe = re.sub(r"[^A-Za-z0-9.+-]+", "_", display).strip("_")
+    if not display:
+        display = "target"
+    if not safe:
+        safe = "target"
+    return display, safe
+
+def resolve_analysis_outroot(star_safe: str) -> Path:
+    base = OUTROOT / star_safe if OUTPUT_TARGET_SUBDIR else OUTROOT
+    base.mkdir(parents=True, exist_ok=True)
+    return base
 
 # ----------------------------------------------------------------------
 # Data structures
@@ -1768,21 +1826,23 @@ def phase_bin_medians(phase: np.ndarray, y: np.ndarray, nbin: int = 16) -> tuple
 
 def plot_tess_timeseries_and_spectra(tess0: TimeSeries, final_resid: TimeSeries, freqs: np.ndarray,
                                      Pstart: np.ndarray, Pend: np.ndarray, mode_table: pd.DataFrame,
-                                     outdir: Path, show_plots_inline: bool = False):
+                                     outdir: Path, show_plots_inline: bool = False, file_prefix: str = ""):
     outdir.mkdir(parents=True, exist_ok=True)
 
+    C_START = "#7EC8FF"
+    C_END = "#000000"
     fig, ax = plt.subplots(figsize=(11, 4.8))
     y0 = tess0.y - np.nanmedian(tess0.y)
     y1 = final_resid.y - np.nanmedian(final_resid.y)
-    ax.scatter(tess0.t, y0, s=8, alpha=0.55, label="tess start", color="#0072B2")
-    ax.scatter(final_resid.t, y1, s=8, alpha=0.65, label="tess end (resid)", color="#56B4E9")
+    ax.scatter(tess0.t, y0, s=5, alpha=0.50, label="tess start", color=C_START)
+    ax.scatter(final_resid.t, y1, s=5, alpha=0.55, label="tess end (resid)", color=C_END)
     ax.set_xlabel("Time [days]")
     ax.set_ylabel("TESS value (median-subtracted)")
     set_robust_time_ylim(ax, y0, y1, central_pct=98.0, pad_frac=0.12)
     ax.set_title("TESS time series")
     ax.legend(loc="best", fontsize=9)
     fig.tight_layout()
-    fig.savefig(outdir / "timeseries_start_end.png", dpi=180)
+    fig.savefig(outdir / prefixed_output_name(file_prefix, "timeseries_start_end.png"), dpi=180)
     if show_plots_inline:
         plt.show()
     plt.close(fig)
@@ -1790,8 +1850,8 @@ def plot_tess_timeseries_and_spectra(tess0: TimeSeries, final_resid: TimeSeries,
     P0 = _norm_spec(Pstart)
     P1 = _norm_spec(Pend)
     fig, ax = plt.subplots(figsize=(11, 4.8))
-    ax.plot(freqs, P0, lw=0.9, color="#0072B2", label="tess start")
-    ax.plot(freqs, P1 + 1.2, lw=0.9, color="#56B4E9", linestyle="--", label="tess end (offset)")
+    ax.plot(freqs, P0, lw=0.9, color=C_START, label="tess start")
+    ax.plot(freqs, P1 + 1.2, lw=0.9, color=C_END, linestyle="--", label="tess end (offset)")
     if not mode_table.empty:
         ytop = np.nanmax(P1 + 1.2)
         for _, r in mode_table.iterrows():
@@ -1804,14 +1864,14 @@ def plot_tess_timeseries_and_spectra(tess0: TimeSeries, final_resid: TimeSeries,
     ax.set_title("TESS spectra")
     ax.legend(loc="best", fontsize=9)
     fig.tight_layout()
-    fig.savefig(outdir / "spectra_start_end.png", dpi=180)
+    fig.savefig(outdir / prefixed_output_name(file_prefix, "spectra_start_end.png"), dpi=180)
     if show_plots_inline:
         plt.show()
     plt.close(fig)
 
     fig, ax = plt.subplots(figsize=(11, 4.8))
-    ax.semilogy(freqs, np.maximum(Pstart, 1e-12), lw=0.9, color="#0072B2", label="tess start")
-    ax.semilogy(freqs, np.maximum(Pend, 1e-12), lw=0.9, color="#56B4E9", linestyle="--", label="tess end")
+    ax.semilogy(freqs, np.maximum(Pstart, 1e-12), lw=0.9, color=C_START, label="tess start")
+    ax.semilogy(freqs, np.maximum(Pend, 1e-12), lw=0.9, color=C_END, linestyle="--", label="tess end")
     if not mode_table.empty:
         for _, r in mode_table.iterrows():
             ax.axvline(float(r["f"]), lw=0.8, alpha=0.35, color="0.3")
@@ -1820,7 +1880,7 @@ def plot_tess_timeseries_and_spectra(tess0: TimeSeries, final_resid: TimeSeries,
     ax.set_title("TESS spectra (log y)")
     ax.legend(loc="best", fontsize=9)
     fig.tight_layout()
-    fig.savefig(outdir / "spectra_start_end_log_offset.png", dpi=180)
+    fig.savefig(outdir / prefixed_output_name(file_prefix, "spectra_start_end_log_offset.png"), dpi=180)
     if show_plots_inline:
         plt.show()
     plt.close(fig)
@@ -1832,7 +1892,7 @@ def plot_tess_timeseries_and_spectra(tess0: TimeSeries, final_resid: TimeSeries,
     ax.set_ylabel("Window power")
     ax.set_title("TESS spectral window")
     fig.tight_layout()
-    fig.savefig(outdir / "spectral_windows.png", dpi=180)
+    fig.savefig(outdir / prefixed_output_name(file_prefix, "spectral_windows.png"), dpi=180)
     if show_plots_inline:
         plt.show()
     plt.close(fig)
@@ -1843,16 +1903,18 @@ def plot_channel_timeseries_and_spectra(tess0: TimeSeries, tess_final_resid: Tim
                                         freqs_pol: np.ndarray, Ppo_start: np.ndarray, Ppo_end: np.ndarray,
                                         freqs_pol_full: np.ndarray, Ppo_start_full: np.ndarray, Ppo_end_full: np.ndarray,
                                         outdir: Path, guided_diags: list[dict] | None = None,
-                                        show_plots_inline: bool = False):
+                                        show_plots_inline: bool = False, file_prefix: str = ""):
     outdir.mkdir(parents=True, exist_ok=True)
 
     fig, axes = plt.subplots(nrows=2, ncols=1, figsize=(11, 7.5), sharex=False)
 
+    C_START = "#7EC8FF"
+    C_END = "#000000"
     ax = axes[0]
     t0 = tess0.y - np.nanmedian(tess0.y)
     t1 = tess_final_resid.y - np.nanmedian(tess_final_resid.y)
-    ax.scatter(tess0.t, t0, s=8, alpha=0.55, label="tess start", color="#0072B2")
-    ax.scatter(tess_final_resid.t, t1, s=8, alpha=0.65, label="tess end (resid)", color="#56B4E9")
+    ax.scatter(tess0.t, t0, s=5, alpha=0.50, label="tess start", color=C_START)
+    ax.scatter(tess_final_resid.t, t1, s=5, alpha=0.55, label="tess end (resid)", color=C_END)
     ax.set_ylabel("TESS value (median-subtracted)")
     set_robust_time_ylim(ax, t0, t1, central_pct=98.0, pad_frac=0.12)
     ax.set_title("TESS time series")
@@ -1861,15 +1923,15 @@ def plot_channel_timeseries_and_spectra(tess0: TimeSeries, tess_final_resid: Tim
     ax = axes[1]
     p0 = pol0.y - np.nanmedian(pol0.y)
     p1 = pol_final_resid.y - np.nanmedian(pol_final_resid.y)
-    ax.scatter(pol0.t, p0, s=10, alpha=0.55, label=f"{pol0.name} start", color="#E69F00")
-    ax.scatter(pol_final_resid.t, p1, s=10, alpha=0.65, label=f"{pol0.name} end (resid)", color="#CC79A7")
+    ax.scatter(pol0.t, p0, s=6, alpha=0.50, label=f"{pol0.name} start", color=C_START)
+    ax.scatter(pol_final_resid.t, p1, s=6, alpha=0.55, label=f"{pol0.name} end (resid)", color=C_END)
     ax.set_xlabel("Time [days]")
     ax.set_ylabel(f"{pol0.name} value (median-subtracted)")
     set_robust_time_ylim(ax, p0, p1, central_pct=98.0, pad_frac=0.12)
     ax.set_title(f"{pol0.name} time series")
     ax.legend(loc="best", fontsize=9)
     fig.tight_layout()
-    fig.savefig(outdir / "timeseries_start_end.png", dpi=180)
+    fig.savefig(outdir / prefixed_output_name(file_prefix, "timeseries_start_end.png"), dpi=180)
     if show_plots_inline:
         plt.show()
     plt.close(fig)
@@ -1883,8 +1945,8 @@ def plot_channel_timeseries_and_spectra(tess0: TimeSeries, tess_final_resid: Tim
     ax = axes[0]
     T0 = _norm_spec(Pte_start)
     T1 = _norm_spec(Pte_end)
-    ax.plot(freqs_tess, T0, lw=0.9, color="#0072B2", label="tess start")
-    ax.plot(freqs_tess, T1 + 1.2, lw=0.9, color="#56B4E9", linestyle="--", label="tess end (offset)")
+    ax.plot(freqs_tess, T0, lw=0.9, color=C_START, label="tess start")
+    ax.plot(freqs_tess, T1 + 1.2, lw=0.9, color=C_END, linestyle="--", label="tess end (offset)")
     if not tess_table.empty:
         ytop = np.nanmax(T1 + 1.2)
         for _, r in tess_table.iterrows():
@@ -1900,8 +1962,8 @@ def plot_channel_timeseries_and_spectra(tess0: TimeSeries, tess_final_resid: Tim
             P0 = _norm_spec(gd["Pstart"])
             P1 = _norm_spec(gd["Pend"])
             freqs = gd["freqs"]
-            ax.plot(freqs, P0, lw=1.0, color="#E69F00", label=f"{pol0.name} start")
-            ax.plot(freqs, P1 + 1.2, lw=1.0, color="#CC79A7", linestyle="--", label=f"{pol0.name} end (offset)")
+            ax.plot(freqs, P0, lw=1.0, color=C_START, label=f"{pol0.name} start")
+            ax.plot(freqs, P1 + 1.2, lw=1.0, color=C_END, linestyle="--", label=f"{pol0.name} end (offset)")
             ax.axvline(gd["f_tess"], lw=0.9, alpha=0.6, color="0.3", label="TESS template" if i == 1 else None)
             if np.isfinite(gd["f_detected"]):
                 ax.axvline(gd["f_detected"], lw=0.9, alpha=0.8, color="#009E73", linestyle=":", label="pol detection" if i == 1 else None)
@@ -1917,15 +1979,15 @@ def plot_channel_timeseries_and_spectra(tess0: TimeSeries, tess_final_resid: Tim
         ax = axes[1]
         P0 = _norm_spec(Ppo_start)
         P1 = _norm_spec(Ppo_end)
-        ax.plot(freqs_pol, P0, lw=0.9, color="#E69F00", label=f"{pol0.name} start")
-        ax.plot(freqs_pol, P1 + 1.2, lw=0.9, color="#CC79A7", linestyle="--", label=f"{pol0.name} end (offset)")
+        ax.plot(freqs_pol, P0, lw=0.9, color=C_START, label=f"{pol0.name} start")
+        ax.plot(freqs_pol, P1 + 1.2, lw=0.9, color=C_END, linestyle="--", label=f"{pol0.name} end (offset)")
         ax.set_xlabel("Frequency [c/d]")
         ax.set_ylabel(f"{pol0.name} norm. power + offset")
         ax.set_title(f"{pol0.name} spectra")
         ax.legend(loc="best", fontsize=9)
 
     fig.tight_layout()
-    fig.savefig(outdir / "spectra_start_end.png", dpi=180)
+    fig.savefig(outdir / prefixed_output_name(file_prefix, "spectra_start_end.png"), dpi=180)
     if show_plots_inline:
         plt.show()
     plt.close(fig)
@@ -1933,8 +1995,8 @@ def plot_channel_timeseries_and_spectra(tess0: TimeSeries, tess_final_resid: Tim
     # Full-range polarimetry spectrum on a full-baseline plot grid
     fig, axes = plt.subplots(nrows=2, ncols=1, figsize=(11, 7.2), sharex=False)
     ax = axes[0]
-    ax.plot(freqs_tess, T0, lw=0.9, color="#0072B2", label="tess start")
-    ax.plot(freqs_tess, T1 + 1.2, lw=0.9, color="#56B4E9", linestyle="--", label="tess end (offset)")
+    ax.plot(freqs_tess, T0, lw=0.9, color=C_START, label="tess start")
+    ax.plot(freqs_tess, T1 + 1.2, lw=0.9, color=C_END, linestyle="--", label="tess end (offset)")
     if not tess_table.empty:
         ytop = np.nanmax(T1 + 1.2)
         for _, r in tess_table.iterrows():
@@ -1947,8 +2009,8 @@ def plot_channel_timeseries_and_spectra(tess0: TimeSeries, tess_final_resid: Tim
     ax = axes[1]
     P0_full = _norm_spec(Ppo_start_full)
     P1_full = _norm_spec(Ppo_end_full)
-    ax.plot(freqs_pol_full, P0_full, lw=0.9, color="#E69F00", label=f"{pol0.name} start")
-    ax.plot(freqs_pol_full, P1_full + 1.2, lw=0.9, color="#CC79A7", linestyle="--", label=f"{pol0.name} end (offset)")
+    ax.plot(freqs_pol_full, P0_full, lw=0.9, color=C_START, label=f"{pol0.name} start")
+    ax.plot(freqs_pol_full, P1_full + 1.2, lw=0.9, color=C_END, linestyle="--", label=f"{pol0.name} end (offset)")
     if not pol_table.empty:
         ytop = np.nanmax(P1_full + 1.2)
         for _, r in pol_table.iterrows():
@@ -1958,7 +2020,7 @@ def plot_channel_timeseries_and_spectra(tess0: TimeSeries, tess_final_resid: Tim
     ax.set_title(f"{pol0.name} spectra (full-range, full-baseline grid)")
     ax.legend(loc="best", fontsize=9)
     fig.tight_layout()
-    fig.savefig(outdir / "spectra_fullrange_start_end.png", dpi=180)
+    fig.savefig(outdir / prefixed_output_name(file_prefix, "spectra_fullrange_start_end.png"), dpi=180)
     if show_plots_inline:
         plt.show()
     plt.close(fig)
@@ -1970,7 +2032,7 @@ def plot_channel_timeseries_and_spectra(tess0: TimeSeries, tess_final_resid: Tim
             axes = [axes]
         for ax, gd in zip(axes, guided_diags):
             freqs = gd["freqs"]
-            ax.semilogy(freqs, np.maximum(gd["Pstart"], 1e-12), lw=1.0, color="#E69F00", label=f"{pol0.name} start")
+            ax.semilogy(freqs, np.maximum(gd["Pstart"], 1e-12), lw=1.0, color=C_START, label=f"{pol0.name} start")
             ax.semilogy(freqs, np.maximum(gd["Pend"], 1e-12), lw=1.0, color="#CC79A7", linestyle="--", label=f"{pol0.name} end")
             ax.axvline(gd["f_tess"], lw=0.9, alpha=0.6, color="0.3", label="TESS template")
             if np.isfinite(gd["f_detected"]):
@@ -1981,27 +2043,27 @@ def plot_channel_timeseries_and_spectra(tess0: TimeSeries, tess_final_resid: Tim
         axes[-1].set_xlabel("Frequency [c/d]")
     else:
         fig, axes = plt.subplots(nrows=2, ncols=1, figsize=(11, 7.5), sharex=False)
-        axes[0].semilogy(freqs_tess, np.maximum(Pte_start, 1e-12), lw=0.9, color="#0072B2", label="tess start")
-        axes[0].semilogy(freqs_tess, np.maximum(Pte_end, 1e-12), lw=0.9, color="#56B4E9", linestyle="--", label="tess end")
+        axes[0].semilogy(freqs_tess, np.maximum(Pte_start, 1e-12), lw=0.9, color=C_START, label="tess start")
+        axes[0].semilogy(freqs_tess, np.maximum(Pte_end, 1e-12), lw=0.9, color=C_END, linestyle="--", label="tess end")
         axes[0].legend(loc="best", fontsize=9)
         axes[0].set_ylabel("TESS power")
         axes[0].set_title("TESS spectra (log y)")
 
-        axes[1].semilogy(freqs_pol, np.maximum(Ppo_start, 1e-12), lw=0.9, color="#E69F00", label=f"{pol0.name} start")
+        axes[1].semilogy(freqs_pol, np.maximum(Ppo_start, 1e-12), lw=0.9, color=C_START, label=f"{pol0.name} start")
         axes[1].semilogy(freqs_pol, np.maximum(Ppo_end, 1e-12), lw=0.9, color="#CC79A7", linestyle="--", label=f"{pol0.name} end")
         axes[1].legend(loc="best", fontsize=9)
         axes[1].set_xlabel("Frequency [c/d]")
         axes[1].set_ylabel(f"{pol0.name} power")
         axes[1].set_title(f"{pol0.name} spectra (log y)")
     fig.tight_layout()
-    fig.savefig(outdir / "spectra_start_end_log_offset.png", dpi=180)
+    fig.savefig(outdir / prefixed_output_name(file_prefix, "spectra_start_end_log_offset.png"), dpi=180)
     if show_plots_inline:
         plt.show()
     plt.close(fig)
 
     fig, axes = plt.subplots(nrows=2, ncols=1, figsize=(11, 7.2), sharex=False)
-    axes[0].semilogy(freqs_tess, np.maximum(Pte_start, 1e-12), lw=0.9, color="#0072B2", label="tess start")
-    axes[0].semilogy(freqs_tess, np.maximum(Pte_end, 1e-12), lw=0.9, color="#56B4E9", linestyle="--", label="tess end")
+    axes[0].semilogy(freqs_tess, np.maximum(Pte_start, 1e-12), lw=0.9, color=C_START, label="tess start")
+    axes[0].semilogy(freqs_tess, np.maximum(Pte_end, 1e-12), lw=0.9, color=C_END, linestyle="--", label="tess end")
     if not tess_table.empty:
         for _, r in tess_table.iterrows():
             axes[0].axvline(float(r["f"]), lw=0.8, alpha=0.25, color="0.3")
@@ -2009,7 +2071,7 @@ def plot_channel_timeseries_and_spectra(tess0: TimeSeries, tess_final_resid: Tim
     axes[0].set_title("TESS spectra (log y)")
     axes[0].legend(loc="best", fontsize=9)
 
-    axes[1].semilogy(freqs_pol_full, np.maximum(Ppo_start_full, 1e-12), lw=0.9, color="#E69F00", label=f"{pol0.name} start")
+    axes[1].semilogy(freqs_pol_full, np.maximum(Ppo_start_full, 1e-12), lw=0.9, color=C_START, label=f"{pol0.name} start")
     axes[1].semilogy(freqs_pol_full, np.maximum(Ppo_end_full, 1e-12), lw=0.9, color="#CC79A7", linestyle="--", label=f"{pol0.name} end")
     if not pol_table.empty:
         for _, r in pol_table.iterrows():
@@ -2019,7 +2081,7 @@ def plot_channel_timeseries_and_spectra(tess0: TimeSeries, tess_final_resid: Tim
     axes[1].set_title(f"{pol0.name} spectra (full-range, log y)")
     axes[1].legend(loc="best", fontsize=9)
     fig.tight_layout()
-    fig.savefig(outdir / "spectra_fullrange_start_end_log.png", dpi=180)
+    fig.savefig(outdir / prefixed_output_name(file_prefix, "spectra_fullrange_start_end_log.png"), dpi=180)
     if show_plots_inline:
         plt.show()
     plt.close(fig)
@@ -2035,13 +2097,13 @@ def plot_channel_timeseries_and_spectra(tess0: TimeSeries, tess_final_resid: Tim
     axes[1].set_ylabel("Window power")
     axes[1].set_title(f"{pol0.name} spectral window (full-baseline grid)")
     fig.tight_layout()
-    fig.savefig(outdir / "spectral_windows.png", dpi=180)
+    fig.savefig(outdir / prefixed_output_name(file_prefix, "spectral_windows.png"), dpi=180)
     if show_plots_inline:
         plt.show()
     plt.close(fig)
 
 def plot_tess_phased_modes(tess_snapshots: list[dict], mode_table: pd.DataFrame, outdir: Path,
-                           n_phase_plots: int = 3, show_plots_inline: bool = False):
+                           n_phase_plots: int = 3, show_plots_inline: bool = False, file_prefix: str = ""):
     if mode_table.empty or not tess_snapshots:
         return
     snap_map = {int(s["mode"]): s for s in tess_snapshots if "mode" in s}
@@ -2058,8 +2120,8 @@ def plot_tess_phased_modes(tess_snapshots: list[dict], mode_table: pd.DataFrame,
         f = float(fit["best_f"])
         y = prefit.y - np.nanmedian(prefit.y)
         ph = phase_fold(prefit.t, f)
-        ax.scatter(ph, y, s=8, alpha=0.7, color="0.25")
-        ax.scatter(ph + 1.0, y, s=8, alpha=0.7, color="0.25")
+        ax.scatter(ph, y, s=6, alpha=0.65, color="0.25")
+        ax.scatter(ph + 1.0, y, s=6, alpha=0.65, color="0.25")
         ph_grid = np.linspace(0.0, 2.0, 500)
         model = float(fit["s_coeff"]) * np.sin(2.0 * np.pi * ph_grid) + float(fit["c_coeff"]) * np.cos(2.0 * np.pi * ph_grid)
         model = model - np.nanmedian(model)
@@ -2070,7 +2132,7 @@ def plot_tess_phased_modes(tess_snapshots: list[dict], mode_table: pd.DataFrame,
         ax.set_ylabel("TESS (median-subtracted)")
         ax.set_title(f"Mode {mode} | TESS | f={float(r['f']):.6f} c/d | amp={float(r['amp']):.4g} | SNR={float(r['snr_local']):.2f}")
     fig.tight_layout()
-    fig.savefig(outdir / "phased_top_modes.png", dpi=180)
+    fig.savefig(outdir / prefixed_output_name(file_prefix, "phased_top_modes.png"), dpi=180)
     if show_plots_inline:
         plt.show()
     plt.close(fig)
@@ -2078,7 +2140,7 @@ def plot_tess_phased_modes(tess_snapshots: list[dict], mode_table: pd.DataFrame,
 def plot_channel_phased_modes(tess_snapshots: list[dict], tess_table: pd.DataFrame,
                               pol_search_df: pd.DataFrame, pol_snapshots: list[dict], pol0: TimeSeries,
                               outdir: Path, n_phase_plots: int = 3, sort_by: str = "amp",
-                              show_plots_inline: bool = False):
+                              show_plots_inline: bool = False, file_prefix: str = ""):
     if pol_search_df is not None and len(pol_search_df):
         if "postfit_keep" in pol_search_df.columns:
             detected = pol_search_df.loc[pol_search_df["postfit_keep"]].copy()
@@ -2110,8 +2172,8 @@ def plot_channel_phased_modes(tess_snapshots: list[dict], tess_table: pd.DataFra
             f_t = float(tfit["best_f"])
             y_t = tprefit.y - np.nanmedian(tprefit.y)
             ph_t = phase_fold(tprefit.t, f_t)
-            ax.scatter(ph_t, y_t, s=8, alpha=0.7, color="0.25")
-            ax.scatter(ph_t + 1.0, y_t, s=8, alpha=0.7, color="0.25")
+            ax.scatter(ph_t, y_t, s=6, alpha=0.65, color="0.25")
+            ax.scatter(ph_t + 1.0, y_t, s=6, alpha=0.65, color="0.25")
             ph_grid = np.linspace(0.0, 2.0, 500)
             model_t = float(tfit["s_coeff"]) * np.sin(2.0 * np.pi * ph_grid) + float(tfit["c_coeff"]) * np.cos(2.0 * np.pi * ph_grid)
             model_t = model_t - np.nanmedian(model_t)
@@ -2132,12 +2194,12 @@ def plot_channel_phased_modes(tess_snapshots: list[dict], tess_table: pd.DataFra
             y_p = pprefit.y - np.asarray(pfit["baseline_model"], dtype=float)
             y_p = y_p - np.nanmedian(y_p)
             ph_p = phase_fold(pprefit.t, f_p)
-            ax.scatter(ph_p, y_p, s=12, alpha=0.55, color="0.25")
-            ax.scatter(ph_p + 1.0, y_p, s=12, alpha=0.55, color="0.25")
+            ax.scatter(ph_p, y_p, s=8, alpha=0.50, color="0.25")
+            ax.scatter(ph_p + 1.0, y_p, s=8, alpha=0.50, color="0.25")
             bph, by = phase_bin_medians(ph_p, y_p, nbin=PHASE_BIN_N)
             if len(bph):
-                ax.scatter(bph, by, s=28, alpha=0.95, color="#D55E00", zorder=3)
-                ax.scatter(bph + 1.0, by, s=28, alpha=0.95, color="#D55E00", zorder=3, label="phase-bin median")
+                ax.scatter(bph, by, s=20, alpha=0.95, color="#D55E00", zorder=3)
+                ax.scatter(bph + 1.0, by, s=20, alpha=0.95, color="#D55E00", zorder=3, label="phase-bin median")
             ph_grid = np.linspace(0.0, 2.0, 500)
             model_p = float(pfit["s_coeff"]) * np.sin(2.0 * np.pi * ph_grid) + float(pfit["c_coeff"]) * np.cos(2.0 * np.pi * ph_grid)
             model_p = model_p - np.nanmedian(model_p)
@@ -2149,7 +2211,7 @@ def plot_channel_phased_modes(tess_snapshots: list[dict], tess_table: pd.DataFra
         ax.set_ylabel(f"{pol0.name} (median-subtracted)")
 
     fig.tight_layout()
-    fig.savefig(outdir / "phased_top_modes.png", dpi=180)
+    fig.savefig(outdir / prefixed_output_name(file_prefix, "phased_top_modes.png"), dpi=180)
     if show_plots_inline:
         plt.show()
     plt.close(fig)
@@ -2277,10 +2339,14 @@ def run_analysis():
 
     if USE_POLARIMETRY:
         pol_dict = load_polarimetry_csv(POL_CSV, product=POL_PRODUCT, trend_cfg=trend_cfg)
+        star_label, star_safe = infer_star_labels_from_pol_path(POL_CSV)
         vprint(1, f"Loaded datasets | TESS n={len(tess.t)} | " + ", ".join([f"{k} n={len(v.t)}" for k, v in pol_dict.items()]))
     else:
         pol_dict = {}
+        star_label, star_safe = infer_star_labels_from_tess_input()
         vprint(1, f"Loaded datasets | TESS n={len(tess.t)} | photometry-only mode")
+    print("STAR_LABEL =", star_label)
+    analysis_outroot = resolve_analysis_outroot(star_safe)
 
     if DO_DETREND and DETREND_POLY_ORDER > 0:
         tess_dt = detrend_poly(tess, order=DETREND_POLY_ORDER)
@@ -2290,18 +2356,19 @@ def run_analysis():
         pol_dt = pol_dict
 
     # TESS-only analysis
-    tess_outdir = OUTROOT / "tess"
+    tess_prefix = f"{star_safe}_tess"
+    tess_outdir = analysis_outroot / tess_prefix
     tess_outdir.mkdir(parents=True, exist_ok=True)
     vprint(1, "Starting TESS-only analysis...")
     tess_local_df, tess_global_fit, tess_snapshots, tess_final_resid, freqs_tess, Pte_start, Pte_end = extract_tess_modes(tess_dt)
     tess_table = match_global_components_with_local(tess_local_df, tess_global_fit)
-    tess_table.to_csv(tess_outdir / "peaks_table.csv", index=False)
-    pd.DataFrame(tess_global_fit["component_rows"]).to_csv(tess_outdir / "global_components_raw.csv", index=False)
+    tess_table.to_csv(tess_outdir / prefixed_output_name(tess_prefix, "peaks_table.csv"), index=False)
+    pd.DataFrame(tess_global_fit["component_rows"]).to_csv(tess_outdir / prefixed_output_name(tess_prefix, "global_components_raw.csv"), index=False)
     show_table("TESS peaks_table", tess_table)
     plot_tess_timeseries_and_spectra(tess_dt, tess_final_resid, freqs_tess, Pte_start, Pte_end, tess_table,
-                                     tess_outdir, show_plots_inline=SHOW_PLOTS_INLINE)
+                                     tess_outdir, show_plots_inline=SHOW_PLOTS_INLINE, file_prefix=tess_prefix)
     plot_tess_phased_modes(tess_snapshots, tess_table, tess_outdir,
-                           n_phase_plots=N_PHASE_PLOTS, show_plots_inline=SHOW_PLOTS_INLINE)
+                           n_phase_plots=N_PHASE_PLOTS, show_plots_inline=SHOW_PLOTS_INLINE, file_prefix=tess_prefix)
 
     outputs = {"tess": tess_table}
 
@@ -2313,17 +2380,18 @@ def run_analysis():
         if k not in pol_dt:
             print(f"Skipping channel {k!r}: not present.")
             continue
-        outdir = OUTROOT / k
+        channel_prefix = f"{star_safe}_{k}"
+        outdir = analysis_outroot / channel_prefix
         outdir.mkdir(parents=True, exist_ok=True)
-        print(f"\n=== Guided run for {k} ===")
+        print(f"\n=== Guided run for {star_label} {k} ===")
         (search_df, final_df, global_fit, pol_snapshots, pol_final_resid,
          freqs_pol, Ppo_start, Ppo_end, guided_diags,
          freqs_pol_full, Ppo_start_full, Ppo_end_full) = search_guided_channel(
             pol_dt[k], tess_table, 1.0 / max(compute_T_full(tess_dt), 1e-8), trend_cfg
         )
-        search_df.to_csv(outdir / "matched_search_table.csv", index=False)
-        final_df.to_csv(outdir / "peaks_table.csv", index=False)
-        pd.DataFrame(global_fit["component_rows"]).to_csv(outdir / "global_components_raw.csv", index=False)
+        search_df.to_csv(outdir / prefixed_output_name(channel_prefix, "matched_search_table.csv"), index=False)
+        final_df.to_csv(outdir / prefixed_output_name(channel_prefix, "peaks_table.csv"), index=False)
+        pd.DataFrame(global_fit["component_rows"]).to_csv(outdir / prefixed_output_name(channel_prefix, "global_components_raw.csv"), index=False)
         show_table(f"{k} matched_search_table", search_df)
         show_table(f"{k} peaks_table", final_df)
         plot_channel_timeseries_and_spectra(
@@ -2332,13 +2400,13 @@ def run_analysis():
             freqs_tess, Pte_start, Pte_end,
             freqs_pol, Ppo_start, Ppo_end,
             freqs_pol_full, Ppo_start_full, Ppo_end_full,
-            outdir, guided_diags=guided_diags, show_plots_inline=SHOW_PLOTS_INLINE
+            outdir, guided_diags=guided_diags, show_plots_inline=SHOW_PLOTS_INLINE, file_prefix=channel_prefix
         )
         plot_channel_phased_modes(
             tess_snapshots, tess_table,
             search_df, pol_snapshots, pol_dt[k],
             outdir, n_phase_plots=N_PHASE_PLOTS, sort_by=PHASE_SORT_BY,
-            show_plots_inline=SHOW_PLOTS_INLINE
+            show_plots_inline=SHOW_PLOTS_INLINE, file_prefix=channel_prefix
         )
         outputs[k] = final_df
 

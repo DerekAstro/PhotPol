@@ -1,7 +1,6 @@
 # Auto-exported companion script from notebook v6
 
 import argparse
-import matplotlib
 import numpy as np
 import pandas as pd
 from dataclasses import dataclass
@@ -94,6 +93,7 @@ SHOW_PLOTS_INLINE = True
 # --- Output ---
 OUTROOT = Path("joint_phot_pol_outputs_optionC")
 OUTROOT.mkdir(parents=True, exist_ok=True)
+OUTPUT_TARGET_SUBDIR = False
 
 # --- Phase reference ---
 PHASE_ZERO_MODE = "local_start"   # "local_start" | "btjd_zero" | "custom_btjd"
@@ -131,6 +131,11 @@ def infer_star_labels_from_pol_path(path: Path | str) -> tuple[str, str]:
 def prefixed_output_name(prefix: str, basename: str) -> str:
     prefix = str(prefix).strip()
     return f"{prefix}_{basename}" if prefix else basename
+
+def resolve_analysis_outroot(star_safe: str) -> Path:
+    base = OUTROOT / star_safe if OUTPUT_TARGET_SUBDIR else OUTROOT
+    base.mkdir(parents=True, exist_ok=True)
+    return base
 
 @dataclass
 class TimeSeries:
@@ -1229,8 +1234,8 @@ def plot_phased_modes(mode_snapshots: list[dict], res: pd.DataFrame, outdir: Pat
             y_t = np.asarray(snap["tess_prefit"].y, dtype=float)
             ylab_t = "TESS (prefit residual; median-subtracted)"
         y_t = y_t - np.nanmedian(y_t)
-        ax.scatter(phase_t, y_t, s=8, alpha=0.7, color=point_color)
-        ax.scatter(phase_t + 1.0, y_t, s=8, alpha=0.7, color=point_color)
+        ax.scatter(phase_t, y_t, s=6, alpha=0.65, color=point_color)
+        ax.scatter(phase_t + 1.0, y_t, s=6, alpha=0.65, color=point_color)
         y_model = phase_model_on_grid(ph_grid, ft, snap["fit_tess"]["beta"][:2], snap["tess_prefit"])
         y_model = y_model - np.nanmedian(y_model)
         ax.plot(ph_grid, y_model, lw=1.4, color=model_color)
@@ -1251,8 +1256,8 @@ def plot_phased_modes(mode_snapshots: list[dict], res: pd.DataFrame, outdir: Pat
             y_p = np.asarray(snap["pol_prefit"].y - snap["fit_pol"]["baseline_model"], dtype=float)
             ylab_p = f"{snap['pol_prefit'].name} (prefit residual; median-subtracted)"
         y_p = y_p - np.nanmedian(y_p)
-        ax.scatter(phase_p, y_p, s=10, alpha=0.7, color=point_color)
-        ax.scatter(phase_p + 1.0, y_p, s=10, alpha=0.7, color=point_color)
+        ax.scatter(phase_p, y_p, s=7, alpha=0.65, color=point_color)
+        ax.scatter(phase_p + 1.0, y_p, s=7, alpha=0.65, color=point_color)
         y_model_p = phase_model_on_grid(ph_grid, fp, snap["fit_pol"]["beta"][:2], snap["pol_prefit"])
         y_model_p = y_model_p - np.nanmedian(y_model_p)
         ax.plot(ph_grid, y_model_p, lw=1.4, color=model_color)
@@ -1436,25 +1441,25 @@ def run_joint_extraction_one(tess0: TimeSeries, pol0: TimeSeries, outdir: Path,
     Ppo_end = nuisance_periodogram(pol, freqs_coarse, baseline_matrix=make_pol_baseline_matrix(pol, pol_trend_cfg))
 
     # time-series plot (stacked panels: TESS and polarimetry separated; start/end overplotted)
-    C_TESS_START = "#0072B2"
-    C_TESS_END   = "#56B4E9"
-    C_POL_START  = "#E69F00"
-    C_POL_END    = "#CC79A7"
+    C_TESS_START = "#7EC8FF"
+    C_TESS_END   = "#000000"
+    C_POL_START  = "#7EC8FF"
+    C_POL_END    = "#000000"
 
     fig, axes = plt.subplots(nrows=2, ncols=1, figsize=(11, 7.5), sharex=True)
 
     ax = axes[0]
     tess0_plot = tess0.y - np.nanmedian(tess0.y)
     tess_plot  = tess.y  - np.nanmedian(tess.y)
-    ax.scatter(tess0.t, tess0_plot, s=8, alpha=0.55, label="tess start", color=C_TESS_START)
-    ax.scatter(tess.t, tess_plot, s=8, alpha=0.65, label="tess end (resid)", color=C_TESS_END)
+    ax.scatter(tess0.t, tess0_plot, s=5, alpha=0.50, label="tess start", color=C_TESS_START)
+    ax.scatter(tess.t, tess_plot, s=5, alpha=0.55, label="tess end (resid)", color=C_TESS_END)
     ax.set_ylabel("TESS value (median-subtracted)")
     ax.set_title("TESS time series")
     ax.legend(loc="best", fontsize=9)
 
     ax = axes[1]
-    ax.scatter(pol0.t, pol0.y, s=10, alpha=0.55, label=f"{display_name} start", color=C_POL_START)
-    ax.scatter(pol.t, pol.y, s=10, alpha=0.65, label=f"{display_name} end (resid)", color=C_POL_END)
+    ax.scatter(pol0.t, pol0.y, s=6, alpha=0.50, label=f"{display_name} start", color=C_POL_START)
+    ax.scatter(pol.t, pol.y, s=6, alpha=0.55, label=f"{display_name} end (resid)", color=C_POL_END)
     ax.set_xlabel("Time [days]")
     ax.set_ylabel(f"{display_name} value")
     ax.set_title(f"{display_name} time series")
@@ -1633,6 +1638,7 @@ def main(argv=None):
 
     star_label, star_safe = infer_star_labels_from_pol_path(POL_CSV)
     print("STAR_LABEL =", star_label)
+    analysis_outroot = resolve_analysis_outroot(star_safe)
     print("JOINT_WEIGHT_MODE =", JOINT_WEIGHT_MODE, "| SCALE_FREE_WEIGHT_BASIS =", SCALE_FREE_WEIGHT_BASIS, "| MANUAL_W_TESS =", MANUAL_W_TESS, "| MANUAL_W_POL =", MANUAL_W_POL)
     print("TOP_N_RAW_TESS_CANDIDATES =", TOP_N_RAW_TESS_CANDIDATES)
     print("TESS:", len(tess_dt.t), "Tfull=", compute_T_full(tess_dt), "weight=", estimate_dataset_weight(tess_dt, mode=JOINT_WEIGHT_MODE, scale_free_basis=SCALE_FREE_WEIGHT_BASIS, manual_weight=MANUAL_W_TESS))
@@ -1644,7 +1650,7 @@ def main(argv=None):
     results = {}
     for k in ["q", "u", "p"]:
         channel_prefix = f"{star_safe}_joint_{k}"
-        outdir = OUTROOT / channel_prefix
+        outdir = analysis_outroot / channel_prefix
         display_name = f"{star_label} {k}"
         print("\n=== RUN:", display_name, "->", outdir, "===")
         results[k] = run_joint_extraction_one(tess_dt, pol_dt[k], outdir=outdir, pol_trend_cfg=POL_TREND_CFG,
@@ -1653,12 +1659,12 @@ def main(argv=None):
     summary_df = build_joint_summary_table(results, tess_dt)
     if not summary_df.empty:
         summary_prefix = f"{star_safe}_joint_summary"
-        csv_path = OUTROOT / prefixed_output_name(summary_prefix, "frequency_table.csv")
-        xlsx_path = OUTROOT / prefixed_output_name(summary_prefix, "frequency_table.xlsx")
+        csv_path = analysis_outroot / prefixed_output_name(summary_prefix, "frequency_table.csv")
+        xlsx_path = analysis_outroot / prefixed_output_name(summary_prefix, "frequency_table.xlsx")
         save_summary_table(summary_df, csv_path, xlsx_path)
         plot_joint_summary_amplitude_spectra(
             summary_df, tess_dt, pol_dt, POL_TREND_CFG,
-            OUTROOT / prefixed_output_name(summary_prefix, "amplitude_spectra.png"),
+            analysis_outroot / prefixed_output_name(summary_prefix, "amplitude_spectra.png"),
             show_plots_inline=SHOW_PLOTS_INLINE,
         )
         results["summary"] = summary_df
