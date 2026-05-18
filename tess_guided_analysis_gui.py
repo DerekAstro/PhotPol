@@ -9,7 +9,9 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import traceback
 import threading
+import re
 from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
@@ -53,6 +55,10 @@ Existing CSV
 Pipeline/custom CSV directory
   Point at a directory of CSV light curves and let guided analysis load them
   using TESS_INPUT_MODE = 'pipeline_dir'.
+
+Pipeline/custom CSV directory (batch one file at a time)
+  Point at a directory of CSV light curves and run the guided analysis once per file.
+  This is intended for photometry-only batch work over many CSVs.
 
 SPOC lc.fits conversion
   Run spoc_lightcurve_converter.py first, then feed the converted CSV into the
@@ -117,13 +123,16 @@ TOOLTIPS = {
     "pipeline_pattern": "Filename pattern used when scanning the pipeline/custom light-curve directory.",
     "pipeline_flux": "Preferred flux-family selection in pipeline_dir mode: raw, detrended, or auto.",
     "pipeline_recursive": "Search the pipeline/custom light-curve directory recursively.",
+    "pipeline_batch_skip_existing": "In batch-per-file mode, skip a CSV if its expected per-target output already exists under the chosen output root.",
     "spoc_input": "SPOC lc.fits input path or glob used by the converter.",
     "spoc_output_csv": "CSV path that the converter should write before the guided analysis starts.",
     "spoc_template": "Command template used to run the SPOC converter. Use {python}, {script}, {input}, and {output} placeholders.",
     "pol_csv": "Polarimetry CSV: either raw/basic polarimetry or a precomputed analysis-frame CSV.",
+    "use_polarimetry": "Guided mode only. When unchecked, run only the TESS frequency search and global multisinusoid fit, skipping all polarimetry steps.",
     "pol_product": "Polarimetry product to analyze: nm, resid_nm_pchip, or pw_resid_nm_pchip.",
     "save_generated_frame": "Save the generated analysis-frame CSV when the input polarimetry is raw/basic.",
     "generated_analysis_dir": "Optional directory for the generated analysis-frame CSV. Blank means next to the polarimetry file.",
+    "output_target_subdir": "If enabled, place analysis outputs inside a subdirectory named after the target to keep runs separated and reduce accidental overwriting.",
     "outroot": "Top-level output directory. The script writes subdirectories like tess/, q/, u/, p/, and optional preprocessing diagnostics here.",
     "show_inline": "Inline plots / interactively. Usually best left off in GUI mode.",
     "verbose": "General verbosity level printed by the guided-analysis script.",
@@ -133,6 +142,12 @@ TOOLTIPS = {
     "tess_grid_mode": "Use the full baseline or the longest contiguous chunk to set the TESS discovery grid.",
     "tess_snr_stop": "Stop the sequential TESS search when the local SNR drops below this value.",
     "max_tess_modes": "Maximum number of sequential TESS modes to extract before the global fit.",
+    "tess_candidates_per_iter": "Maximum number of TESS peaks to accept and prewhiten in a single round of the smooth-background search.",
+    "tess_bootstrap_vet": "Enable the final TESS bootstrap amplitude-significance vetting pass.",
+    "tess_bootstrap_n": "Number of block-bootstrap realizations used for final TESS amplitude-significance vetting.",
+    "tess_bootstrap_block_days": "Block length in days for the TESS residual moving-block bootstrap.",
+    "tess_bootstrap_gap_days": "Gap threshold in days used to split TESS data into contiguous bootstrap segments.",
+    "tess_bootstrap_snr_min": "Final TESS bootstrap amplitude-SNR threshold for keeping a mode.",
     "pol_snr_stop": "Guided polarimetry detections must reach at least this local SNR.",
     "max_pol_modes": "Maximum number of guided polarimetry modes to test / keep.",
     "guided_pol_fmin": "Do not test TESS template frequencies below this value in the guided polarimetric matching.",
@@ -211,6 +226,7 @@ class ToolTip:
             relief="solid",
             borderwidth=1,
             background="#fff8dc",
+            foreground="#111111",
             padx=6,
             pady=4,
             wraplength=self.wraplength,
@@ -246,7 +262,20 @@ class ScrollableFrame(ttk.Frame):
         self.columnconfigure(0, weight=1)
         self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
 
+    def _widget_in_scrollable(self, widget):
+        w = widget
+        while w is not None:
+            if w is self.canvas or w is self.inner:
+                return True
+            try:
+                w = w.master
+            except Exception:
+                break
+        return False
+
     def _on_mousewheel(self, event):
+        if not self._widget_in_scrollable(getattr(event, "widget", None)):
+            return
         try:
             self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
         except Exception:
@@ -271,6 +300,7 @@ class GuidedAnalysisGUI(tk.Tk):
         self._poll_log_queue()
         self._update_tess_mode_state()
         self._update_analysis_mode_state()
+        self._update_polarimetry_state()
         self._update_joint_weight_mode_state()
         self._update_phase_zero_mode_state()
         self._update_run_plan_preview()
@@ -292,6 +322,7 @@ class GuidedAnalysisGUI(tk.Tk):
         self.pipeline_pattern = tk.StringVar(value="*.csv")
         self.pipeline_recursive = tk.BooleanVar(value=False)
         self.pipeline_flux = tk.StringVar(value="auto")
+        self.pipeline_batch_skip_existing = tk.BooleanVar(value=True)
         self.tess_force_y_col = tk.StringVar(value="")
 
         self.spoc_input = tk.StringVar(value="")
@@ -299,10 +330,12 @@ class GuidedAnalysisGUI(tk.Tk):
         self.spoc_template = tk.StringVar(value="{python} -u {script} --input {input} --output {output}")
 
         # polarimetry / output
+        self.use_polarimetry = tk.BooleanVar(value=True)
         self.pol_csv = tk.StringVar(value="target_IND.csv")
         self.pol_product = tk.StringVar(value="resid_nm_pchip")
         self.save_generated_frame = tk.BooleanVar(value=True)
         self.generated_analysis_dir = tk.StringVar(value="")
+        self.output_target_subdir = tk.BooleanVar(value=False)
         self.outroot = tk.StringVar(value="tess_guided_outputs")
         self.show_plots_inline = tk.BooleanVar(value=False)
         self.verbose = tk.IntVar(value=1)
@@ -314,6 +347,12 @@ class GuidedAnalysisGUI(tk.Tk):
         self.tess_grid_mode = tk.StringVar(value="full_baseline")
         self.tess_snr_stop = tk.DoubleVar(value=4.0)
         self.max_tess_modes = tk.IntVar(value=20)
+        self.tess_candidates_per_iter = tk.IntVar(value=10)
+        self.tess_bootstrap_vet = tk.BooleanVar(value=True)
+        self.tess_bootstrap_n = tk.IntVar(value=100)
+        self.tess_bootstrap_block_days = tk.DoubleVar(value=0.5)
+        self.tess_bootstrap_gap_days = tk.DoubleVar(value=1.0)
+        self.tess_bootstrap_snr_min = tk.DoubleVar(value=4.0)
         self.pol_snr_stop = tk.DoubleVar(value=2.0)
         self.max_pol_modes = tk.IntVar(value=99)
         self.guided_pol_fmin = tk.DoubleVar(value=0.2)
@@ -552,16 +591,19 @@ class GuidedAnalysisGUI(tk.Tk):
 
         pol = ttk.LabelFrame(root, text="Polarimetry / output")
         pol.grid(row=1, column=0, sticky="ew", padx=8, pady=6)
-        for c in range(4):
+        for c in range(6):
             pol.columnconfigure(c, weight=1)
-        self._entry(pol, "Polarimetry CSV", self.pol_csv, 0, 0, browse="file", tooltip_key="pol_csv", filetypes=[("CSV files", "*.csv"), ("All files", "*.*")])
-        self._combo(pol, "POL product", self.pol_product, ["nm", "resid_nm_pchip", "pw_resid_nm_pchip"], 1, 0, tooltip_key="pol_product")
-        self._check(pol, "Save generated analysis frame", self.save_generated_frame, 1, 2, tooltip_key="save_generated_frame", command=self._update_run_plan_preview)
-        self._entry(pol, "Generated analysis dir", self.generated_analysis_dir, 2, 0, browse="dir", tooltip_key="generated_analysis_dir")
-        self._entry(pol, "Output root", self.outroot, 3, 0, browse="dir", tooltip_key="outroot")
-        self._check(pol, "Inline plots", self.show_plots_inline, 3, 2, tooltip_key="show_inline", command=self._update_run_plan_preview)
-        self._spin(pol, "Verbose", self.verbose, 0, 5, 4, 0, tooltip_key="verbose")
-        self._spin(pol, "LSQ verbose", self.lsq_verbose, 0, 5, 4, 2, tooltip_key="lsq_verbose")
+        self.use_polarimetry_chk = self._check(pol, "Use polarimetry", self.use_polarimetry, 0, 0, tooltip_key="use_polarimetry", command=self._update_polarimetry_state, colspan=2)
+
+        self.pol_csv_entry = self._entry(pol, "Polarimetry CSV", self.pol_csv, 1, 0, browse="file", tooltip_key="pol_csv", filetypes=[("CSV files", "*.csv"), ("All files", "*.*")])
+        self.pol_product_combo = self._combo(pol, "POL product", self.pol_product, ["nm", "resid_nm_pchip", "pw_resid_nm_pchip"], 2, 0, tooltip_key="pol_product")
+        self.save_generated_frame_chk = self._check(pol, "Save generated analysis frame", self.save_generated_frame, 2, 3, tooltip_key="save_generated_frame", command=self._update_run_plan_preview, colspan=2)
+        self.generated_analysis_dir_entry = self._entry(pol, "Generated analysis dir", self.generated_analysis_dir, 3, 0, browse="dir", tooltip_key="generated_analysis_dir")
+        self._entry(pol, "Output root", self.outroot, 4, 0, browse="dir", tooltip_key="outroot")
+        self.output_target_subdir_chk = self._check(pol, "Place outputs in target subdirectory", self.output_target_subdir, 5, 0, tooltip_key="output_target_subdir", command=self._update_run_plan_preview, colspan=3)
+        self._check(pol, "Inline plots", self.show_plots_inline, 5, 3, tooltip_key="show_inline", command=self._update_run_plan_preview, colspan=2)
+        self._spin(pol, "Verbose", self.verbose, 0, 5, 6, 0, tooltip_key="verbose")
+        self._spin(pol, "LSQ verbose", self.lsq_verbose, 0, 5, 6, 2, tooltip_key="lsq_verbose")
 
         main = ttk.LabelFrame(root, text="Main analysis settings")
         main.grid(row=2, column=0, sticky="ew", padx=8, pady=6)
@@ -572,15 +614,26 @@ class GuidedAnalysisGUI(tk.Tk):
         self._combo(main, "TESS grid mode", self.tess_grid_mode, ["full_baseline", "longest_chunk"], 1, 0, tooltip_key="tess_grid_mode")
         self._entry(main, "TESS SNR stop", self.tess_snr_stop, 1, 2, tooltip_key="tess_snr_stop")
         self._spin(main, "Max TESS modes", self.max_tess_modes, 1, 999, 2, 0, tooltip_key="max_tess_modes")
-        self._entry(main, "POL SNR stop", self.pol_snr_stop, 2, 2, tooltip_key="pol_snr_stop")
-        self._spin(main, "Max POL modes", self.max_pol_modes, 1, 999, 3, 0, tooltip_key="max_pol_modes")
-        self._entry(main, "Guided POL fmin", self.guided_pol_fmin, 3, 2, tooltip_key="guided_pol_fmin")
-        self._entry(main, "Search window mult", self.search_window_mult, 4, 0, tooltip_key="search_window_mult")
-        self._entry(main, "Noise KS", self.noise_ks, 4, 2, tooltip_key="noise_ks")
-        self._spin(main, "Noise side bins", self.noise_bins, 1, 1000, 5, 0, tooltip_key="noise_bins")
+        self._spin(main, "Max TESS peaks/round", self.tess_candidates_per_iter, 1, 20, 2, 2, tooltip_key="tess_candidates_per_iter")
+        self._entry(main, "POL SNR stop", self.pol_snr_stop, 3, 2, tooltip_key="pol_snr_stop")
+        self._spin(main, "Max POL modes", self.max_pol_modes, 1, 999, 4, 0, tooltip_key="max_pol_modes")
+        self._entry(main, "Guided POL fmin", self.guided_pol_fmin, 4, 2, tooltip_key="guided_pol_fmin")
+        self._entry(main, "Search window mult", self.search_window_mult, 5, 0, tooltip_key="search_window_mult")
+        self._entry(main, "Noise KS", self.noise_ks, 5, 2, tooltip_key="noise_ks")
+        self._spin(main, "Noise side bins", self.noise_bins, 1, 1000, 6, 0, tooltip_key="noise_bins")
+
+        boot = ttk.LabelFrame(root, text="TESS bootstrap vetting")
+        boot.grid(row=3, column=0, sticky="ew", padx=8, pady=6)
+        for c in range(4):
+            boot.columnconfigure(c, weight=1)
+        self._check(boot, "Enable final bootstrap vetting", self.tess_bootstrap_vet, 0, 0, tooltip_key="tess_bootstrap_vet", command=self._update_run_plan_preview, colspan=2)
+        self._spin(boot, "Bootstrap N", self.tess_bootstrap_n, 0, 5000, 1, 0, tooltip_key="tess_bootstrap_n")
+        self._entry(boot, "Block days", self.tess_bootstrap_block_days, 1, 2, tooltip_key="tess_bootstrap_block_days")
+        self._entry(boot, "Gap days", self.tess_bootstrap_gap_days, 2, 0, tooltip_key="tess_bootstrap_gap_days")
+        self._entry(boot, "Final bootstrap SNR min", self.tess_bootstrap_snr_min, 2, 2, tooltip_key="tess_bootstrap_snr_min")
 
         chans = ttk.LabelFrame(root, text="Channels / baseline model")
-        chans.grid(row=3, column=0, sticky="ew", padx=8, pady=6)
+        chans.grid(row=4, column=0, sticky="ew", padx=8, pady=6)
         for c in range(4):
             chans.columnconfigure(c, weight=1)
         self._check(chans, "q", self.channel_q, 0, 0, tooltip_key="channels", command=self._update_run_plan_preview)
@@ -592,7 +645,7 @@ class GuidedAnalysisGUI(tk.Tk):
         self._entry(chans, "Gap hours", self.gap_hours, 2, 2, tooltip_key="gap_hours")
 
         extras = ttk.LabelFrame(root, text="Optional detrending / plots / preprocessing diagnostics")
-        extras.grid(row=4, column=0, sticky="ew", padx=8, pady=6)
+        extras.grid(row=5, column=0, sticky="ew", padx=8, pady=6)
         for c in range(4):
             extras.columnconfigure(c, weight=1)
         self._check(extras, "Apply broad polynomial detrend", self.do_detrend, 0, 0, tooltip_key="do_detrend", command=self._update_run_plan_preview)
@@ -652,15 +705,23 @@ class GuidedAnalysisGUI(tk.Tk):
         self.plan_text.configure(state="disabled")
 
         self.analysis_mode_groups = {
-            "guided": [main, extras],
+            "guided": [main, boot, extras],
             "joint": [jointf],
         }
+        self.polarimetry_toggle_widgets = [
+            getattr(self, "pol_csv_entry", None),
+            getattr(self, "pol_product_combo", None),
+            getattr(self, "save_generated_frame_chk", None),
+            getattr(self, "generated_analysis_dir_entry", None),
+            getattr(self, "output_target_subdir_chk", None),
+        ]
 
         self._trace_vars([
-            self.guided_script, self.joint_script, self.converter_script, self.analysis_mode,
+            self.guided_script, self.joint_script, self.converter_script, self.analysis_mode, self.use_polarimetry,
             self.pol_csv, self.pol_product, self.save_generated_frame, self.generated_analysis_dir,
-            self.outroot, self.show_plots_inline, self.verbose, self.lsq_verbose,
-            self.fmin, self.fmax, self.tess_grid_mode, self.tess_snr_stop, self.max_tess_modes,
+            self.output_target_subdir, self.outroot, self.show_plots_inline, self.verbose, self.lsq_verbose,
+            self.fmin, self.fmax, self.tess_grid_mode, self.tess_snr_stop, self.max_tess_modes, self.tess_candidates_per_iter,
+            self.tess_bootstrap_vet, self.tess_bootstrap_n, self.tess_bootstrap_block_days, self.tess_bootstrap_gap_days, self.tess_bootstrap_snr_min,
             self.pol_snr_stop, self.max_pol_modes, self.guided_pol_fmin, self.search_window_mult,
             self.noise_ks, self.noise_bins, self.channel_q, self.channel_u, self.channel_p,
             self.use_offsets, self.use_slopes, self.group_mode, self.gap_hours,
@@ -674,6 +735,7 @@ class GuidedAnalysisGUI(tk.Tk):
             self.joint_scale_free_basis, self.joint_manual_w_tess, self.joint_manual_w_pol,
         ], self._update_run_plan_preview)
         self._trace_vars([self.analysis_mode], self._update_analysis_mode_state)
+        self._trace_vars([self.use_polarimetry], self._update_polarimetry_state)
         self._trace_vars([self.joint_weight_mode], self._update_joint_weight_mode_state)
         self._trace_vars([self.phase_zero_mode], self._update_phase_zero_mode_state)
 
@@ -688,7 +750,7 @@ class GuidedAnalysisGUI(tk.Tk):
         for c in range(4):
             modef.columnconfigure(c, weight=1)
         self._combo(modef, "TESS input mode", self.tess_input_mode,
-                    ["existing_csv", "pipeline_dir", "spoc_lc_fits"], 0, 0, tooltip_key="tess_input_mode")
+                    ["existing_csv", "pipeline_dir", "pipeline_dir_batch", "spoc_lc_fits"], 0, 0, tooltip_key="tess_input_mode")
 
         csvf = ttk.LabelFrame(root, text="Existing CSV mode")
         csvf.grid(row=1, column=0, sticky="ew", padx=8, pady=6)
@@ -703,6 +765,7 @@ class GuidedAnalysisGUI(tk.Tk):
         self._entry(pipef, "Pattern", self.pipeline_pattern, 1, 0, tooltip_key="pipeline_pattern")
         self._combo(pipef, "Flux family", self.pipeline_flux, ["raw", "detrended", "auto"], 1, 2, tooltip_key="pipeline_flux")
         self._check(pipef, "Recursive", self.pipeline_recursive, 2, 0, tooltip_key="pipeline_recursive", command=self._update_run_plan_preview)
+        self._check(pipef, "Batch skip existing", self.pipeline_batch_skip_existing, 2, 1, tooltip_key="pipeline_batch_skip_existing", command=self._update_run_plan_preview)
         self._entry(pipef, "Force TESS y column (optional)", self.tess_force_y_col, 2, 2)
 
         spocf = ttk.LabelFrame(root, text="SPOC lc.fits conversion mode")
@@ -715,7 +778,7 @@ class GuidedAnalysisGUI(tk.Tk):
 
         self._trace_vars([
             self.tess_input_mode, self.tess_csv, self.pipeline_dir, self.pipeline_pattern,
-            self.pipeline_recursive, self.pipeline_flux, self.tess_force_y_col,
+            self.pipeline_recursive, self.pipeline_flux, self.pipeline_batch_skip_existing, self.tess_force_y_col,
             self.spoc_input, self.spoc_output_csv, self.spoc_template,
         ], self._update_run_plan_preview)
         self._trace_vars([self.tess_input_mode], self._update_tess_mode_state)
@@ -836,7 +899,7 @@ class GuidedAnalysisGUI(tk.Tk):
     def _update_tess_mode_state(self):
         mode = self.tess_input_mode.get()
         self._set_state_recursive(self.tess_mode_groups["csv"], "normal" if mode == "existing_csv" else "disabled")
-        self._set_state_recursive(self.tess_mode_groups["pipe"], "normal" if mode == "pipeline_dir" else "disabled")
+        self._set_state_recursive(self.tess_mode_groups["pipe"], "normal" if mode in ("pipeline_dir", "pipeline_dir_batch") else "disabled")
         self._set_state_recursive(self.tess_mode_groups["spoc"], "normal" if mode == "spoc_lc_fits" else "disabled")
         self._update_run_plan_preview()
 
@@ -870,6 +933,26 @@ class GuidedAnalysisGUI(tk.Tk):
                 except Exception:
                     pass
 
+        self._update_run_plan_preview()
+
+    def _update_polarimetry_state(self):
+        guided_mode = (self.analysis_mode.get().strip() == "guided_analysis")
+        use_pol = guided_mode and bool(self.use_polarimetry.get())
+        try:
+            self.use_polarimetry_chk.configure(state=("normal" if guided_mode else "disabled"))
+        except Exception:
+            pass
+        for w in getattr(self, "polarimetry_toggle_widgets", []):
+            if w is None:
+                continue
+            try:
+                if hasattr(w, "configure"):
+                    if w.__class__.__name__.lower().endswith("combobox"):
+                        w.configure(state=("readonly" if use_pol else "disabled"))
+                    else:
+                        w.configure(state=("normal" if use_pol else "disabled"))
+            except Exception:
+                pass
         self._update_run_plan_preview()
 
     def _update_joint_weight_mode_state(self):
@@ -933,7 +1016,8 @@ class GuidedAnalysisGUI(tk.Tk):
 
     def _build_config(self) -> dict:
         channels = self._channels_list()
-        if not channels:
+        use_polarimetry_active = (self.analysis_mode.get().strip() == "guided_analysis") and bool(self.use_polarimetry.get())
+        if use_polarimetry_active and not channels:
             raise ValueError("Select at least one polarimetric channel.")
         cfg = {
             "guided_script": self.guided_script.get().strip(),
@@ -945,11 +1029,14 @@ class GuidedAnalysisGUI(tk.Tk):
             "pipeline_pattern": self.pipeline_pattern.get().strip(),
             "pipeline_recursive": bool(self.pipeline_recursive.get()),
             "pipeline_flux": self.pipeline_flux.get().strip(),
+            "pipeline_batch_skip_existing": bool(self.pipeline_batch_skip_existing.get()),
             "tess_force_y_col": self.tess_force_y_col.get().strip(),
+            "use_polarimetry": use_polarimetry_active,
             "pol_csv": self.pol_csv.get().strip(),
             "pol_product": self.pol_product.get().strip(),
             "save_generated_frame": bool(self.save_generated_frame.get()),
             "generated_analysis_dir": self.generated_analysis_dir.get().strip(),
+            "output_target_subdir": bool(self.output_target_subdir.get()),
             "outroot": self.outroot.get().strip(),
             "show_plots_inline": bool(self.show_plots_inline.get()),
             "verbose": int(self.verbose.get()),
@@ -959,13 +1046,19 @@ class GuidedAnalysisGUI(tk.Tk):
             "tess_grid_mode": self.tess_grid_mode.get().strip(),
             "tess_snr_stop": float(self.tess_snr_stop.get()),
             "max_tess_modes": int(self.max_tess_modes.get()),
+            "tess_candidates_per_iter": int(self.tess_candidates_per_iter.get()),
+            "tess_bootstrap_vet": bool(self.tess_bootstrap_vet.get()),
+            "tess_bootstrap_n": int(self.tess_bootstrap_n.get()),
+            "tess_bootstrap_block_days": float(self.tess_bootstrap_block_days.get()),
+            "tess_bootstrap_gap_days": float(self.tess_bootstrap_gap_days.get()),
+            "tess_bootstrap_snr_min": float(self.tess_bootstrap_snr_min.get()),
             "pol_snr_stop": float(self.pol_snr_stop.get()),
             "max_pol_modes": int(self.max_pol_modes.get()),
             "guided_pol_fmin": float(self.guided_pol_fmin.get()),
             "search_window_mult": float(self.search_window_mult.get()),
             "noise_ks": float(self.noise_ks.get()),
             "noise_bins": int(self.noise_bins.get()),
-            "channels": channels,
+            "channels": (channels if use_polarimetry_active else []),
             "use_offsets": bool(self.use_offsets.get()),
             "use_slopes": bool(self.use_slopes.get()),
             "group_mode": self.group_mode.get().strip(),
@@ -1008,7 +1101,7 @@ class GuidedAnalysisGUI(tk.Tk):
                 raise ValueError("Joint-search script path is empty.")
         else:
             raise ValueError(f"Unsupported analysis mode: {cfg['analysis_mode']}")
-        if not cfg["pol_csv"]:
+        if cfg["use_polarimetry"] and not cfg["pol_csv"]:
             raise ValueError("Polarimetry CSV path is empty.")
         if not cfg["outroot"]:
             raise ValueError("Output root is empty.")
@@ -1020,6 +1113,14 @@ class GuidedAnalysisGUI(tk.Tk):
         elif cfg["tess_input_mode"] == "pipeline_dir":
             if not cfg["pipeline_dir"]:
                 raise ValueError("Pipeline/custom CSV mode selected but no pipeline directory is set.")
+            cfg["converter_command"] = None
+        elif cfg["tess_input_mode"] == "pipeline_dir_batch":
+            if cfg["analysis_mode"] != "guided_analysis":
+                raise ValueError("Batch-per-file CSV directory mode is implemented only for guided_analysis.")
+            if cfg["use_polarimetry"]:
+                raise ValueError("Batch-per-file CSV directory mode currently supports photometry-only runs. Uncheck Use polarimetry.")
+            if not cfg["pipeline_dir"]:
+                raise ValueError("Batch CSV directory mode selected but no pipeline directory is set.")
             cfg["converter_command"] = None
         elif cfg["tess_input_mode"] == "spoc_lc_fits":
             cfg["converter_command"] = self._build_converter_command()
@@ -1045,19 +1146,27 @@ class GuidedAnalysisGUI(tk.Tk):
             elif cfg["tess_input_mode"] == "pipeline_dir":
                 lines.append(f"Pipeline dir: {cfg['pipeline_dir']}")
                 lines.append(f"Pattern: {cfg['pipeline_pattern']} | recursive={cfg['pipeline_recursive']} | flux={cfg['pipeline_flux']}")
+            elif cfg["tess_input_mode"] == "pipeline_dir_batch":
+                lines.append(f"Batch pipeline dir: {cfg['pipeline_dir']}")
+                lines.append(f"Pattern: {cfg['pipeline_pattern']} | recursive={cfg['pipeline_recursive']} | flux={cfg['pipeline_flux']} | skip_existing={cfg['pipeline_batch_skip_existing']}")
             else:
                 lines.append("SPOC converter command:")
                 lines.append("  " + quote_cmd(cfg["converter_command"]))
                 lines.append(f"Converted CSV: {cfg['tess_csv']}")
             lines.extend([
-                f"Polarimetry CSV: {cfg['pol_csv']}",
-                f"POL product: {cfg['pol_product']}",
-                f"Channels: {', '.join(cfg['channels'])}",
+                f"Use polarimetry: {cfg['use_polarimetry']}",
+                f"Polarimetry CSV: {cfg['pol_csv'] if cfg['use_polarimetry'] else '(not used)'}",
+                f"POL product: {cfg['pol_product'] if cfg['use_polarimetry'] else '(not used)'}",
+                f"Channels: {', '.join(cfg['channels']) if cfg['use_polarimetry'] else '(none)'}",
                 f"Output root: {cfg['outroot']}",
+                f"Target subdirectory: {cfg['output_target_subdir']}",
                 f"Phase zero: {cfg['phase_zero_mode']}" + (f" (BTJD={cfg['phase_zero_btjd']})" if cfg['phase_zero_mode']=='custom_btjd' else (" (absolute TESS BTJD=0.0)" if cfg['phase_zero_mode']=='btjd_zero' else "")),
             ])
             if cfg["analysis_mode"] == "guided_analysis":
-                lines.append("Run style: wrapper script imports guided module, applies settings, and calls run_analysis().")
+                if cfg["tess_input_mode"] == "pipeline_dir_batch":
+                    lines.append("Run style: wrapper script imports guided module and runs one photometry-only guided analysis per matching CSV.")
+                else:
+                    lines.append("Run style: wrapper script imports guided module, applies settings, and calls run_analysis().")
             else:
                 lines.append("Run style: wrapper script patches the joint-search companion script with the chosen settings and runs the patched copy.")
                 lines.append(
@@ -1134,71 +1243,147 @@ if CFG["analysis_mode"] == "guided_analysis":
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
 
+    def _apply_guided_common_settings(mod):
+        mod.TESS_FORCE_Y_COL = CFG["tess_force_y_col"] if CFG["tess_force_y_col"] else None
+
+        mod.USE_POLARIMETRY = bool(CFG["use_polarimetry"])
+        mod.POL_CSV = Path(CFG["pol_csv"]) if CFG["pol_csv"] else Path(".")
+        mod.POL_PRODUCT = CFG["pol_product"]
+        mod.POL_SAVE_GENERATED_ANALYSIS_FRAME = bool(CFG["save_generated_frame"])
+        mod.POL_GENERATED_ANALYSIS_DIR = (None if not CFG["generated_analysis_dir"] else str(CFG["generated_analysis_dir"]))
+        mod.OUTROOT = Path(CFG["outroot"])
+        mod.OUTROOT.mkdir(parents=True, exist_ok=True)
+        mod.OUTPUT_TARGET_SUBDIR = bool(CFG["output_target_subdir"])
+        mod.SHOW_PLOTS_INLINE = bool(CFG["show_plots_inline"])
+        mod.VERBOSE = int(CFG["verbose"])
+        mod.LSQ_VERBOSE = int(CFG["lsq_verbose"])
+
+        mod.FMIN = float(CFG["fmin"])
+        mod.FMAX = float(CFG["fmax"])
+        mod.TESS_GRID_MODE = CFG["tess_grid_mode"]
+        mod.TESS_SNR_STOP = float(CFG["tess_snr_stop"])
+        mod.MAX_TESS_MODES = int(CFG["max_tess_modes"])
+        mod.TESS_CANDIDATES_PER_ITER = int(CFG["tess_candidates_per_iter"])
+        mod.TESS_FINAL_BOOTSTRAP_VET = bool(CFG["tess_bootstrap_vet"])
+        mod.TESS_BOOTSTRAP_N = int(CFG["tess_bootstrap_n"])
+        mod.TESS_BOOTSTRAP_BLOCK_DAYS = float(CFG["tess_bootstrap_block_days"])
+        mod.TESS_BOOTSTRAP_GAP_DAYS = float(CFG["tess_bootstrap_gap_days"])
+        mod.TESS_BOOTSTRAP_SNR_MIN = float(CFG["tess_bootstrap_snr_min"])
+        mod.POL_SNR_STOP = float(CFG["pol_snr_stop"])
+        mod.MAX_POL_MODES = int(CFG["max_pol_modes"])
+        mod.GUIDED_POL_FMIN = float(CFG["guided_pol_fmin"])
+        mod.POL_SEARCH_WINDOW_MULT = float(CFG["search_window_mult"])
+        mod.POL_LOCAL_NOISE_KS = float(CFG["noise_ks"])
+        mod.POL_LOCAL_NOISE_SIDE_BINS = int(CFG["noise_bins"])
+        mod.POL_CHANNELS = list(CFG["channels"]) if CFG["use_polarimetry"] else []
+        mod.USE_POL_NIGHT_OFFSETS = bool(CFG["use_offsets"])
+        mod.USE_POL_NIGHT_SLOPES = bool(CFG["use_slopes"])
+        mod.POL_NIGHT_GROUP_MODE = CFG["group_mode"]
+        mod.POL_NIGHT_GAP_HOURS = float(CFG["gap_hours"])
+        mod.DO_DETREND = bool(CFG["do_detrend"])
+        mod.DETREND_POLY_ORDER = int(CFG["detrend_order"])
+        mod.N_PHASE_PLOTS = int(CFG["n_phase_plots"])
+        mod.PHASE_SORT_BY = CFG["phase_sort_by"]
+        mod.PHASE_PLOT_STYLE = CFG["phase_plot_style"]
+        mod.PHASE_ZERO_MODE = CFG["phase_zero_mode"]
+        mod.PHASE_ZERO_BTJD = float(CFG["phase_zero_btjd"])
+
+        mod.POL_PLOT_PREPROCESS_DIAGNOSTICS = bool(CFG["plot_preprocess"])
+        mod.POL_PREPROCESS_PLOT_CHUNK_DAYS = float(CFG["preplot_chunk_days"])
+        mod.POL_PREPROCESS_PLOT_PANELS_PER_FIG = int(CFG["preplot_panels"])
+        mod.POL_PREPROCESS_PLOT_INCLUDE_PREWHITEN = bool(CFG["preplot_include_pw"])
+        mod.POL_COMPUTE_PREWHITEN_PRODUCT = bool(CFG["compute_pw"])
+        mod.SUMMARY_SAVE_PERIOD_VERSION = bool(CFG["summary_save_period"])
+        mod.SUMMARY_SAVE_LOG_AMPLITUDE = bool(CFG["summary_save_log_amplitude"])
+
+    def _configure_guided_tess_input_for_mode(mod, mode, csv_path=None):
+        if mode == "existing_csv":
+            mod.TESS_INPUT_MODE = "spoc_csv"
+            mod.TESS_CSV = Path(CFG["tess_csv"])
+        elif mode == "pipeline_dir":
+            mod.TESS_INPUT_MODE = "pipeline_dir"
+            mod.TESS_PIPELINE_DIR = Path(CFG["pipeline_dir"])
+            mod.TESS_PIPELINE_PATTERN = CFG["pipeline_pattern"]
+            mod.TESS_PIPELINE_RECURSIVE = bool(CFG["pipeline_recursive"])
+            mod.TESS_PIPELINE_FLUX = CFG["pipeline_flux"]
+        elif mode == "pipeline_dir_batch":
+            mod.TESS_INPUT_MODE = "spoc_csv"
+            mod.TESS_CSV = Path(csv_path)
+        elif mode == "spoc_lc_fits":
+            mod.TESS_INPUT_MODE = "spoc_csv"
+            mod.TESS_CSV = Path(CFG["tess_csv"])
+        else:
+            raise SystemExit(f"Unsupported TESS input mode: {{mode}}")
+
     mode = CFG["tess_input_mode"]
-    if mode == "existing_csv":
-        mod.TESS_INPUT_MODE = "spoc_csv"
-        mod.TESS_CSV = Path(CFG["tess_csv"])
-    elif mode == "pipeline_dir":
-        mod.TESS_INPUT_MODE = "pipeline_dir"
-        mod.TESS_PIPELINE_DIR = Path(CFG["pipeline_dir"])
-        mod.TESS_PIPELINE_PATTERN = CFG["pipeline_pattern"]
-        mod.TESS_PIPELINE_RECURSIVE = bool(CFG["pipeline_recursive"])
-        mod.TESS_PIPELINE_FLUX = CFG["pipeline_flux"]
-    elif mode == "spoc_lc_fits":
-        mod.TESS_INPUT_MODE = "spoc_csv"
-        mod.TESS_CSV = Path(CFG["tess_csv"])
+    _apply_guided_common_settings(mod)
+
+    if mode != "pipeline_dir_batch":
+        _configure_guided_tess_input_for_mode(mod, mode)
+        outputs = mod.run_analysis()
+        print("GUI runner finished")
     else:
-        raise SystemExit(f"Unsupported TESS input mode: {{mode}}")
+        pipe_root = Path(CFG["pipeline_dir"]).expanduser()
+        if not pipe_root.exists():
+            raise SystemExit(f"Batch pipeline directory not found: {{pipe_root}}")
+        pattern = CFG["pipeline_pattern"]
+        files = sorted(pipe_root.rglob(pattern) if CFG["pipeline_recursive"] else pipe_root.glob(pattern))
+        files = [p for p in files if p.is_file()]
+        if not files:
+            raise SystemExit(f"No CSV files found in {{pipe_root}} matching {{pattern!r}}")
 
-    mod.TESS_FORCE_Y_COL = CFG["tess_force_y_col"] if CFG["tess_force_y_col"] else None
+        print(f"Guided batch mode: {{len(files)}} CSV file(s) found")
+        print("  Input dir =", pipe_root)
+        print("  Output root =", Path(CFG["outroot"]).expanduser())
 
-    mod.POL_CSV = Path(CFG["pol_csv"])
-    mod.POL_PRODUCT = CFG["pol_product"]
-    mod.POL_SAVE_GENERATED_ANALYSIS_FRAME = bool(CFG["save_generated_frame"])
-    mod.POL_GENERATED_ANALYSIS_DIR = (None if not CFG["generated_analysis_dir"] else str(CFG["generated_analysis_dir"]))
-    mod.OUTROOT = Path(CFG["outroot"])
-    mod.OUTROOT.mkdir(parents=True, exist_ok=True)
-    mod.SHOW_PLOTS_INLINE = bool(CFG["show_plots_inline"])
-    mod.VERBOSE = int(CFG["verbose"])
-    mod.LSQ_VERBOSE = int(CFG["lsq_verbose"])
+        n_ok = 0
+        n_skip = 0
+        n_fail = 0
+        failures = []
 
-    mod.FMIN = float(CFG["fmin"])
-    mod.FMAX = float(CFG["fmax"])
-    mod.TESS_GRID_MODE = CFG["tess_grid_mode"]
-    mod.TESS_SNR_STOP = float(CFG["tess_snr_stop"])
-    mod.MAX_TESS_MODES = int(CFG["max_tess_modes"])
-    mod.POL_SNR_STOP = float(CFG["pol_snr_stop"])
-    mod.MAX_POL_MODES = int(CFG["max_pol_modes"])
-    mod.GUIDED_POL_FMIN = float(CFG["guided_pol_fmin"])
-    mod.POL_SEARCH_WINDOW_MULT = float(CFG["search_window_mult"])
-    mod.POL_LOCAL_NOISE_KS = float(CFG["noise_ks"])
-    mod.POL_LOCAL_NOISE_SIDE_BINS = int(CFG["noise_bins"])
-    mod.POL_CHANNELS = list(CFG["channels"])
-    mod.USE_POL_NIGHT_OFFSETS = bool(CFG["use_offsets"])
-    mod.USE_POL_NIGHT_SLOPES = bool(CFG["use_slopes"])
-    mod.POL_NIGHT_GROUP_MODE = CFG["group_mode"]
-    mod.POL_NIGHT_GAP_HOURS = float(CFG["gap_hours"])
-    mod.DO_DETREND = bool(CFG["do_detrend"])
-    mod.DETREND_POLY_ORDER = int(CFG["detrend_order"])
-    mod.N_PHASE_PLOTS = int(CFG["n_phase_plots"])
-    mod.PHASE_SORT_BY = CFG["phase_sort_by"]
-    mod.PHASE_PLOT_STYLE = CFG["phase_plot_style"]
-    mod.PHASE_ZERO_MODE = CFG["phase_zero_mode"]
-    mod.PHASE_ZERO_BTJD = float(CFG["phase_zero_btjd"])
+        for i, csv_path in enumerate(files, start=1):
+            print("\\n" + "-" * 88)
+            print(f"[{{i}}/{{len(files)}}] CSV: {{csv_path}}")
 
-    mod.POL_PLOT_PREPROCESS_DIAGNOSTICS = bool(CFG["plot_preprocess"])
-    mod.POL_PREPROCESS_PLOT_CHUNK_DAYS = float(CFG["preplot_chunk_days"])
-    mod.POL_PREPROCESS_PLOT_PANELS_PER_FIG = int(CFG["preplot_panels"])
-    mod.POL_PREPROCESS_PLOT_INCLUDE_PREWHITEN = bool(CFG["preplot_include_pw"])
-    mod.POL_COMPUTE_PREWHITEN_PRODUCT = bool(CFG["compute_pw"])
-    mod.SUMMARY_SAVE_PERIOD_VERSION = bool(CFG["summary_save_period"])
-    mod.SUMMARY_SAVE_LOG_AMPLITUDE_VERSION = bool(CFG["summary_save_log_amplitude"])
+            _apply_guided_common_settings(mod)
+            _configure_guided_tess_input_for_mode(mod, "pipeline_dir_batch", csv_path=csv_path)
 
-    print("Running guided analysis...")
-    outputs = mod.run_analysis()
-    if isinstance(outputs, dict):
-        print("Output keys:", sorted(outputs.keys()))
-    print("GUI runner finished")
+            try:
+                _, star_safe = mod.infer_star_labels_from_tess_path(csv_path)
+                expected = mod.expected_tess_peaks_table_path_for_csv(
+                    csv_path,
+                    outroot=Path(CFG["outroot"]),
+                    output_target_subdir=bool(CFG["output_target_subdir"]),
+                )
+            except Exception as exc:
+                print(f"  [WARN] Could not determine expected output path for skip-existing: {{exc}}")
+                star_safe = csv_path.stem
+                expected = None
+
+            if bool(CFG["pipeline_batch_skip_existing"]) and expected is not None and Path(expected).exists():
+                print(f"  [SKIP] Existing output found: {{expected}}")
+                n_skip += 1
+                continue
+
+            try:
+                mod.run_analysis()
+                n_ok += 1
+            except Exception as exc:
+                n_fail += 1
+                failures.append((str(csv_path), str(exc)))
+                print(f"  [FAIL] {{type(exc).__name__}}: {{exc}}")
+                traceback.print_exc()
+                continue
+
+        print("\\n" + "=" * 88)
+        print(f"Batch summary: success={{n_ok}} | skipped={{n_skip}} | failed={{n_fail}} | total={{len(files)}}")
+        if failures:
+            print("Failed files:")
+            for name, reason in failures[:20]:
+                print("  -", name, "->", reason)
+            if len(failures) > 20:
+                print(f"  ... and {{len(failures) - 20}} more")
+        print("GUI runner finished")
 
 elif CFG["analysis_mode"] == "joint_search":
     script_path = Path(CFG["joint_script"]).expanduser().resolve()
@@ -1481,19 +1666,37 @@ else:
         if self.preview_scale_mode.get().strip().lower() == "fit":
             self._render_current_preview()
 
+    def _widget_in_preview_canvas(self, widget):
+        w = widget
+        preview_targets = {getattr(self, "preview_canvas", None), getattr(self, "preview_panel", None)}
+        while w is not None:
+            if w in preview_targets:
+                return True
+            try:
+                w = w.master
+            except Exception:
+                break
+        return False
+
     def _on_preview_mousewheel(self, event):
+        if not self._widget_in_preview_canvas(getattr(event, "widget", None)):
+            return
         try:
             self.preview_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
         except Exception:
             pass
 
     def _on_preview_shift_mousewheel(self, event):
+        if not self._widget_in_preview_canvas(getattr(event, "widget", None)):
+            return
         try:
             self.preview_canvas.xview_scroll(int(-1 * (event.delta / 120)), "units")
         except Exception:
             pass
 
     def _on_preview_zoom_mousewheel(self, event):
+        if not self._widget_in_preview_canvas(getattr(event, "widget", None)):
+            return
         try:
             steps = 1 if event.delta > 0 else -1
             self._change_preview_zoom(steps)
@@ -1562,9 +1765,9 @@ else:
                 "guided_script", "joint_script", "converter_script", "analysis_mode", "tess_input_mode", "tess_csv",
                 "pipeline_dir", "pipeline_pattern", "pipeline_recursive", "pipeline_flux", "tess_force_y_col",
                 "spoc_input", "spoc_output_csv", "spoc_template", "pol_csv", "pol_product",
-                "save_generated_frame", "generated_analysis_dir", "outroot", "show_plots_inline",
+                "save_generated_frame", "generated_analysis_dir", "output_target_subdir", "outroot", "show_plots_inline",
                 "verbose", "lsq_verbose", "fmin", "fmax", "tess_grid_mode", "tess_snr_stop",
-                "max_tess_modes", "pol_snr_stop", "max_pol_modes", "guided_pol_fmin",
+                "max_tess_modes", "tess_candidates_per_iter", "tess_bootstrap_vet", "tess_bootstrap_n", "tess_bootstrap_block_days", "tess_bootstrap_gap_days", "tess_bootstrap_snr_min", "pol_snr_stop", "max_pol_modes", "guided_pol_fmin",
                 "search_window_mult", "noise_ks", "noise_bins", "use_offsets", "use_slopes",
                 "group_mode", "gap_hours", "do_detrend", "detrend_order", "n_phase_plots",
                 "phase_sort_by", "phase_plot_style", "phase_zero_mode", "phase_zero_btjd", "plot_preprocess", "preplot_chunk_days",
