@@ -12,9 +12,12 @@ import argparse
 from pathlib import Path
 import sys
 import re
+import time
+import signal
 
 import numpy as np
 import pandas as pd
+import requests
 
 from scipy.interpolate import PchipInterpolator
 from scipy.ndimage import gaussian_filter
@@ -492,6 +495,10 @@ def build_design_matrix_with_back(t, x, y, back, knot_spacing_days: float = 1.0,
     # Append background terms
     return np.hstack([X, bb[:, None], (bb**2)[:, None]])
 
+
+def completion_marker_path(outdir: Path, tpf_path: Path) -> Path:
+    return outdir / f".done_{sanitize_token(tpf_path.stem)}.txt"
+
 # =============================================================================
 # Metrics + helpers
 # =============================================================================
@@ -537,11 +544,47 @@ def get_neighbor_pixels(ap_set, ny: int, nx: int, allowed_mask):
 def pixel_radius_from_seed(seed_pix, iy: int, ix: int):
     return np.hypot(float(iy - seed_pix[0]), float(ix - seed_pix[1]))
 
+
+class GaiaQueryTimeout(RuntimeError):
+    """Raised when a Gaia query exceeds the configured timeout."""
+
+
+class _SignalTimeout:
+    def __init__(self, seconds: float | int | None):
+        try:
+            self.seconds = float(seconds)
+        except Exception:
+            self.seconds = 0.0
+        self._enabled = bool(self.seconds > 0 and hasattr(signal, "setitimer") and hasattr(signal, "SIGALRM"))
+        self._old_handler = None
+
+    def _handler(self, signum, frame):
+        raise GaiaQueryTimeout(f"Gaia query timed out after {self.seconds:g} s")
+
+    def __enter__(self):
+        if self._enabled:
+            self._old_handler = signal.getsignal(signal.SIGALRM)
+            signal.signal(signal.SIGALRM, self._handler)
+            signal.setitimer(signal.ITIMER_REAL, self.seconds)
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self._enabled:
+            signal.setitimer(signal.ITIMER_REAL, 0.0)
+            signal.signal(signal.SIGALRM, self._old_handler)
+        return False
+
 # =============================================================================
 # Gaia + Voronoi (version-safe cone search)
 # =============================================================================
 
-def gaia_brightest_sources_near(tpf, radius_arcmin: float = 6.0):
+def gaia_brightest_sources_near(
+    tpf,
+    radius_arcmin: float = 6.0,
+    max_retries: int = 3,
+    retry_sleep: tuple[float, ...] = (1.0, 3.0, 8.0),
+    timeout_sec: float = 60.0,
+):
     ra0 = dec0 = None
     for k in ("RA_OBJ", "RA", "ra"):
         if hasattr(tpf, "meta") and k in tpf.meta:
@@ -572,17 +615,35 @@ def gaia_brightest_sources_near(tpf, radius_arcmin: float = 6.0):
     center = SkyCoord(ra=ra0 * u.deg, dec=dec0 * u.deg)
     radius = float(radius_arcmin) * u.arcmin
 
-    # Make sure astroquery does not silently truncate the Gaia result set.
     Gaia.ROW_LIMIT = -1
 
-    # Use keyword args (astroquery signature changed across versions)
-    job = Gaia.cone_search_async(coordinate=center, radius=radius)
-    tab = job.get_results()
-    print(f"  Gaia cone search returned {len(tab)} rows before inside-stamp filtering")
-    if "phot_g_mean_mag" not in tab.colnames:
-        raise RuntimeError("Gaia result missing phot_g_mean_mag")
-    tab = tab[np.argsort(tab["phot_g_mean_mag"])]
-    return tab
+    last_err = None
+    for attempt in range(max(1, int(max_retries))):
+        try:
+            with _SignalTimeout(timeout_sec):
+                job = Gaia.cone_search_async(coordinate=center, radius=radius)
+                tab = job.get_results()
+            print(f"  Gaia cone search returned {len(tab)} rows before inside-stamp filtering")
+            if "phot_g_mean_mag" not in tab.colnames:
+                raise RuntimeError("Gaia result missing phot_g_mean_mag")
+            tab = tab[np.argsort(tab["phot_g_mean_mag"])]
+            return tab
+        except GaiaQueryTimeout as e:
+            last_err = e
+            print(f"  [WARN] Gaia query timed out ({attempt + 1}/{max_retries}): {e}")
+        except requests.exceptions.HTTPError as e:
+            last_err = e
+            print(f"  [WARN] Gaia query failed ({attempt + 1}/{max_retries}): {e}")
+        except Exception as e:
+            last_err = e
+            print(f"  [WARN] Gaia query failed ({attempt + 1}/{max_retries}): {type(e).__name__}: {e}")
+
+        if attempt < max(1, int(max_retries)) - 1:
+            delay = retry_sleep[min(attempt, len(retry_sleep) - 1)] if retry_sleep else 1.0
+            time.sleep(float(delay))
+
+    print("  [WARN] Gaia unavailable after retries." + (f" Last error: {last_err}" if last_err is not None else ""))
+    return None
 
 
 def sources_inside_stamp(tpf, gaia_tab, cadence_idx: int):
@@ -1274,7 +1335,9 @@ def infer_single_target_label(tpf, mean_image_2d=None, gaia_radius_arcmin: float
 
     # Fifth choice: brightest Gaia source actually inside the stamp.
     try:
-        gaia_tab = gaia_brightest_sources_near(tpf, radius_arcmin=max(float(gaia_radius_arcmin), 6.0))
+        gaia_tab = gaia_brightest_sources_near(tpf, radius_arcmin=max(float(gaia_radius_arcmin), 6.0), timeout_sec=60.0)
+        if gaia_tab is None:
+            raise RuntimeError("Gaia unavailable")
         gaia_in, _ = sources_inside_stamp(tpf, gaia_tab, cadence_idx=0)
         if len(gaia_in) > 0:
             row = gaia_in[0]
@@ -1373,6 +1436,17 @@ def parse_args(argv=None):
         "--no-quality0",
         action="store_true",
         help="Disable filtering to quality==0 cadences.",
+    )
+    p.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help="Skip TPFs that already have a completion marker in --output-root.",
+    )
+    p.add_argument(
+        "--gaia-timeout-sec",
+        type=float,
+        default=60.0,
+        help="Per-attempt timeout for Gaia cone searches in seconds. Set <=0 to disable timeout.",
     )
 
     # Growth knobs
@@ -1494,6 +1568,11 @@ def main(argv=None):
         print("TPF:", tpf_path)
 
         outdir = output_root
+        done_marker = completion_marker_path(outdir, tpf_path)
+        if getattr(args, "skip_existing", False) and done_marker.exists():
+            print(f"  [INFO] Skipping already-completed TPF: {tpf_path.name}")
+            continue
+        wrote_any_for_this_tpf = False
 
         tpf = lk.read(str(tpf_path))
         # Sector inference (used by MATLAB saturated-star mode)
@@ -1583,6 +1662,11 @@ def main(argv=None):
                     f"  Wrote {target_label} / target1 (matlab_pure): {raw_csv_path.name}"
                     f"  Npix={int(np.count_nonzero(ap_mask_2d))}"
                 )
+                wrote_any_for_this_tpf = True
+                try:
+                    done_marker.write_text(f"{tpf_path}\n", encoding="utf-8")
+                except Exception as e:
+                    print(f"  [WARN] Could not write completion marker {done_marker.name}: {e}")
                 continue
             else:
                 print(f"  [INFO] --matlab-pure-single-sat requested but saturation gate failed (npix_above_thresh={sat_npix}); using standard pipeline.")
@@ -1631,13 +1715,21 @@ def main(argv=None):
 
         if use_gaia:
             try:
-                gaia_tab = gaia_brightest_sources_near(tpf, radius_arcmin=args.gaia_radius_arcmin)
+                gaia_tab = gaia_brightest_sources_near(tpf, radius_arcmin=args.gaia_radius_arcmin, timeout_sec=args.gaia_timeout_sec)
+                if gaia_tab is None:
+                    if args.gaia_fallback and int(args.n_targets) == 1:
+                        print("  [WARN] Gaia unavailable after retries. Falling back to no-Gaia single-target mode.")
+                        use_gaia = False
+                    else:
+                        print("  [WARN] Gaia unavailable after retries; skipping this TPF.")
+                        continue
             except Exception as e:
                 if args.gaia_fallback and int(args.n_targets) == 1:
                     print(f"  [WARN] Gaia query failed ({type(e).__name__}: {e}). Falling back to no-Gaia single-target mode.")
                     use_gaia = False
                 else:
-                    raise
+                    print(f"  [WARN] Gaia query failed ({type(e).__name__}: {e}); skipping this TPF.")
+                    continue
 
         if use_gaia:
             # Gaia-based multi-/single-target identification (standard behavior)
@@ -1875,6 +1967,13 @@ def main(argv=None):
                     f"  Wrote {tag} ({meth_tag}): preferred_lc_{tag}_{meth_tag}.csv"
                     f"  Npix={int(np.count_nonzero(ap_mask))}"
                 )
+                wrote_any_for_this_tpf = True
+
+        if wrote_any_for_this_tpf:
+            try:
+                done_marker.write_text(f"{tpf_path}\n", encoding="utf-8")
+            except Exception as e:
+                print(f"  [WARN] Could not write completion marker {done_marker.name}: {e}")
 
     print("\nDone.")
     return 0

@@ -118,6 +118,16 @@ Gaia fallback
   --gaia-fallback
   If Gaia fails, fall back to no-Gaia single-target mode.
 
+Gaia timeout [s]
+  --gaia-timeout-sec
+  Per-attempt timeout for Gaia cone searches. If a Gaia request hangs, the extractor
+  aborts that attempt and retries or falls back/skips according to the other settings.
+
+Skip existing completed targets
+  --skip-existing
+  Skip TPFs that already have a completion marker in the output root.
+  This is most useful for resuming interrupted batch runs.
+
 Ignore quality flags
   --no-quality0
   Do not restrict to cadences with QUALITY == 0.
@@ -285,6 +295,8 @@ TOOLTIPS = {
     "ex_gaia_radius": "Cone-search radius used for Gaia target lookup.",
     "ex_no_gaia": "Skip Gaia queries and define the target from image pixels instead. Best for single-target runs.",
     "ex_gaia_fallback": "If Gaia fails, fall back to no-Gaia single-target mode.",
+    "ex_gaia_timeout": "Per-attempt timeout for Gaia cone searches in seconds. Use 0 or a negative value to disable the timeout.",
+    "ex_skip_existing": "Skip TPFs that already have a completion marker in the output root. Useful for resuming interrupted batch runs.",
     "ex_no_quality0": "Do not restrict to QUALITY==0 cadences.",
     "ex_pure_sum": "Use the full watershed-owned region for the target and sum all of those pixels instead of optimizing the aperture.",
     "ex_save_aperture_plots": "Save aperture-overlay PNGs. If unchecked, --no-aperture-plots is added.",
@@ -457,9 +469,11 @@ class TESSGui(tk.Tk):
         self.ex_n_targets = tk.IntVar(value=1)
         self.ex_method = tk.StringVar(value="jump")
         self.ex_gaia_radius = tk.DoubleVar(value=6.0)
+        self.ex_gaia_timeout = tk.DoubleVar(value=60.0)
 
         self.ex_no_gaia = tk.BooleanVar(value=False)
         self.ex_gaia_fallback = tk.BooleanVar(value=False)
+        self.ex_skip_existing = tk.BooleanVar(value=False)
         self.ex_no_quality0 = tk.BooleanVar(value=False)
         self.ex_pure_sum = tk.BooleanVar(value=False)
         self.ex_save_aperture_plots = tk.BooleanVar(value=True)
@@ -689,20 +703,23 @@ class TESSGui(tk.Tk):
         self._spin(main_frame, "N targets", self.ex_n_targets, 1, 20, 0, 0, tooltip_key="ex_n_targets")
         self._combo(main_frame, "Method", self.ex_method, ["jump", "core", "both"], 0, 2, tooltip_key="ex_method")
         self._entry(main_frame, "Gaia radius [arcmin]", self.ex_gaia_radius, 1, 0, tooltip_key="ex_gaia_radius")
+        self._entry(main_frame, "Gaia timeout [s]", self.ex_gaia_timeout, 1, 2, tooltip_key="ex_gaia_timeout")
 
         self._make_checkbutton(main_frame, text="No Gaia", variable=self.ex_no_gaia, command=self._update_extractor_state,
-                        tooltip_key="ex_no_gaia", row=1, column=2, sticky="w", padx=6, pady=4)
+                        tooltip_key="ex_no_gaia", row=2, column=2, sticky="w", padx=6, pady=4)
         self._make_checkbutton(main_frame, text="Gaia fallback", variable=self.ex_gaia_fallback, command=self._update_extractor_command_preview,
-                        tooltip_key="ex_gaia_fallback", row=1, column=3, sticky="w", padx=6, pady=4)
+                        tooltip_key="ex_gaia_fallback", row=2, column=3, sticky="w", padx=6, pady=4)
+        self._make_checkbutton(main_frame, text="Skip existing completed", variable=self.ex_skip_existing, command=self._update_extractor_command_preview,
+                        tooltip_key="ex_skip_existing", row=3, column=0, sticky="w", padx=6, pady=4)
         self._make_checkbutton(main_frame, text="Ignore quality flags", variable=self.ex_no_quality0, command=self._update_extractor_command_preview,
-                        tooltip_key="ex_no_quality0", row=2, column=0, sticky="w", padx=6, pady=4)
+                        tooltip_key="ex_no_quality0", row=4, column=0, sticky="w", padx=6, pady=4)
         self._make_checkbutton(main_frame, text="Pure sum", variable=self.ex_pure_sum, command=self._update_extractor_state,
-                        tooltip_key="ex_pure_sum", row=2, column=1, sticky="w", padx=6, pady=4)
+                        tooltip_key="ex_pure_sum", row=4, column=1, sticky="w", padx=6, pady=4)
         self._make_checkbutton(main_frame, text="MATLAB pure single saturated mode", variable=self.ex_matlab_pure_single_sat, command=self._update_extractor_state,
-                        tooltip_key="ex_matlab_pure_single_sat", row=2, column=2, columnspan=2, sticky="w", padx=6, pady=4)
+                        tooltip_key="ex_matlab_pure_single_sat", row=4, column=2, columnspan=2, sticky="w", padx=6, pady=4)
 
         self.ex_warning_label = ttk.Label(main_frame, text="", foreground="firebrick")
-        self.ex_warning_label.grid(row=3, column=0, columnspan=4, sticky="w", padx=6, pady=(4, 0))
+        self.ex_warning_label.grid(row=5, column=0, columnspan=4, sticky="w", padx=6, pady=(4, 0))
 
         adv = ttk.LabelFrame(root, text="Advanced")
         adv.grid(row=4, column=0, sticky="ew", padx=8, pady=6)
@@ -1002,7 +1019,7 @@ class TESSGui(tk.Tk):
         vars_to_trace = [
             self.extractor_script, self.ex_input_mode, self.ex_tpf_dir, self.ex_single_file,
             self.ex_recursive, self.ex_output_root, self.ex_n_targets, self.ex_method,
-            self.ex_gaia_radius, self.ex_no_gaia, self.ex_gaia_fallback, self.ex_no_quality0,
+            self.ex_gaia_radius, self.ex_no_gaia, self.ex_gaia_fallback, self.ex_skip_existing, self.ex_no_quality0,
             self.ex_pure_sum, self.ex_save_aperture_plots, self.ex_matlab_pure_single_sat,
             self.ex_min_pixels, self.ex_amp_q_lo, self.ex_amp_q_hi, self.ex_amp_min_frac,
             self.ex_max_radius_pix, self.ex_max_components, self.ex_min_seed_frac,
@@ -1048,11 +1065,50 @@ class TESSGui(tk.Tk):
             pass
         self._update_detrender_command_preview()
 
+
+    def _is_simple_extractor_script(self, script: str) -> bool:
+        name = Path(script).name.lower()
+        return ("simple_extractor" in name) and ("watershed" not in name)
+
     def build_extractor_command(self) -> list[str]:
         script = self.extractor_script.get().strip()
         if not script:
             raise ValueError("Extractor script path is empty.")
         cmd = [sys.executable, "-u", script]
+
+        # tess_simple_extractor/simple_tess_extractor use a different CLI than the watershed extractor.
+        # Build the appropriate command automatically based on the selected script name.
+        if self._is_simple_extractor_script(script):
+            if self.ex_input_mode.get() == "directory":
+                tpf_dir = self.ex_tpf_dir.get().strip() or "."
+                pattern = "**/*_tp.fits" if self.ex_recursive.get() else "*_tp.fits"
+                input_arg = str(Path(tpf_dir) / pattern)
+            else:
+                single = self.ex_single_file.get().strip()
+                if not single:
+                    raise ValueError("Single-file mode is selected but no FITS file is set.")
+                input_arg = single
+
+            cmd += ["--input", input_arg]
+            cmd += ["--outdir", self.ex_output_root.get().strip() or "LC_products_multi"]
+            cmd += ["--n-targets", str(int(self.ex_n_targets.get()))]
+
+            # Best-effort mapping of GUI controls that have reasonable analogs.
+            if self.ex_no_quality0.get():
+                cmd.append("--no-quality0")
+            if self.ex_save_aperture_plots.get():
+                cmd.append("--save-plots")
+
+            # The simple extractor uses aperture-mode instead of watershed method/pure-sum logic.
+            # "auto" is the safest GUI default because it can switch among apgrow/fixedap/fullstamp.
+            ap_mode = "auto"
+            if self.ex_pure_sum.get():
+                ap_mode = "fullstamp"
+            cmd += ["--aperture-mode", ap_mode]
+
+            # Map one closely related growth control where possible.
+            cmd += ["--min-frac-of-seed", str(float(self.ex_min_seed_frac.get()))]
+            return cmd
 
         if self.ex_input_mode.get() == "directory":
             cmd += ["--tpf-dir", self.ex_tpf_dir.get().strip() or "."]
@@ -1069,11 +1125,14 @@ class TESSGui(tk.Tk):
         if not self.ex_pure_sum.get():
             cmd += ["--method", self.ex_method.get()]
         cmd += ["--gaia-radius-arcmin", str(float(self.ex_gaia_radius.get()))]
+        cmd += ["--gaia-timeout-sec", str(float(self.ex_gaia_timeout.get()))]
 
         if self.ex_no_gaia.get():
             cmd.append("--no-gaia")
         if self.ex_gaia_fallback.get():
             cmd.append("--gaia-fallback")
+        if self.ex_skip_existing.get():
+            cmd.append("--skip-existing")
         if self.ex_no_quality0.get():
             cmd.append("--no-quality0")
         if self.ex_pure_sum.get():
@@ -1334,8 +1393,10 @@ class TESSGui(tk.Tk):
             "ex_n_targets": self.ex_n_targets.get(),
             "ex_method": self.ex_method.get(),
             "ex_gaia_radius": self.ex_gaia_radius.get(),
+            "ex_gaia_timeout": self.ex_gaia_timeout.get(),
             "ex_no_gaia": self.ex_no_gaia.get(),
             "ex_gaia_fallback": self.ex_gaia_fallback.get(),
+            "ex_skip_existing": self.ex_skip_existing.get(),
             "ex_no_quality0": self.ex_no_quality0.get(),
             "ex_pure_sum": self.ex_pure_sum.get(),
             "ex_save_aperture_plots": self.ex_save_aperture_plots.get(),
