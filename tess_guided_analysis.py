@@ -2083,8 +2083,12 @@ def run_analysis():
 
     t_all = time.time()
     tess = load_tess_input()
-    pol_dict = load_polarimetry_csv(POL_CSV, product=POL_PRODUCT, trend_cfg=trend_cfg)
-    vprint(1, f"Loaded datasets | TESS n={len(tess.t)} | " + ", ".join([f"{k} n={len(v.t)}" for k, v in pol_dict.items()]))
+    if POL_CHANNELS:
+        pol_dict = load_polarimetry_csv(POL_CSV, product=POL_PRODUCT, trend_cfg=trend_cfg)
+        vprint(1, f"Loaded datasets | TESS n={len(tess.t)} | " + ", ".join([f"{k} n={len(v.t)}" for k, v in pol_dict.items()]))
+    else:
+        pol_dict = {}
+        vprint(1, f"Loaded datasets | TESS n={len(tess.t)} | photometry-only mode")
 
     if DO_DETREND and DETREND_POLY_ORDER > 0:
         tess_dt = detrend_poly(tess, order=DETREND_POLY_ORDER)
