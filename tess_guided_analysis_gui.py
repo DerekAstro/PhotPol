@@ -54,6 +54,10 @@ Pipeline/custom CSV directory
   Point at a directory of CSV light curves and let guided analysis load them
   using TESS_INPUT_MODE = 'pipeline_dir'.
 
+Pipeline/custom CSV directory (batch one file at a time)
+  Point at a directory of CSV light curves and run the guided analysis once per file.
+  This is intended for photometry-only batch work over many CSVs.
+
 SPOC lc.fits conversion
   Run spoc_lightcurve_converter.py first, then feed the converted CSV into the
   guided analysis as a normal TESS CSV.
@@ -111,12 +115,13 @@ TOOLTIPS = {
     "joint_scale_free_basis": "Scale-free basis used when joint_weight_mode = scale_free.",
     "joint_manual_w_tess": "Manual relative weight for photometry when joint_weight_mode = manual.",
     "joint_manual_w_pol": "Manual relative weight for polarimetry when joint_weight_mode = manual.",
-    "tess_input_mode": "Choose whether TESS input comes from an existing CSV, a pipeline/custom CSV directory, or SPOC lc.fits conversion.",
+    "tess_input_mode": "Choose whether TESS input comes from an existing CSV, a pipeline/custom CSV directory, a batch-per-file CSV directory, or SPOC lc.fits conversion.",
     "tess_csv": "Existing TESS CSV file to load directly in spoc_csv mode.",
     "pipeline_dir": "Directory of pipeline/custom CSV light curves for pipeline_dir mode.",
     "pipeline_pattern": "Filename pattern used when scanning the pipeline/custom light-curve directory.",
     "pipeline_flux": "Preferred flux-family selection in pipeline_dir mode: raw, detrended, or auto.",
     "pipeline_recursive": "Search the pipeline/custom light-curve directory recursively.",
+"pipeline_batch_skip_existing": "In batch-per-file CSV directory mode, skip files whose per-target output directory already contains tess/peaks_table.csv.",
     "spoc_input": "SPOC lc.fits input path or glob used by the converter.",
     "spoc_output_csv": "CSV path that the converter should write before the guided analysis starts.",
     "spoc_template": "Command template used to run the SPOC converter. Use {python}, {script}, {input}, and {output} placeholders.",
@@ -293,6 +298,7 @@ class GuidedAnalysisGUI(tk.Tk):
         self.pipeline_dir = tk.StringVar(value="tess_pipeline_lcs")
         self.pipeline_pattern = tk.StringVar(value="*.csv")
         self.pipeline_recursive = tk.BooleanVar(value=False)
+        self.pipeline_batch_skip_existing = tk.BooleanVar(value=True)
         self.pipeline_flux = tk.StringVar(value="auto")
         self.tess_force_y_col = tk.StringVar(value="")
 
@@ -693,7 +699,7 @@ class GuidedAnalysisGUI(tk.Tk):
         for c in range(4):
             modef.columnconfigure(c, weight=1)
         self._combo(modef, "TESS input mode", self.tess_input_mode,
-                    ["existing_csv", "pipeline_dir", "spoc_lc_fits"], 0, 0, tooltip_key="tess_input_mode")
+                    ["existing_csv", "pipeline_dir", "pipeline_dir_batch", "spoc_lc_fits"], 0, 0, tooltip_key="tess_input_mode")
 
         csvf = ttk.LabelFrame(root, text="Existing CSV mode")
         csvf.grid(row=1, column=0, sticky="ew", padx=8, pady=6)
@@ -708,7 +714,8 @@ class GuidedAnalysisGUI(tk.Tk):
         self._entry(pipef, "Pattern", self.pipeline_pattern, 1, 0, tooltip_key="pipeline_pattern")
         self._combo(pipef, "Flux family", self.pipeline_flux, ["raw", "detrended", "auto"], 1, 2, tooltip_key="pipeline_flux")
         self._check(pipef, "Recursive", self.pipeline_recursive, 2, 0, tooltip_key="pipeline_recursive", command=self._update_run_plan_preview)
-        self._entry(pipef, "Force TESS y column (optional)", self.tess_force_y_col, 2, 2)
+        self._check(pipef, "Batch mode: skip existing", self.pipeline_batch_skip_existing, 2, 1, tooltip_key="pipeline_batch_skip_existing", command=self._update_run_plan_preview)
+        self._entry(pipef, "Force TESS y column (optional)", self.tess_force_y_col, 3, 0)
 
         spocf = ttk.LabelFrame(root, text="SPOC lc.fits conversion mode")
         spocf.grid(row=3, column=0, sticky="ew", padx=8, pady=6)
@@ -720,7 +727,7 @@ class GuidedAnalysisGUI(tk.Tk):
 
         self._trace_vars([
             self.tess_input_mode, self.tess_csv, self.pipeline_dir, self.pipeline_pattern,
-            self.pipeline_recursive, self.pipeline_flux, self.tess_force_y_col,
+            self.pipeline_recursive, self.pipeline_batch_skip_existing, self.pipeline_flux, self.tess_force_y_col,
             self.spoc_input, self.spoc_output_csv, self.spoc_template,
         ], self._update_run_plan_preview)
         self._trace_vars([self.tess_input_mode], self._update_tess_mode_state)
@@ -841,7 +848,7 @@ class GuidedAnalysisGUI(tk.Tk):
     def _update_tess_mode_state(self):
         mode = self.tess_input_mode.get()
         self._set_state_recursive(self.tess_mode_groups["csv"], "normal" if mode == "existing_csv" else "disabled")
-        self._set_state_recursive(self.tess_mode_groups["pipe"], "normal" if mode == "pipeline_dir" else "disabled")
+        self._set_state_recursive(self.tess_mode_groups["pipe"], "normal" if mode in ("pipeline_dir", "pipeline_dir_batch") else "disabled")
         self._set_state_recursive(self.tess_mode_groups["spoc"], "normal" if mode == "spoc_lc_fits" else "disabled")
         self._update_run_plan_preview()
 
@@ -971,6 +978,7 @@ class GuidedAnalysisGUI(tk.Tk):
             "pipeline_dir": self.pipeline_dir.get().strip(),
             "pipeline_pattern": self.pipeline_pattern.get().strip(),
             "pipeline_recursive": bool(self.pipeline_recursive.get()),
+            "pipeline_batch_skip_existing": bool(self.pipeline_batch_skip_existing.get()),
             "pipeline_flux": self.pipeline_flux.get().strip(),
             "tess_force_y_col": self.tess_force_y_col.get().strip(),
             "use_polarimetry": guided_use_polarimetry,
@@ -1049,6 +1057,14 @@ class GuidedAnalysisGUI(tk.Tk):
             if not cfg["pipeline_dir"]:
                 raise ValueError("Pipeline/custom CSV mode selected but no pipeline directory is set.")
             cfg["converter_command"] = None
+        elif cfg["tess_input_mode"] == "pipeline_dir_batch":
+            if cfg["analysis_mode"] != "guided_analysis":
+                raise ValueError("Batch-per-file CSV directory mode is implemented only for guided_analysis.")
+            if cfg["use_polarimetry"]:
+                raise ValueError("Batch-per-file CSV directory mode currently supports photometry-only runs. Uncheck Use polarimetry.")
+            if not cfg["pipeline_dir"]:
+                raise ValueError("Batch CSV directory mode selected but no pipeline directory is set.")
+            cfg["converter_command"] = None
         elif cfg["tess_input_mode"] == "spoc_lc_fits":
             cfg["converter_command"] = self._build_converter_command()
             cfg["tess_csv"] = self.spoc_output_csv.get().strip()
@@ -1073,6 +1089,9 @@ class GuidedAnalysisGUI(tk.Tk):
             elif cfg["tess_input_mode"] == "pipeline_dir":
                 lines.append(f"Pipeline dir: {cfg['pipeline_dir']}")
                 lines.append(f"Pattern: {cfg['pipeline_pattern']} | recursive={cfg['pipeline_recursive']} | flux={cfg['pipeline_flux']}")
+            elif cfg["tess_input_mode"] == "pipeline_dir_batch":
+                lines.append(f"Batch pipeline dir: {cfg['pipeline_dir']}")
+                lines.append(f"Pattern: {cfg['pipeline_pattern']} | recursive={cfg['pipeline_recursive']} | flux={cfg['pipeline_flux']} | skip_existing={cfg['pipeline_batch_skip_existing']}")
             else:
                 lines.append("SPOC converter command:")
                 lines.append("  " + quote_cmd(cfg["converter_command"]))
@@ -1159,77 +1178,124 @@ if CFG["analysis_mode"] == "guided_analysis":
     if not script_path.exists():
         raise SystemExit(f"Guided-analysis script not found: {{script_path}}")
 
-    spec = importlib.util.spec_from_file_location("guided_analysis_gui_module", script_path)
-    if spec is None or spec.loader is None:
-        raise SystemExit(f"Could not import guided-analysis script: {{script_path}}")
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+    def _load_guided_module():
+        spec = importlib.util.spec_from_file_location("guided_analysis_gui_module", script_path)
+        if spec is None or spec.loader is None:
+            raise SystemExit(f"Could not import guided-analysis script: {{script_path}}")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def _apply_guided_common_settings(mod):
+        mod.TESS_FORCE_Y_COL = CFG["tess_force_y_col"] if CFG["tess_force_y_col"] else None
+        mod.POL_CSV = Path(CFG["pol_csv"]) if CFG.get("pol_csv") else Path(".")
+        mod.POL_PRODUCT = CFG["pol_product"]
+        mod.POL_SAVE_GENERATED_ANALYSIS_FRAME = bool(CFG["save_generated_frame"])
+        mod.POL_GENERATED_ANALYSIS_DIR = (None if not CFG["generated_analysis_dir"] else str(CFG["generated_analysis_dir"]))
+        mod.SHOW_PLOTS_INLINE = bool(CFG["show_plots_inline"])
+        mod.VERBOSE = int(CFG["verbose"])
+        mod.LSQ_VERBOSE = int(CFG["lsq_verbose"])
+
+        mod.FMIN = float(CFG["fmin"])
+        mod.FMAX = float(CFG["fmax"])
+        mod.TESS_GRID_MODE = CFG["tess_grid_mode"]
+        mod.TESS_SNR_STOP = float(CFG["tess_snr_stop"])
+        mod.MAX_TESS_MODES = int(CFG["max_tess_modes"])
+        mod.POL_SNR_STOP = float(CFG["pol_snr_stop"])
+        mod.MAX_POL_MODES = int(CFG["max_pol_modes"])
+        mod.GUIDED_POL_FMIN = float(CFG["guided_pol_fmin"])
+        mod.POL_SEARCH_WINDOW_MULT = float(CFG["search_window_mult"])
+        mod.POL_LOCAL_NOISE_KS = float(CFG["noise_ks"])
+        mod.POL_LOCAL_NOISE_SIDE_BINS = int(CFG["noise_bins"])
+        mod.POL_CHANNELS = list(CFG["channels"])
+        mod.USE_POL_NIGHT_OFFSETS = bool(CFG["use_offsets"])
+        mod.USE_POL_NIGHT_SLOPES = bool(CFG["use_slopes"])
+        mod.POL_NIGHT_GROUP_MODE = CFG["group_mode"]
+        mod.POL_NIGHT_GAP_HOURS = float(CFG["gap_hours"])
+        mod.DO_DETREND = bool(CFG["do_detrend"])
+        mod.DETREND_POLY_ORDER = int(CFG["detrend_order"])
+        mod.N_PHASE_PLOTS = int(CFG["n_phase_plots"])
+        mod.PHASE_SORT_BY = CFG["phase_sort_by"]
+        mod.PHASE_PLOT_STYLE = CFG["phase_plot_style"]
+        mod.PHASE_ZERO_MODE = CFG["phase_zero_mode"]
+        mod.PHASE_ZERO_BTJD = float(CFG["phase_zero_btjd"])
+        mod.POL_PLOT_PREPROCESS_DIAGNOSTICS = bool(CFG["plot_preprocess"])
+        mod.POL_PREPROCESS_PLOT_CHUNK_DAYS = float(CFG["preplot_chunk_days"])
+        mod.POL_PREPROCESS_PLOT_PANELS_PER_FIG = int(CFG["preplot_panels"])
+        mod.POL_PREPROCESS_PLOT_INCLUDE_PREWHITEN = bool(CFG["preplot_include_pw"])
+        mod.POL_COMPUTE_PREWHITEN_PRODUCT = bool(CFG["compute_pw"])
+        mod.SUMMARY_SAVE_PERIOD_VERSION = bool(CFG["summary_save_period"])
+        mod.SUMMARY_SAVE_LOG_AMPLITUDE_VERSION = bool(CFG["summary_save_log_amplitude"])
 
     mode = CFG["tess_input_mode"]
-    if mode == "existing_csv":
-        mod.TESS_INPUT_MODE = "spoc_csv"
-        mod.TESS_CSV = Path(CFG["tess_csv"])
-    elif mode == "pipeline_dir":
-        mod.TESS_INPUT_MODE = "pipeline_dir"
-        mod.TESS_PIPELINE_DIR = Path(CFG["pipeline_dir"])
-        mod.TESS_PIPELINE_PATTERN = CFG["pipeline_pattern"]
-        mod.TESS_PIPELINE_RECURSIVE = bool(CFG["pipeline_recursive"])
-        mod.TESS_PIPELINE_FLUX = CFG["pipeline_flux"]
-    elif mode == "spoc_lc_fits":
-        mod.TESS_INPUT_MODE = "spoc_csv"
-        mod.TESS_CSV = Path(CFG["tess_csv"])
+    if mode == "pipeline_dir_batch":
+        if CFG.get("use_polarimetry", True):
+            raise SystemExit("Batch-per-file CSV directory mode currently supports photometry-only runs. Uncheck Use polarimetry.")
+        indir = Path(CFG["pipeline_dir"]).expanduser()
+        if not indir.exists():
+            raise SystemExit(f"Pipeline directory not found: {{indir}}")
+        files = sorted(indir.rglob(CFG["pipeline_pattern"]) if bool(CFG["pipeline_recursive"]) else indir.glob(CFG["pipeline_pattern"]))
+        files = [p for p in files if p.is_file()]
+        if not files:
+            raise SystemExit(f"No CSV files found in {{indir}} matching {{CFG['pipeline_pattern']!r}}")
+
+        outroot = Path(CFG["outroot"])
+        outroot.mkdir(parents=True, exist_ok=True)
+        print(f"Guided batch mode: {{len(files)}} CSV file(s) found")
+        print("  Input dir =", indir)
+        print("  Output root =", outroot)
+
+        for i, csv_path in enumerate(files, start=1):
+            target_out = outroot / csv_path.stem
+            done_path = target_out / "tess" / "peaks_table.csv"
+            print("\\n" + "-" * 88)
+            print(f"[{{i}}/{{len(files)}}] CSV: {{csv_path}}")
+            if bool(CFG.get("pipeline_batch_skip_existing", False)) and done_path.exists():
+                print(f"  [SKIP] Existing output found: {{done_path}}")
+                continue
+
+            mod = _load_guided_module()
+            _apply_guided_common_settings(mod)
+            mod.TESS_INPUT_MODE = "spoc_csv"
+            mod.TESS_CSV = csv_path
+            mod.OUTROOT = target_out
+            mod.OUTROOT.mkdir(parents=True, exist_ok=True)
+
+            try:
+                outputs = mod.run_analysis()
+                if isinstance(outputs, dict):
+                    print("  [OK] Output keys:", sorted(outputs.keys()))
+            except Exception as exc:
+                import traceback
+                print(f"  [FAIL] {{type(exc).__name__}}: {{exc}}")
+                traceback.print_exc()
+        print("GUI runner finished")
     else:
-        raise SystemExit(f"Unsupported TESS input mode: {{mode}}")
+        mod = _load_guided_module()
+        _apply_guided_common_settings(mod)
+        if mode == "existing_csv":
+            mod.TESS_INPUT_MODE = "spoc_csv"
+            mod.TESS_CSV = Path(CFG["tess_csv"])
+        elif mode == "pipeline_dir":
+            mod.TESS_INPUT_MODE = "pipeline_dir"
+            mod.TESS_PIPELINE_DIR = Path(CFG["pipeline_dir"])
+            mod.TESS_PIPELINE_PATTERN = CFG["pipeline_pattern"]
+            mod.TESS_PIPELINE_RECURSIVE = bool(CFG["pipeline_recursive"])
+            mod.TESS_PIPELINE_FLUX = CFG["pipeline_flux"]
+        elif mode == "spoc_lc_fits":
+            mod.TESS_INPUT_MODE = "spoc_csv"
+            mod.TESS_CSV = Path(CFG["tess_csv"])
+        else:
+            raise SystemExit(f"Unsupported TESS input mode: {{mode}}")
 
-    mod.TESS_FORCE_Y_COL = CFG["tess_force_y_col"] if CFG["tess_force_y_col"] else None
+        mod.OUTROOT = Path(CFG["outroot"])
+        mod.OUTROOT.mkdir(parents=True, exist_ok=True)
 
-    mod.POL_CSV = Path(CFG["pol_csv"]) if CFG.get("pol_csv") else Path(".")
-    mod.POL_PRODUCT = CFG["pol_product"]
-    mod.POL_SAVE_GENERATED_ANALYSIS_FRAME = bool(CFG["save_generated_frame"])
-    mod.POL_GENERATED_ANALYSIS_DIR = (None if not CFG["generated_analysis_dir"] else str(CFG["generated_analysis_dir"]))
-    mod.OUTROOT = Path(CFG["outroot"])
-    mod.OUTROOT.mkdir(parents=True, exist_ok=True)
-    mod.SHOW_PLOTS_INLINE = bool(CFG["show_plots_inline"])
-    mod.VERBOSE = int(CFG["verbose"])
-    mod.LSQ_VERBOSE = int(CFG["lsq_verbose"])
-
-    mod.FMIN = float(CFG["fmin"])
-    mod.FMAX = float(CFG["fmax"])
-    mod.TESS_GRID_MODE = CFG["tess_grid_mode"]
-    mod.TESS_SNR_STOP = float(CFG["tess_snr_stop"])
-    mod.MAX_TESS_MODES = int(CFG["max_tess_modes"])
-    mod.POL_SNR_STOP = float(CFG["pol_snr_stop"])
-    mod.MAX_POL_MODES = int(CFG["max_pol_modes"])
-    mod.GUIDED_POL_FMIN = float(CFG["guided_pol_fmin"])
-    mod.POL_SEARCH_WINDOW_MULT = float(CFG["search_window_mult"])
-    mod.POL_LOCAL_NOISE_KS = float(CFG["noise_ks"])
-    mod.POL_LOCAL_NOISE_SIDE_BINS = int(CFG["noise_bins"])
-    mod.POL_CHANNELS = list(CFG["channels"])
-    mod.USE_POL_NIGHT_OFFSETS = bool(CFG["use_offsets"])
-    mod.USE_POL_NIGHT_SLOPES = bool(CFG["use_slopes"])
-    mod.POL_NIGHT_GROUP_MODE = CFG["group_mode"]
-    mod.POL_NIGHT_GAP_HOURS = float(CFG["gap_hours"])
-    mod.DO_DETREND = bool(CFG["do_detrend"])
-    mod.DETREND_POLY_ORDER = int(CFG["detrend_order"])
-    mod.N_PHASE_PLOTS = int(CFG["n_phase_plots"])
-    mod.PHASE_SORT_BY = CFG["phase_sort_by"]
-    mod.PHASE_PLOT_STYLE = CFG["phase_plot_style"]
-    mod.PHASE_ZERO_MODE = CFG["phase_zero_mode"]
-    mod.PHASE_ZERO_BTJD = float(CFG["phase_zero_btjd"])
-
-    mod.POL_PLOT_PREPROCESS_DIAGNOSTICS = bool(CFG["plot_preprocess"])
-    mod.POL_PREPROCESS_PLOT_CHUNK_DAYS = float(CFG["preplot_chunk_days"])
-    mod.POL_PREPROCESS_PLOT_PANELS_PER_FIG = int(CFG["preplot_panels"])
-    mod.POL_PREPROCESS_PLOT_INCLUDE_PREWHITEN = bool(CFG["preplot_include_pw"])
-    mod.POL_COMPUTE_PREWHITEN_PRODUCT = bool(CFG["compute_pw"])
-    mod.SUMMARY_SAVE_PERIOD_VERSION = bool(CFG["summary_save_period"])
-    mod.SUMMARY_SAVE_LOG_AMPLITUDE_VERSION = bool(CFG["summary_save_log_amplitude"])
-
-    print("Running guided analysis...")
-    outputs = mod.run_analysis()
-    if isinstance(outputs, dict):
-        print("Output keys:", sorted(outputs.keys()))
-    print("GUI runner finished")
+        print("Running guided analysis...")
+        outputs = mod.run_analysis()
+        if isinstance(outputs, dict):
+            print("Output keys:", sorted(outputs.keys()))
+        print("GUI runner finished")
 
 elif CFG["analysis_mode"] == "joint_search":
     script_path = Path(CFG["joint_script"]).expanduser().resolve()
@@ -1591,7 +1657,7 @@ else:
         return {
             k: getattr(self, k).get() for k in [
                 "guided_script", "joint_script", "converter_script", "analysis_mode", "tess_input_mode", "tess_csv",
-                "pipeline_dir", "pipeline_pattern", "pipeline_recursive", "pipeline_flux", "tess_force_y_col",
+                "pipeline_dir", "pipeline_pattern", "pipeline_recursive", "pipeline_batch_skip_existing", "pipeline_flux", "tess_force_y_col",
                 "spoc_input", "spoc_output_csv", "spoc_template", "pol_csv", "pol_product",
                 "save_generated_frame", "generated_analysis_dir", "outroot", "show_plots_inline",
                 "verbose", "lsq_verbose", "fmin", "fmax", "tess_grid_mode", "tess_snr_stop",
