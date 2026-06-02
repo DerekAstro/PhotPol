@@ -7,6 +7,7 @@ import queue
 import re
 import shlex
 import subprocess
+import signal
 import sys
 import tempfile
 import threading
@@ -136,6 +137,7 @@ TOOLTIPS = {
     "lsq_verbose": "least_squares verbosity level for the global fits.",
     "fmin": "Minimum frequency in cycles/day.",
     "fmax": "Maximum frequency in cycles/day.",
+"tess_cap_fmax_to_nyquist": "When enabled, use the smaller of the GUI Fmax value and the TESS Nyquist frequency for the current dataset. This is the default and is especially useful in batch mode.",
     "tess_grid_mode": "Use the full baseline or the longest contiguous chunk to set the TESS discovery grid.",
     "tess_snr_stop": "Stop the sequential TESS search when the local SNR drops below this value.",
     "max_tess_modes": "Maximum number of sequential TESS modes to extract before the global fit.",
@@ -320,6 +322,7 @@ class GuidedAnalysisGUI(tk.Tk):
         # main analysis controls
         self.fmin = tk.DoubleVar(value=0.01)
         self.fmax = tk.DoubleVar(value=50.0)
+        self.tess_cap_fmax_to_nyquist = tk.BooleanVar(value=True)
         self.tess_grid_mode = tk.StringVar(value="full_baseline")
         self.tess_snr_stop = tk.DoubleVar(value=4.0)
         self.max_tess_modes = tk.IntVar(value=20)
@@ -579,15 +582,16 @@ class GuidedAnalysisGUI(tk.Tk):
             main.columnconfigure(c, weight=1)
         self._entry(main, "Fmin [c/d]", self.fmin, 0, 0, tooltip_key="fmin")
         self._entry(main, "Fmax [c/d]", self.fmax, 0, 2, tooltip_key="fmax")
-        self._combo(main, "TESS grid mode", self.tess_grid_mode, ["full_baseline", "longest_chunk"], 1, 0, tooltip_key="tess_grid_mode")
-        self._entry(main, "TESS SNR stop", self.tess_snr_stop, 1, 2, tooltip_key="tess_snr_stop")
-        self._spin(main, "Max TESS modes", self.max_tess_modes, 1, 999, 2, 0, tooltip_key="max_tess_modes")
-        self._entry(main, "POL SNR stop", self.pol_snr_stop, 2, 2, tooltip_key="pol_snr_stop")
-        self._spin(main, "Max POL modes", self.max_pol_modes, 1, 999, 3, 0, tooltip_key="max_pol_modes")
-        self._entry(main, "Guided POL fmin", self.guided_pol_fmin, 3, 2, tooltip_key="guided_pol_fmin")
-        self._entry(main, "Search window mult", self.search_window_mult, 4, 0, tooltip_key="search_window_mult")
-        self._entry(main, "Noise KS", self.noise_ks, 4, 2, tooltip_key="noise_ks")
-        self._spin(main, "Noise side bins", self.noise_bins, 1, 1000, 5, 0, tooltip_key="noise_bins")
+        self._check(main, "Cap Fmax to TESS Nyquist", self.tess_cap_fmax_to_nyquist, 1, 2, tooltip_key="tess_cap_fmax_to_nyquist", command=self._update_run_plan_preview, colspan=2)
+        self._combo(main, "TESS grid mode", self.tess_grid_mode, ["full_baseline", "longest_chunk"], 2, 0, tooltip_key="tess_grid_mode")
+        self._entry(main, "TESS SNR stop", self.tess_snr_stop, 2, 2, tooltip_key="tess_snr_stop")
+        self._spin(main, "Max TESS modes", self.max_tess_modes, 1, 999, 3, 0, tooltip_key="max_tess_modes")
+        self._entry(main, "POL SNR stop", self.pol_snr_stop, 3, 2, tooltip_key="pol_snr_stop")
+        self._spin(main, "Max POL modes", self.max_pol_modes, 1, 999, 4, 0, tooltip_key="max_pol_modes")
+        self._entry(main, "Guided POL fmin", self.guided_pol_fmin, 4, 2, tooltip_key="guided_pol_fmin")
+        self._entry(main, "Search window mult", self.search_window_mult, 5, 0, tooltip_key="search_window_mult")
+        self._entry(main, "Noise KS", self.noise_ks, 5, 2, tooltip_key="noise_ks")
+        self._spin(main, "Noise side bins", self.noise_bins, 1, 1000, 6, 0, tooltip_key="noise_bins")
 
         chans = ttk.LabelFrame(root, text="Channels / baseline model")
         chans.grid(row=3, column=0, sticky="ew", padx=8, pady=6)
@@ -992,6 +996,7 @@ class GuidedAnalysisGUI(tk.Tk):
             "lsq_verbose": int(self.lsq_verbose.get()),
             "fmin": float(self.fmin.get()),
             "fmax": float(self.fmax.get()),
+            "tess_cap_fmax_to_nyquist": bool(self.tess_cap_fmax_to_nyquist.get()),
             "tess_grid_mode": self.tess_grid_mode.get().strip(),
             "tess_snr_stop": float(self.tess_snr_stop.get()),
             "max_tess_modes": int(self.max_tess_modes.get()),
@@ -1198,6 +1203,7 @@ if CFG["analysis_mode"] == "guided_analysis":
 
         mod.FMIN = float(CFG["fmin"])
         mod.FMAX = float(CFG["fmax"])
+        mod.TESS_CAP_FMAX_TO_NYQUIST = bool(CFG["tess_cap_fmax_to_nyquist"])
         mod.TESS_GRID_MODE = CFG["tess_grid_mode"]
         mod.TESS_SNR_STOP = float(CFG["tess_snr_stop"])
         mod.MAX_TESS_MODES = int(CFG["max_tess_modes"])
@@ -1458,7 +1464,71 @@ else:
         job_name = "Joint analysis" if cfg["analysis_mode"] == "joint_search" else "Guided analysis"
         self._run_subprocess(job_name, cmd, Path(cfg["outroot"]))
 
+
+    def _clear_current_process_state(self, status: str = "Ready."):
+        self.current_process = None
+
+        self.status_text.set(status)
+
+    def _reap_stale_process_if_needed(self) -> bool:
+        proc = self.current_process
+        if proc is None:
+            return False
+        try:
+            rc = proc.poll()
+        except Exception:
+            rc = None
+        if rc is None:
+            return False
+        self.log_text.insert("end", f"\n[INFO] Cleared stale finished process (exit code {rc}).\n")
+        self.log_text.see("end")
+        self._clear_current_process_state("Ready.")
+        return True
+
+    def _terminate_process_tree(self, proc: subprocess.Popen, force: bool = False):
+        if os.name == "nt":
+            cmd = ["taskkill", "/PID", str(proc.pid), "/T"]
+            if force:
+                cmd.append("/F")
+            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+            return
+        try:
+            pgid = os.getpgid(proc.pid)
+        except Exception:
+            pgid = None
+        sig = signal.SIGKILL if force else signal.SIGTERM
+        if pgid is not None:
+            try:
+                os.killpg(pgid, sig)
+                return
+            except Exception:
+                pass
+        try:
+            proc.kill() if force else proc.terminate()
+        except Exception:
+            pass
+
+    def _stop_process_worker(self, proc: subprocess.Popen):
+        try:
+            self._terminate_process_tree(proc, force=False)
+            try:
+                proc.wait(timeout=3.0)
+            except Exception:
+                self._terminate_process_tree(proc, force=True)
+                try:
+                    proc.wait(timeout=2.0)
+                except Exception:
+                    pass
+        finally:
+            if self.current_process is proc:
+                try:
+                    rc = proc.poll()
+                except Exception:
+                    rc = None
+                self.log_queue.put(("done", f"Process stop requested; final exit code {rc}.\n"))
+
     def _run_subprocess(self, job_name: str, cmd: list[str], output_dir: Path):
+        self._reap_stale_process_if_needed()
         if self.current_process is not None:
             messagebox.showwarning("Job already running", "Stop the current process before starting another one.")
             return
@@ -1472,22 +1542,26 @@ else:
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
         try:
-            self.current_process = subprocess.Popen(
-                cmd,
+            popen_kwargs = dict(
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
                 bufsize=1,
                 env=env,
             )
+            if os.name == "nt":
+                popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            else:
+                popen_kwargs["preexec_fn"] = os.setsid
+            self.current_process = subprocess.Popen(cmd, **popen_kwargs)
         except Exception as exc:
-            self.current_process = None
-            self.status_text.set("Ready.")
+            self._clear_current_process_state("Ready.")
             messagebox.showerror("Failed to start process", str(exc))
             return
 
-        def reader_thread():
-            proc = self.current_process
+        proc = self.current_process
+
+        def reader_thread(proc=proc):
             try:
                 if proc and proc.stdout is not None:
                     for line in proc.stdout:
@@ -1500,11 +1574,13 @@ else:
         threading.Thread(target=reader_thread, daemon=True).start()
 
     def stop_current_process(self):
-        if self.current_process is None:
+        self._reap_stale_process_if_needed()
+        proc = self.current_process
+        if proc is None:
             return
         try:
-            self.current_process.terminate()
-            self.status_text.set("Stopping process...")
+            self.status_text.set("Stopping process tree...")
+            threading.Thread(target=self._stop_process_worker, args=(proc,), daemon=True).start()
         except Exception as exc:
             messagebox.showerror("Stop failed", str(exc))
 
@@ -1518,11 +1594,23 @@ else:
                 elif kind == "done":
                     self.log_text.insert("end", "\n" + payload + "\n")
                     self.log_text.see("end")
-                    self.current_process = None
-                    self.status_text.set("Ready.")
+                    self._clear_current_process_state("Ready.")
                     self._refresh_preview_list()
         except queue.Empty:
             pass
+
+        proc = self.current_process
+        if proc is not None:
+            try:
+                rc = proc.poll()
+            except Exception:
+                rc = None
+            if rc is not None:
+                self.log_text.insert("end", f"\n[INFO] Detected exited process without clean completion (exit code {rc}).\n")
+                self.log_text.see("end")
+                self._clear_current_process_state("Ready.")
+                self._refresh_preview_list()
+
         self.after(150, self._poll_log_queue)
 
     def _refresh_preview_list(self):

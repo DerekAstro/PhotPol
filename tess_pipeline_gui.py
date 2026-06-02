@@ -17,6 +17,7 @@ import queue
 import re
 import shlex
 import subprocess
+import signal
 import sys
 import threading
 from pathlib import Path
@@ -117,16 +118,6 @@ No Gaia
 Gaia fallback
   --gaia-fallback
   If Gaia fails, fall back to no-Gaia single-target mode.
-
-Gaia timeout [s]
-  --gaia-timeout-sec
-  Per-attempt timeout for Gaia cone searches. If a Gaia request hangs, the extractor
-  aborts that attempt and retries or falls back/skips according to the other settings.
-
-Skip existing completed targets
-  --skip-existing
-  Skip TPFs that already have a completion marker in the output root.
-  This is most useful for resuming interrupted batch runs.
 
 Ignore quality flags
   --no-quality0
@@ -295,8 +286,6 @@ TOOLTIPS = {
     "ex_gaia_radius": "Cone-search radius used for Gaia target lookup.",
     "ex_no_gaia": "Skip Gaia queries and define the target from image pixels instead. Best for single-target runs.",
     "ex_gaia_fallback": "If Gaia fails, fall back to no-Gaia single-target mode.",
-    "ex_gaia_timeout": "Per-attempt timeout for Gaia cone searches in seconds. Use 0 or a negative value to disable the timeout.",
-    "ex_skip_existing": "Skip TPFs that already have a completion marker in the output root. Useful for resuming interrupted batch runs.",
     "ex_no_quality0": "Do not restrict to QUALITY==0 cadences.",
     "ex_pure_sum": "Use the full watershed-owned region for the target and sum all of those pixels instead of optimizing the aperture.",
     "ex_save_aperture_plots": "Save aperture-overlay PNGs. If unchecked, --no-aperture-plots is added.",
@@ -469,11 +458,9 @@ class TESSGui(tk.Tk):
         self.ex_n_targets = tk.IntVar(value=1)
         self.ex_method = tk.StringVar(value="jump")
         self.ex_gaia_radius = tk.DoubleVar(value=6.0)
-        self.ex_gaia_timeout = tk.DoubleVar(value=60.0)
 
         self.ex_no_gaia = tk.BooleanVar(value=False)
         self.ex_gaia_fallback = tk.BooleanVar(value=False)
-        self.ex_skip_existing = tk.BooleanVar(value=False)
         self.ex_no_quality0 = tk.BooleanVar(value=False)
         self.ex_pure_sum = tk.BooleanVar(value=False)
         self.ex_save_aperture_plots = tk.BooleanVar(value=True)
@@ -703,23 +690,20 @@ class TESSGui(tk.Tk):
         self._spin(main_frame, "N targets", self.ex_n_targets, 1, 20, 0, 0, tooltip_key="ex_n_targets")
         self._combo(main_frame, "Method", self.ex_method, ["jump", "core", "both"], 0, 2, tooltip_key="ex_method")
         self._entry(main_frame, "Gaia radius [arcmin]", self.ex_gaia_radius, 1, 0, tooltip_key="ex_gaia_radius")
-        self._entry(main_frame, "Gaia timeout [s]", self.ex_gaia_timeout, 1, 2, tooltip_key="ex_gaia_timeout")
 
         self._make_checkbutton(main_frame, text="No Gaia", variable=self.ex_no_gaia, command=self._update_extractor_state,
-                        tooltip_key="ex_no_gaia", row=2, column=2, sticky="w", padx=6, pady=4)
+                        tooltip_key="ex_no_gaia", row=1, column=2, sticky="w", padx=6, pady=4)
         self._make_checkbutton(main_frame, text="Gaia fallback", variable=self.ex_gaia_fallback, command=self._update_extractor_command_preview,
-                        tooltip_key="ex_gaia_fallback", row=2, column=3, sticky="w", padx=6, pady=4)
-        self._make_checkbutton(main_frame, text="Skip existing completed", variable=self.ex_skip_existing, command=self._update_extractor_command_preview,
-                        tooltip_key="ex_skip_existing", row=3, column=0, sticky="w", padx=6, pady=4)
+                        tooltip_key="ex_gaia_fallback", row=1, column=3, sticky="w", padx=6, pady=4)
         self._make_checkbutton(main_frame, text="Ignore quality flags", variable=self.ex_no_quality0, command=self._update_extractor_command_preview,
-                        tooltip_key="ex_no_quality0", row=4, column=0, sticky="w", padx=6, pady=4)
+                        tooltip_key="ex_no_quality0", row=2, column=0, sticky="w", padx=6, pady=4)
         self._make_checkbutton(main_frame, text="Pure sum", variable=self.ex_pure_sum, command=self._update_extractor_state,
-                        tooltip_key="ex_pure_sum", row=4, column=1, sticky="w", padx=6, pady=4)
+                        tooltip_key="ex_pure_sum", row=2, column=1, sticky="w", padx=6, pady=4)
         self._make_checkbutton(main_frame, text="MATLAB pure single saturated mode", variable=self.ex_matlab_pure_single_sat, command=self._update_extractor_state,
-                        tooltip_key="ex_matlab_pure_single_sat", row=4, column=2, columnspan=2, sticky="w", padx=6, pady=4)
+                        tooltip_key="ex_matlab_pure_single_sat", row=2, column=2, columnspan=2, sticky="w", padx=6, pady=4)
 
         self.ex_warning_label = ttk.Label(main_frame, text="", foreground="firebrick")
-        self.ex_warning_label.grid(row=5, column=0, columnspan=4, sticky="w", padx=6, pady=(4, 0))
+        self.ex_warning_label.grid(row=3, column=0, columnspan=4, sticky="w", padx=6, pady=(4, 0))
 
         adv = ttk.LabelFrame(root, text="Advanced")
         adv.grid(row=4, column=0, sticky="ew", padx=8, pady=6)
@@ -1019,7 +1003,7 @@ class TESSGui(tk.Tk):
         vars_to_trace = [
             self.extractor_script, self.ex_input_mode, self.ex_tpf_dir, self.ex_single_file,
             self.ex_recursive, self.ex_output_root, self.ex_n_targets, self.ex_method,
-            self.ex_gaia_radius, self.ex_no_gaia, self.ex_gaia_fallback, self.ex_skip_existing, self.ex_no_quality0,
+            self.ex_gaia_radius, self.ex_no_gaia, self.ex_gaia_fallback, self.ex_no_quality0,
             self.ex_pure_sum, self.ex_save_aperture_plots, self.ex_matlab_pure_single_sat,
             self.ex_min_pixels, self.ex_amp_q_lo, self.ex_amp_q_hi, self.ex_amp_min_frac,
             self.ex_max_radius_pix, self.ex_max_components, self.ex_min_seed_frac,
@@ -1065,50 +1049,11 @@ class TESSGui(tk.Tk):
             pass
         self._update_detrender_command_preview()
 
-
-    def _is_simple_extractor_script(self, script: str) -> bool:
-        name = Path(script).name.lower()
-        return ("simple_extractor" in name) and ("watershed" not in name)
-
     def build_extractor_command(self) -> list[str]:
         script = self.extractor_script.get().strip()
         if not script:
             raise ValueError("Extractor script path is empty.")
         cmd = [sys.executable, "-u", script]
-
-        # tess_simple_extractor/simple_tess_extractor use a different CLI than the watershed extractor.
-        # Build the appropriate command automatically based on the selected script name.
-        if self._is_simple_extractor_script(script):
-            if self.ex_input_mode.get() == "directory":
-                tpf_dir = self.ex_tpf_dir.get().strip() or "."
-                pattern = "**/*_tp.fits" if self.ex_recursive.get() else "*_tp.fits"
-                input_arg = str(Path(tpf_dir) / pattern)
-            else:
-                single = self.ex_single_file.get().strip()
-                if not single:
-                    raise ValueError("Single-file mode is selected but no FITS file is set.")
-                input_arg = single
-
-            cmd += ["--input", input_arg]
-            cmd += ["--outdir", self.ex_output_root.get().strip() or "LC_products_multi"]
-            cmd += ["--n-targets", str(int(self.ex_n_targets.get()))]
-
-            # Best-effort mapping of GUI controls that have reasonable analogs.
-            if self.ex_no_quality0.get():
-                cmd.append("--no-quality0")
-            if self.ex_save_aperture_plots.get():
-                cmd.append("--save-plots")
-
-            # The simple extractor uses aperture-mode instead of watershed method/pure-sum logic.
-            # "auto" is the safest GUI default because it can switch among apgrow/fixedap/fullstamp.
-            ap_mode = "auto"
-            if self.ex_pure_sum.get():
-                ap_mode = "fullstamp"
-            cmd += ["--aperture-mode", ap_mode]
-
-            # Map one closely related growth control where possible.
-            cmd += ["--min-frac-of-seed", str(float(self.ex_min_seed_frac.get()))]
-            return cmd
 
         if self.ex_input_mode.get() == "directory":
             cmd += ["--tpf-dir", self.ex_tpf_dir.get().strip() or "."]
@@ -1125,14 +1070,11 @@ class TESSGui(tk.Tk):
         if not self.ex_pure_sum.get():
             cmd += ["--method", self.ex_method.get()]
         cmd += ["--gaia-radius-arcmin", str(float(self.ex_gaia_radius.get()))]
-        cmd += ["--gaia-timeout-sec", str(float(self.ex_gaia_timeout.get()))]
 
         if self.ex_no_gaia.get():
             cmd.append("--no-gaia")
         if self.ex_gaia_fallback.get():
             cmd.append("--gaia-fallback")
-        if self.ex_skip_existing.get():
-            cmd.append("--skip-existing")
         if self.ex_no_quality0.get():
             cmd.append("--no-quality0")
         if self.ex_pure_sum.get():
@@ -1216,7 +1158,72 @@ class TESSGui(tk.Tk):
             return
         self._run_subprocess("Detrender", cmd, Path(self.dt_output_dir.get().strip() or "."))
 
+
+    def _clear_current_process_state(self, status: str = "Ready."):
+        self.current_process = None
+        self.current_job_name = None
+
+        self.status_text.set(status)
+
+    def _reap_stale_process_if_needed(self) -> bool:
+        proc = self.current_process
+        if proc is None:
+            return False
+        try:
+            rc = proc.poll()
+        except Exception:
+            rc = None
+        if rc is None:
+            return False
+        self.log_text.insert("end", f"\n[INFO] Cleared stale finished process (exit code {rc}).\n")
+        self.log_text.see("end")
+        self._clear_current_process_state("Ready.")
+        return True
+
+    def _terminate_process_tree(self, proc: subprocess.Popen, force: bool = False):
+        if os.name == "nt":
+            cmd = ["taskkill", "/PID", str(proc.pid), "/T"]
+            if force:
+                cmd.append("/F")
+            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+            return
+        try:
+            pgid = os.getpgid(proc.pid)
+        except Exception:
+            pgid = None
+        sig = signal.SIGKILL if force else signal.SIGTERM
+        if pgid is not None:
+            try:
+                os.killpg(pgid, sig)
+                return
+            except Exception:
+                pass
+        try:
+            proc.kill() if force else proc.terminate()
+        except Exception:
+            pass
+
+    def _stop_process_worker(self, proc: subprocess.Popen):
+        try:
+            self._terminate_process_tree(proc, force=False)
+            try:
+                proc.wait(timeout=3.0)
+            except Exception:
+                self._terminate_process_tree(proc, force=True)
+                try:
+                    proc.wait(timeout=2.0)
+                except Exception:
+                    pass
+        finally:
+            if self.current_process is proc:
+                try:
+                    rc = proc.poll()
+                except Exception:
+                    rc = None
+                self.log_queue.put(("done", f"Process stop requested; final exit code {rc}.\n"))
+
     def _run_subprocess(self, job_name: str, cmd: list[str], output_dir: Path):
+        self._reap_stale_process_if_needed()
         if self.current_process is not None:
             messagebox.showwarning("Job already running", "Stop the current process before starting another one.")
             return
@@ -1234,22 +1241,26 @@ class TESSGui(tk.Tk):
         try:
             env = os.environ.copy()
             env["PYTHONUNBUFFERED"] = "1"
-            self.current_process = subprocess.Popen(
-                cmd,
+            popen_kwargs = dict(
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
                 bufsize=1,
                 env=env,
             )
+            if os.name == "nt":
+                popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            else:
+                popen_kwargs["preexec_fn"] = os.setsid
+            self.current_process = subprocess.Popen(cmd, **popen_kwargs)
         except Exception as exc:
-            self.current_process = None
-            self.status_text.set("Ready.")
+            self._clear_current_process_state("Ready.")
             messagebox.showerror("Failed to start process", str(exc))
             return
 
-        def reader_thread():
-            proc = self.current_process
+        proc = self.current_process
+
+        def reader_thread(proc=proc):
             try:
                 if proc and proc.stdout is not None:
                     for line in proc.stdout:
@@ -1262,11 +1273,13 @@ class TESSGui(tk.Tk):
         threading.Thread(target=reader_thread, daemon=True).start()
 
     def stop_current_process(self):
-        if self.current_process is None:
+        self._reap_stale_process_if_needed()
+        proc = self.current_process
+        if proc is None:
             return
         try:
-            self.current_process.terminate()
-            self.status_text.set("Stopping process...")
+            self.status_text.set("Stopping process tree...")
+            threading.Thread(target=self._stop_process_worker, args=(proc,), daemon=True).start()
         except Exception as exc:
             messagebox.showerror("Stop failed", str(exc))
 
@@ -1280,11 +1293,23 @@ class TESSGui(tk.Tk):
                 elif kind == "done":
                     self.log_text.insert("end", "\n" + payload + "\n")
                     self.log_text.see("end")
-                    self.current_process = None
-                    self.status_text.set("Ready.")
+                    self._clear_current_process_state("Ready.")
                     self._refresh_preview_list()
         except queue.Empty:
             pass
+
+        proc = self.current_process
+        if proc is not None:
+            try:
+                rc = proc.poll()
+            except Exception:
+                rc = None
+            if rc is not None:
+                self.log_text.insert("end", f"\n[INFO] Detected exited process without clean completion (exit code {rc}).\n")
+                self.log_text.see("end")
+                self._clear_current_process_state("Ready.")
+                self._refresh_preview_list()
+
         self.after(150, self._poll_log_queue)
 
     def clear_log(self):
@@ -1393,10 +1418,8 @@ class TESSGui(tk.Tk):
             "ex_n_targets": self.ex_n_targets.get(),
             "ex_method": self.ex_method.get(),
             "ex_gaia_radius": self.ex_gaia_radius.get(),
-            "ex_gaia_timeout": self.ex_gaia_timeout.get(),
             "ex_no_gaia": self.ex_no_gaia.get(),
             "ex_gaia_fallback": self.ex_gaia_fallback.get(),
-            "ex_skip_existing": self.ex_skip_existing.get(),
             "ex_no_quality0": self.ex_no_quality0.get(),
             "ex_pure_sum": self.ex_pure_sum.get(),
             "ex_save_aperture_plots": self.ex_save_aperture_plots.get(),

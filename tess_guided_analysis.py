@@ -80,6 +80,7 @@ POL_PREWHITEN_MAX_SAMPLES = 100_000
 # --- Frequency range (cycles/day) ---
 FMIN = 0.01
 FMAX = 50.0
+TESS_CAP_FMAX_TO_NYQUIST = True
 
 # --- TESS-only extraction ---
 TESS_OVERSAMPLE = 1.0
@@ -824,6 +825,20 @@ def longest_contiguous_segment_duration(t: np.ndarray, gap_days: float) -> float
 
 def compute_Tseg(ts: TimeSeries, gap_days: float = 1.0) -> float:
     return longest_contiguous_segment_duration(ts.t, gap_days=gap_days)
+
+def compute_tess_nyquist_cpd(ts: TimeSeries) -> float:
+    t = np.asarray(ts.t, dtype=float)
+    t = t[np.isfinite(t)]
+    if t.size < 2:
+        return np.nan
+    dt = np.diff(np.sort(t))
+    dt = dt[np.isfinite(dt) & (dt > 0)]
+    if dt.size == 0:
+        return np.nan
+    med_dt = np.nanmedian(dt)
+    if not np.isfinite(med_dt) or med_dt <= 0:
+        return np.nan
+    return float(0.5 / med_dt)
 
 def make_frequency_grid(fmin: float, fmax: float, df: float, max_points: int = 60000) -> np.ndarray:
     if not np.isfinite(df) or df <= 0:
@@ -2083,6 +2098,19 @@ def run_analysis():
 
     t_all = time.time()
     tess = load_tess_input()
+
+    requested_fmax = float(FMAX)
+    nyq_cpd = compute_tess_nyquist_cpd(tess)
+    effective_fmax = requested_fmax
+    if TESS_CAP_FMAX_TO_NYQUIST and np.isfinite(nyq_cpd):
+        effective_fmax = min(requested_fmax, float(nyq_cpd))
+        effective_fmax = max(float(FMIN), effective_fmax)
+    globals()["FMAX"] = float(effective_fmax)
+
+    if np.isfinite(nyq_cpd):
+        print("Requested FMAX =", requested_fmax, "| TESS Nyquist =", f"{nyq_cpd:.6g}", "| effective FMAX =", f"{effective_fmax:.6g}", "| cap_to_nyquist =", TESS_CAP_FMAX_TO_NYQUIST)
+    else:
+        print("Requested FMAX =", requested_fmax, "| TESS Nyquist = unavailable | effective FMAX =", f"{effective_fmax:.6g}", "| cap_to_nyquist =", TESS_CAP_FMAX_TO_NYQUIST)
     if POL_CHANNELS:
         pol_dict = load_polarimetry_csv(POL_CSV, product=POL_PRODUCT, trend_cfg=trend_cfg)
         vprint(1, f"Loaded datasets | TESS n={len(tess.t)} | " + ", ".join([f"{k} n={len(v.t)}" for k, v in pol_dict.items()]))
