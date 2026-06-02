@@ -13,11 +13,11 @@ from pathlib import Path
 import sys
 import re
 import time
-import signal
+import requests
+import multiprocessing as mp
 
 import numpy as np
 import pandas as pd
-import requests
 
 from scipy.interpolate import PchipInterpolator
 from scipy.ndimage import gaussian_filter
@@ -30,6 +30,7 @@ import matplotlib.pyplot as plt
 import astropy.units as u
 from astropy.coordinates import SkyCoord
 from astropy.io import fits
+from astropy.table import Table
 
 import lightkurve as lk
 from skimage.segmentation import watershed
@@ -115,10 +116,8 @@ def matlab_style_extract_lightcurve_pure(
     flag = np.zeros(npix, dtype=int)
     flag[els] = 1
 
-    # Track the actual aperture pixel set used at each iteration so the
-    # reconstructed final mask matches the light curve that was evaluated.
     ts_flux = [np.nansum(flux[:, els], axis=1)]
-    ts_pixel_sets = [np.array(els, dtype=int).copy()]
+    ts_pixels = list(els.astype(int))
     ts_diff = []
 
     pixel_means = np.nanmean(flux, axis=0)
@@ -160,7 +159,7 @@ def matlab_style_extract_lightcurve_pure(
         flag[bb] = 1
         ts_flux.append(ts_flux[-1] + flux[:, bb])
         ts_diff.append(aa)
-        ts_pixel_sets.append(np.concatenate([ts_pixel_sets[-1], np.array([bb], dtype=int)]))
+        ts_pixels.append(bb)
 
     fom = []
     for arr in ts_flux:
@@ -183,7 +182,7 @@ def matlab_style_extract_lightcurve_pure(
 
     rel_flux = best_flux / med
 
-    best_pixels_linear = np.array(ts_pixel_sets[best_idx], dtype=int)
+    best_pixels_linear = np.array(ts_pixels[: best_idx + 1], dtype=int)
     best_mask = np.zeros(npix, dtype=bool)
     best_mask[best_pixels_linear] = True
     best_mask_2d = best_mask.reshape(nrow, ncol)
@@ -207,7 +206,7 @@ def matlab_style_extract_lightcurve_pure(
         "npix": npix,
         "n_cadences_used": len(time),
         "n_initial_pixels": len(els),
-        "n_pixels_in_best_curve": int(best_mask.sum()),
+        "n_pixels_in_best_curve": best_idx + 1,
         "best_fom": float(fom[best_idx]),
         "threshold": float(threshold),
         "nback": int(nback),
@@ -495,7 +494,6 @@ def build_design_matrix_with_back(t, x, y, back, knot_spacing_days: float = 1.0,
     # Append background terms
     return np.hstack([X, bb[:, None], (bb**2)[:, None]])
 
-
 def completion_marker_path(outdir: Path, tpf_path: Path) -> Path:
     return outdir / f".done_{sanitize_token(tpf_path.stem)}.txt"
 
@@ -544,39 +542,102 @@ def get_neighbor_pixels(ap_set, ny: int, nx: int, allowed_mask):
 def pixel_radius_from_seed(seed_pix, iy: int, ix: int):
     return np.hypot(float(iy - seed_pix[0]), float(ix - seed_pix[1]))
 
+# =============================================================================
+# Gaia + Voronoi (version-safe cone search)
+# =============================================================================
 
 class GaiaQueryTimeout(RuntimeError):
     """Raised when a Gaia query exceeds the configured timeout."""
 
 
-class _SignalTimeout:
-    def __init__(self, seconds: float | int | None):
-        try:
-            self.seconds = float(seconds)
-        except Exception:
-            self.seconds = 0.0
-        self._enabled = bool(self.seconds > 0 and hasattr(signal, "setitimer") and hasattr(signal, "SIGALRM"))
-        self._old_handler = None
+def _serialize_gaia_table_subset(tab):
+    cols = ["source_id", "ra", "dec", "phot_g_mean_mag"]
+    payload = {}
+    for name in cols:
+        if name not in tab.colnames:
+            continue
+        col = np.asarray(tab[name])
+        if getattr(col, "dtype", None) is not None and col.dtype.kind in ("i", "u"):
+            payload[name] = [int(x) for x in col]
+        else:
+            out = []
+            for x in col:
+                try:
+                    out.append(float(x))
+                except Exception:
+                    out.append(str(x))
+            payload[name] = out
+    return payload
 
-    def _handler(self, signum, frame):
-        raise GaiaQueryTimeout(f"Gaia query timed out after {self.seconds:g} s")
 
-    def __enter__(self):
-        if self._enabled:
-            self._old_handler = signal.getsignal(signal.SIGALRM)
-            signal.signal(signal.SIGALRM, self._handler)
-            signal.setitimer(signal.ITIMER_REAL, self.seconds)
-        return self
+def _gaia_cone_search_worker(ra_deg: float, dec_deg: float, radius_arcmin: float, queue):
+    try:
+        from astroquery.gaia import Gaia as WorkerGaia
+        import astropy.units as worker_u
+        from astropy.coordinates import SkyCoord as WorkerSkyCoord
+        import numpy as worker_np
 
-    def __exit__(self, exc_type, exc, tb):
-        if self._enabled:
-            signal.setitimer(signal.ITIMER_REAL, 0.0)
-            signal.signal(signal.SIGALRM, self._old_handler)
-        return False
+        center = WorkerSkyCoord(ra=float(ra_deg) * worker_u.deg, dec=float(dec_deg) * worker_u.deg)
+        radius = float(radius_arcmin) * worker_u.arcmin
+        WorkerGaia.ROW_LIMIT = -1
+        job = WorkerGaia.cone_search_async(coordinate=center, radius=radius)
+        tab = job.get_results()
 
-# =============================================================================
-# Gaia + Voronoi (version-safe cone search)
-# =============================================================================
+        if "phot_g_mean_mag" not in tab.colnames:
+            raise RuntimeError("Gaia result missing phot_g_mean_mag")
+
+        order = worker_np.argsort(tab["phot_g_mean_mag"])
+        tab = tab[order]
+        queue.put({
+            "ok": True,
+            "nrows": int(len(tab)),
+            "data": _serialize_gaia_table_subset(tab),
+        })
+    except Exception as e:
+        queue.put({
+            "ok": False,
+            "err_type": type(e).__name__,
+            "err": str(e),
+        })
+
+
+def _gaia_cone_search_with_timeout(ra_deg: float, dec_deg: float, radius_arcmin: float, timeout_sec: float):
+    timeout_sec = float(timeout_sec)
+    if timeout_sec <= 0:
+        q = mp.get_context("spawn").Queue()
+        _gaia_cone_search_worker(ra_deg, dec_deg, radius_arcmin, q)
+        payload = q.get()
+    else:
+        ctx = mp.get_context("spawn")
+        q = ctx.Queue()
+        p = ctx.Process(
+            target=_gaia_cone_search_worker,
+            args=(float(ra_deg), float(dec_deg), float(radius_arcmin), q),
+            daemon=True,
+        )
+        p.start()
+        p.join(timeout_sec)
+        if p.is_alive():
+            p.terminate()
+            p.join(5.0)
+            if p.is_alive():
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+                p.join(1.0)
+            raise GaiaQueryTimeout(f"Gaia query timed out after {timeout_sec:g} s")
+        if q.empty():
+            raise RuntimeError(f"Gaia worker exited without returning a result (exitcode={p.exitcode})")
+        payload = q.get()
+
+    if not payload.get("ok", False):
+        raise RuntimeError(f'{payload.get("err_type", "GaiaError")}: {payload.get("err", "")}'.strip())
+
+    data = payload.get("data", {})
+    tab = Table(data)
+    return tab, int(payload.get("nrows", len(tab)))
+
 
 def gaia_brightest_sources_near(
     tpf,
@@ -612,18 +673,12 @@ def gaia_brightest_sources_near(
         ra0 = np.nanmedian(cg.ra.deg)
         dec0 = np.nanmedian(cg.dec.deg)
 
-    center = SkyCoord(ra=ra0 * u.deg, dec=dec0 * u.deg)
-    radius = float(radius_arcmin) * u.arcmin
-
     Gaia.ROW_LIMIT = -1
-
     last_err = None
     for attempt in range(max(1, int(max_retries))):
         try:
-            with _SignalTimeout(timeout_sec):
-                job = Gaia.cone_search_async(coordinate=center, radius=radius)
-                tab = job.get_results()
-            print(f"  Gaia cone search returned {len(tab)} rows before inside-stamp filtering")
+            tab, nrows = _gaia_cone_search_with_timeout(ra0, dec0, radius_arcmin, timeout_sec)
+            print(f"  Gaia cone search returned {nrows} rows before inside-stamp filtering")
             if "phot_g_mean_mag" not in tab.colnames:
                 raise RuntimeError("Gaia result missing phot_g_mean_mag")
             tab = tab[np.argsort(tab["phot_g_mean_mag"])]
@@ -1335,9 +1390,7 @@ def infer_single_target_label(tpf, mean_image_2d=None, gaia_radius_arcmin: float
 
     # Fifth choice: brightest Gaia source actually inside the stamp.
     try:
-        gaia_tab = gaia_brightest_sources_near(tpf, radius_arcmin=max(float(gaia_radius_arcmin), 6.0), timeout_sec=60.0)
-        if gaia_tab is None:
-            raise RuntimeError("Gaia unavailable")
+        gaia_tab = gaia_brightest_sources_near(tpf, radius_arcmin=max(float(gaia_radius_arcmin), 6.0), timeout_sec=timeout_sec)
         gaia_in, _ = sources_inside_stamp(tpf, gaia_tab, cadence_idx=0)
         if len(gaia_in) > 0:
             row = gaia_in[0]
@@ -1615,7 +1668,7 @@ def main(argv=None):
                 )
                 sector_tag = infer_sector_tag(tpf_path, tpf)
                 target_label, target_gaia_id, target_gaia_g = infer_single_target_label(
-                    tpf, mean_image_2d=mean_image_2d, gaia_radius_arcmin=max(float(args.gaia_radius_arcmin), 12.0)
+                    tpf, mean_image_2d=mean_image_2d, gaia_radius_arcmin=max(float(args.gaia_radius_arcmin), 12.0), timeout_sec=float(args.gaia_timeout_sec)
                 )
                 output_stem = build_output_stem(sector_tag, target_label, 1, "matlab_pure")
                 raw_csv_path = outdir / f"{output_stem}.csv"
@@ -1716,23 +1769,22 @@ def main(argv=None):
         if use_gaia:
             try:
                 gaia_tab = gaia_brightest_sources_near(tpf, radius_arcmin=args.gaia_radius_arcmin, timeout_sec=args.gaia_timeout_sec)
-                if gaia_tab is None:
-                    if args.gaia_fallback and int(args.n_targets) == 1:
-                        print("  [WARN] Gaia unavailable after retries. Falling back to no-Gaia single-target mode.")
-                        use_gaia = False
-                    else:
-                        print("  [WARN] Gaia unavailable after retries; skipping this TPF.")
-                        continue
             except Exception as e:
                 if args.gaia_fallback and int(args.n_targets) == 1:
                     print(f"  [WARN] Gaia query failed ({type(e).__name__}: {e}). Falling back to no-Gaia single-target mode.")
                     use_gaia = False
                 else:
-                    print(f"  [WARN] Gaia query failed ({type(e).__name__}: {e}); skipping this TPF.")
-                    continue
+                    raise
 
         if use_gaia:
             # Gaia-based multi-/single-target identification (standard behavior)
+            if gaia_tab is None:
+                if args.gaia_fallback and int(args.n_targets) == 1:
+                    print("  [WARN] Gaia unavailable after retries. Falling back to no-Gaia single-target mode.")
+                    use_gaia = False
+                else:
+                    print("  [WARN] Gaia unavailable after retries; skipping TPF.")
+                    continue
             gaia_in, _ = sources_inside_stamp(tpf, gaia_tab, mid)
             if len(gaia_in) < 1:
                 print("  No Gaia sources inside stamp; skipping.")
@@ -1759,7 +1811,7 @@ def main(argv=None):
             source_labels = [resolve_target_label(tc, gs) for tc, gs in zip(target_coords, sid)]
             if n_use == 1 and (getattr(args, "matlab_sat_mode", False) or getattr(args, "no_gaia", False) or getattr(args, "matlab_pure_single_sat", False)):
                 try:
-                    single_label, _, _ = infer_single_target_label(tpf, mean_img, gaia_radius_arcmin=float(args.gaia_radius_arcmin))
+                    single_label, _, _ = infer_single_target_label(tpf, mean_img, gaia_radius_arcmin=float(args.gaia_radius_arcmin), timeout_sec=float(args.gaia_timeout_sec))
                     if single_label:
                         source_labels[0] = single_label
                 except Exception:
@@ -1788,7 +1840,7 @@ def main(argv=None):
             sid = ["pixel_seed"]
             gmag = [np.nan]
             try:
-                single_label, _, _ = infer_single_target_label(tpf, mean_img, gaia_radius_arcmin=float(args.gaia_radius_arcmin))
+                single_label, _, _ = infer_single_target_label(tpf, mean_img, gaia_radius_arcmin=float(args.gaia_radius_arcmin), timeout_sec=float(args.gaia_timeout_sec))
                 source_labels = [single_label if single_label else sanitize_token("unknown_target")]
             except Exception:
                 source_labels = [sanitize_token("unknown_target")]
@@ -1806,168 +1858,174 @@ def main(argv=None):
                 continue
 
             for meth in methods_to_run:
-                if meth == "jump":
-                    t_g, lc_raw, ap_mask, *_ = grow_aperture_multi_component_in_region(
-                        flux,
-                        time,
-                        seed_pix=seeds[k],
-                        allowed_mask=allowed,
-                        min_pixels=args.min_pixels,
-                        amp_q_lo=args.amp_q_lo,
-                        amp_q_hi=args.amp_q_hi,
-                        amp_min_frac=args.amp_min_frac,
-                        max_components=args.max_components,
-                        min_seed_frac_of_peak=args.min_seed_frac_of_peak,
-                        min_new_pixels_per_component=args.min_new_pixels_per_component,
-                        max_radius_pix=args.max_radius_pix,
-                    )
-                    meth_tag = "jump"
-                else:
-                    t_g, lc_raw, ap_mask, *_ = grow_aperture_bright_core_preseed(
-                        flux,
-                        time,
-                        seed_pix=seeds[k],
-                        allowed_mask=allowed,
-                        min_pixels=args.min_pixels,
-                        amp_q_lo=args.amp_q_lo,
-                        amp_q_hi=args.amp_q_hi,
-                        amp_min_frac=args.amp_min_frac,
-                        core_npix=args.core_npix,
-                        core_min_frac_of_peak=args.core_min_frac_of_peak,
-                        max_radius_pix=args.max_radius_pix,
-                    )
-                    meth_tag = "core"
-
-                # Median-normalize raw
-                med = np.nanmedian(lc_raw)
-                lc_rel = lc_raw / med if np.isfinite(med) and med != 0 else lc_raw
-
-                # Flux-weighted centroid in this aperture
-                ap = ap_mask
-                denom = np.nansum(flux[:, ap], axis=1)
-                yy, xx = np.indices(ap.shape)
-                crow = np.nansum(flux[:, ap] * yy[ap][None, :], axis=1) / denom
-                ccol = np.nansum(flux[:, ap] * xx[ap][None, :], axis=1) / denom
-
-                # Optional PSF-width proxy
-                psf_sig = None
-                if args.psf_proxy:
-                    psf_sig = psf_width_sigma(flux, ap, crow, ccol)
-                # -----------------------------------------------------------------
-                # Optional MATLAB-style saturated-star mode (only for single-target, heavy saturation)
-                # -----------------------------------------------------------------
-                use_matlab = bool(getattr(args, "matlab_sat_mode", False)) and (sector_orb is not None) and (n_use == 1)
-                if use_matlab:
-                    sat_ok, sat_npix = is_heavily_saturated(mean_img, thresh=args.sat_thresh, min_npix=args.sat_min_npix)
-                    if not sat_ok:
-                        print(f"  [INFO] MATLAB-sat-mode requested but saturation gate failed (npix_above_thresh={sat_npix}); using standard pipeline.")
-                        use_matlab = False
-                if use_matlab:
-                    if sector_num not in sector_orb:
-                        print(f"  [WARN] MATLAB-sat-mode: sector {sector_num} not found in orbtable; using standard pipeline.")
-                        use_matlab = False
-
-                # Build per-cadence background from faint pixels (if needed)
-                back = None
-                if use_matlab:
-                    back = estimate_background_faint_pixels(flux, n_faint=args.back_nfaint)
-                    # Optimize background scaling and subtract
-                    k_back = optimize_background_scale(lc_raw, back)
-                    lc_raw2 = lc_raw - k_back * back
-                    med2 = np.nanmedian(lc_raw2)
-                    lc_rel2 = lc_raw2 / med2 if np.isfinite(med2) and med2 != 0 else lc_raw2
-                    # Orbit-phase template detrend
-                    mid_btjd, freq_cpd = sector_orb[sector_num]
-                    lc_rel2_det, phase, trend = phase_template_detrend(lc_rel2, t_g, freq_cpd, phase_bin=args.phase_bin)
-                    lc_work = lc_rel2_det
-
-                    # Save diagnostics later once the informative output stem is defined below.
-                else:
-                    lc_work = lc_rel
-
-                # -----------------------------------------------------------------
-                # Decorrelation (standard or split-at-mid-sector with background term)
-                # -----------------------------------------------------------------
-                if getattr(args, "pure_sum", False):
-                    lc_xy = lc_work.copy()
-                else:
-                    if use_matlab:
-                        mid_btjd, freq_cpd = sector_orb[sector_num]
-                        # Split at mid-sector (downlink break proxy)
-                        m1 = t_g < mid_btjd
-                        m2 = ~m1
-                        lc_xy = lc_work.copy()
-
-                        for mask in (m1, m2):
-                            if mask.sum() < 200:
-                                continue
-                            # Design matrix with background term
-                            X = build_design_matrix_with_back(
-                                t_g[mask],
-                                ccol[mask],
-                                crow[mask],
-                                back[mask] if back is not None else np.zeros(mask.sum()),
-                                knot_spacing_days=args.knot_spacing_days,
-                                psf_sigma=(psf_sig[mask] if psf_sig is not None else None),
-                            )
-                            yseg = lc_work[mask] - np.nanmedian(lc_work[mask])
-                            good = np.isfinite(yseg) & np.all(np.isfinite(X), axis=1)
-                            if good.sum() > 300:
-                                beta = robust_wls(X[good], yseg[good], n_iter=args.robust_iters, huber_k=args.huber_k)
-                                lc_xy[mask] = (yseg - (X @ beta)) + np.nanmedian(lc_work[mask])
-                    else:
-                        X = build_design_matrix(
-                            t_g,
-                            ccol,
-                            crow,
-                            knot_spacing_days=args.knot_spacing_days,
-                            psf_sigma=psf_sig,
+                try:
+                    if meth == "jump":
+                        t_g, lc_raw, ap_mask, *_ = grow_aperture_multi_component_in_region(
+                            flux,
+                            time,
+                            seed_pix=seeds[k],
+                            allowed_mask=allowed,
+                            min_pixels=args.min_pixels,
+                            amp_q_lo=args.amp_q_lo,
+                            amp_q_hi=args.amp_q_hi,
+                            amp_min_frac=args.amp_min_frac,
+                            max_components=args.max_components,
+                            min_seed_frac_of_peak=args.min_seed_frac_of_peak,
+                            min_new_pixels_per_component=args.min_new_pixels_per_component,
+                            max_radius_pix=args.max_radius_pix,
                         )
-                        y = lc_work - np.nanmedian(lc_work)
-                        good = np.isfinite(y) & np.all(np.isfinite(X), axis=1)
-                        if good.sum() > 1000:
-                            beta = robust_wls(X[good], y[good], n_iter=args.robust_iters, huber_k=args.huber_k)
-                            lc_xy = (y - (X @ beta)) + np.nanmedian(lc_work)
-                        else:
+                        meth_tag = "jump"
+                    else:
+                        t_g, lc_raw, ap_mask, *_ = grow_aperture_bright_core_preseed(
+                            flux,
+                            time,
+                            seed_pix=seeds[k],
+                            allowed_mask=allowed,
+                            min_pixels=args.min_pixels,
+                            amp_q_lo=args.amp_q_lo,
+                            amp_q_hi=args.amp_q_hi,
+                            amp_min_frac=args.amp_min_frac,
+                            core_npix=args.core_npix,
+                            core_min_frac_of_peak=args.core_min_frac_of_peak,
+                            max_radius_pix=args.max_radius_pix,
+                        )
+                        meth_tag = "core"
+
+                    # Median-normalize raw
+                    med = np.nanmedian(lc_raw)
+                    lc_rel = lc_raw / med if np.isfinite(med) and med != 0 else lc_raw
+
+                    # Flux-weighted centroid in this aperture
+                    ap = ap_mask
+                    denom = np.nansum(flux[:, ap], axis=1)
+                    yy, xx = np.indices(ap.shape)
+                    crow = np.nansum(flux[:, ap] * yy[ap][None, :], axis=1) / denom
+                    ccol = np.nansum(flux[:, ap] * xx[ap][None, :], axis=1) / denom
+
+                    # Optional PSF-width proxy
+                    psf_sig = None
+                    if args.psf_proxy:
+                        psf_sig = psf_width_sigma(flux, ap, crow, ccol)
+                    # -----------------------------------------------------------------
+                    # Optional MATLAB-style saturated-star mode (only for single-target, heavy saturation)
+                    # -----------------------------------------------------------------
+                    use_matlab = bool(getattr(args, "matlab_sat_mode", False)) and (sector_orb is not None) and (n_use == 1)
+                    if use_matlab:
+                        sat_ok, sat_npix = is_heavily_saturated(mean_img, thresh=args.sat_thresh, min_npix=args.sat_min_npix)
+                        if not sat_ok:
+                            print(f"  [INFO] MATLAB-sat-mode requested but saturation gate failed (npix_above_thresh={sat_npix}); using standard pipeline.")
+                            use_matlab = False
+                    if use_matlab:
+                        if sector_num not in sector_orb:
+                            print(f"  [WARN] MATLAB-sat-mode: sector {sector_num} not found in orbtable; using standard pipeline.")
+                            use_matlab = False
+
+                    # Build per-cadence background from faint pixels (if needed)
+                    back = None
+                    if use_matlab:
+                        back = estimate_background_faint_pixels(flux, n_faint=args.back_nfaint)
+                        # Optimize background scaling and subtract
+                        k_back = optimize_background_scale(lc_raw, back)
+                        lc_raw2 = lc_raw - k_back * back
+                        med2 = np.nanmedian(lc_raw2)
+                        lc_rel2 = lc_raw2 / med2 if np.isfinite(med2) and med2 != 0 else lc_raw2
+                        # Orbit-phase template detrend
+                        mid_btjd, freq_cpd = sector_orb[sector_num]
+                        lc_rel2_det, phase, trend = phase_template_detrend(lc_rel2, t_g, freq_cpd, phase_bin=args.phase_bin)
+                        lc_work = lc_rel2_det
+
+                        # Save diagnostics later once the informative output stem is defined below.
+                    else:
+                        lc_work = lc_rel
+
+                    # -----------------------------------------------------------------
+                    # Decorrelation (standard or split-at-mid-sector with background term)
+                    # -----------------------------------------------------------------
+                    if getattr(args, "pure_sum", False):
+                        lc_xy = lc_work.copy()
+                    else:
+                        if use_matlab:
+                            mid_btjd, freq_cpd = sector_orb[sector_num]
+                            # Split at mid-sector (downlink break proxy)
+                            m1 = t_g < mid_btjd
+                            m2 = ~m1
                             lc_xy = lc_work.copy()
 
+                            for mask in (m1, m2):
+                                if mask.sum() < 200:
+                                    continue
+                                # Design matrix with background term
+                                X = build_design_matrix_with_back(
+                                    t_g[mask],
+                                    ccol[mask],
+                                    crow[mask],
+                                    back[mask] if back is not None else np.zeros(mask.sum()),
+                                    knot_spacing_days=args.knot_spacing_days,
+                                    psf_sigma=(psf_sig[mask] if psf_sig is not None else None),
+                                )
+                                yseg = lc_work[mask] - np.nanmedian(lc_work[mask])
+                                good = np.isfinite(yseg) & np.all(np.isfinite(X), axis=1)
+                                if good.sum() > 300:
+                                    beta = robust_wls(X[good], yseg[good], n_iter=args.robust_iters, huber_k=args.huber_k)
+                                    lc_xy[mask] = (yseg - (X @ beta)) + np.nanmedian(lc_work[mask])
+                        else:
+                            X = build_design_matrix(
+                                t_g,
+                                ccol,
+                                crow,
+                                knot_spacing_days=args.knot_spacing_days,
+                                psf_sigma=psf_sig,
+                            )
+                            y = lc_work - np.nanmedian(lc_work)
+                            good = np.isfinite(y) & np.all(np.isfinite(X), axis=1)
+                            if good.sum() > 1000:
+                                beta = robust_wls(X[good], y[good], n_iter=args.robust_iters, huber_k=args.huber_k)
+                                lc_xy = (y - (X @ beta)) + np.nanmedian(lc_work)
+                            else:
+                                lc_xy = lc_work.copy()
 
-                 # Write outputs (flat structure, labeled by sector/source/target/method)
-                output_stem = build_output_stem(sector_tag, source_label, k + 1, meth_tag)
-                pd.DataFrame({"time_btjd": t_g, "flux_detrended_rel": lc_xy}).to_csv(
-                    outdir / f"preferred_lc_{output_stem}.csv", index=False
-                )
-                save_lightcurve_plot(
-                    t_g,
-                    lc_xy,
-                    outdir / f"preferred_lc_{output_stem}.png",
-                    f"{tpf_path.stem} — {source_label} / target{k+1} ({meth_tag})",
-                )
-                np.save(outdir / f"aperture_mask_{output_stem}.npy", ap_mask.astype(bool))
-                np.save(outdir / f"centroid_row_{output_stem}.npy", np.asarray(crow, float))
-                np.save(outdir / f"centroid_col_{output_stem}.npy", np.asarray(ccol, float))
-
-                # Aperture image
-                if not args.no_aperture_plots:
-                    # gmag may be unavailable if Gaia was skipped/unavailable
-                    gtxt = "Gaia G=NA"
-                    try:
-                        if gmag is not None and np.isfinite(float(gmag[k])):
-                            gtxt = f"Gaia G={float(gmag[k]):.2f}"
-                    except Exception:
-                        pass
-                    save_aperture_plot_matlab(
-                        mean_img,
-                        ap_mask.astype(bool),
-                        outdir / f"aperture_{output_stem}.png",
-                        f"{tpf_path.stem} — {source_label} / target{k+1} ({meth_tag})\n{gtxt}",
+                    # Write outputs (flat structure, labeled by sector/source/target/method)
+                    output_stem = build_output_stem(sector_tag, source_label, k + 1, meth_tag)
+                    pd.DataFrame({"time_btjd": t_g, "flux_detrended_rel": lc_xy}).to_csv(
+                        outdir / f"preferred_lc_{output_stem}.csv", index=False
                     )
+                    save_lightcurve_plot(
+                        t_g,
+                        lc_xy,
+                        outdir / f"preferred_lc_{output_stem}.png",
+                        f"{tpf_path.stem} — {source_label} / target{k+1} ({meth_tag})",
+                    )
+                    np.save(outdir / f"aperture_mask_{output_stem}.npy", ap_mask.astype(bool))
+                    np.save(outdir / f"centroid_row_{output_stem}.npy", np.asarray(crow, float))
+                    np.save(outdir / f"centroid_col_{output_stem}.npy", np.asarray(ccol, float))
 
-                print(
-                    f"  Wrote {tag} ({meth_tag}): preferred_lc_{tag}_{meth_tag}.csv"
-                    f"  Npix={int(np.count_nonzero(ap_mask))}"
-                )
-                wrote_any_for_this_tpf = True
+                    # Aperture image
+                    if not args.no_aperture_plots:
+                        # gmag may be unavailable if Gaia was skipped/unavailable
+                        gtxt = "Gaia G=NA"
+                        try:
+                            if gmag is not None and np.isfinite(float(gmag[k])):
+                                gtxt = f"Gaia G={float(gmag[k]):.2f}"
+                        except Exception:
+                            pass
+                        save_aperture_plot_matlab(
+                            mean_img,
+                            ap_mask.astype(bool),
+                            outdir / f"aperture_{output_stem}.png",
+                            f"{tpf_path.stem} — {source_label} / target{k+1} ({meth_tag})\n{gtxt}",
+                        )
+
+                    print(
+                        f"  Wrote {tag} ({meth_tag}): preferred_lc_{tag}_{meth_tag}.csv"
+                        f"  Npix={int(np.count_nonzero(ap_mask))}"
+                    )
+                    wrote_any_for_this_tpf = True
+                except Exception as exc:
+                    print(
+                        f"  [WARN] {tag} ({meth}): extraction failed with "
+                        f"{type(exc).__name__}: {exc}. Skipping this target/method and continuing."
+                    )
+                    continue
 
         if wrote_any_for_this_tpf:
             try:
