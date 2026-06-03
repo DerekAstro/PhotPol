@@ -1321,7 +1321,7 @@ def infer_header_target_coord(tpf):
         return None
 
 
-def infer_single_target_label(tpf, mean_image_2d=None, gaia_radius_arcmin: float = 12.0):
+def infer_single_target_label(tpf, mean_image_2d=None, gaia_radius_arcmin: float = 12.0, timeout_sec: float = 60.0):
     """Infer a human-friendly label for a single-target or saturated-target run.
 
     Preference order:
