@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import time
 import matplotlib.pyplot as plt
+import re
 
 try:
     from IPython.display import display
@@ -58,6 +59,7 @@ POL_CSV = Path("target_IND.csv")   # raw/basic polarimetry CSV OR precomputed *_
 
 # --- Polarimetry product to analyze ---
 POL_PRODUCT = "resid_nm_pchip"  # 'nm' | 'resid_nm_pchip' | 'pw_resid_nm_pchip'
+USE_POLARIMETRY = True
 
 # --- Raw-polarimetry preprocessing (used automatically if POL_CSV is raw/basic) ---
 POL_SAVE_GENERATED_ANALYSIS_FRAME = True
@@ -101,6 +103,9 @@ POL_FULL_RANGE_PLOT_OVERSAMPLE = 1.0
 # --- Polarimetry guided extraction ---
 POL_CHANNELS = ["q", "u", "p"]  # p is analyzed directly from the observed CSV column
 POL_SNR_STOP = 2.0
+POL_SNR_SOFT_MIN = 1.5      # admit marginal guided polarimetric modes into the global fit if they are close to the TESS template
+POL_POSTFIT_SNR_MIN = 1.5   # after the global fit, keep marginal modes only if their leave-one-out local SNR clears this value
+POL_SEED_MAX_OFFSET_MULT = 2.0  # require marginal seeds to lie within this many resolution elements of the TESS template
 KS_POL = 10.0
 POL_OVERSAMPLE = 2.0
 POL_SEARCH_WINDOW_MULT = 10.0  # half-window in units of max(1/T_tess, 1/T_pol)
@@ -121,7 +126,7 @@ TESS_DISCOVERY_EXCLUSION_MULT = 5.0  # block re-discovery within this many resol
 # --- Polarimetry night-model (Option C default; D-ready) ---
 USE_POL_NIGHT_OFFSETS = True
 USE_POL_NIGHT_SLOPES = False
-POL_NIGHT_GROUP_MODE = "gap"     # 'gap' | 'integer_jd' | 'run' | 'subrun'
+POL_NIGHT_GROUP_MODE = "gap"     # 'gap' or 'integer_jd'
 POL_NIGHT_GAP_HOURS = 8.0
 
 # --- Optional broad detrending hook (defaults off) ---
@@ -141,6 +146,81 @@ LSQ_VERBOSE = 0
 # --- Output ---
 OUTROOT = Path("tess_guided_phot_pol_outputs_v12")
 OUTROOT.mkdir(parents=True, exist_ok=True)
+OUTPUT_TARGET_SUBDIR = False
+
+
+POL_FILENAME_SUFFIXES = [
+    "_IND_nm_pchip_analysis_frame",
+    "_nm_pchip_analysis_frame",
+    "_analysis_frame",
+    "_IND",
+]
+
+def prefixed_output_name(prefix: str, basename: str) -> str:
+    prefix = str(prefix).strip()
+    return f"{prefix}_{basename}" if prefix else basename
+
+def infer_star_labels_from_pol_path(path: Path | str) -> tuple[str, str]:
+    stem = Path(path).stem
+    for suff in sorted(POL_FILENAME_SUFFIXES, key=len, reverse=True):
+        if stem.endswith(suff):
+            stem = stem[:-len(suff)]
+            break
+    stem = stem.strip(" _-")
+    display = re.sub(r"[_]+", " ", stem).strip()
+    display = re.sub(r"\s+", " ", display)
+    safe = re.sub(r"[^A-Za-z0-9.+-]+", "_", display).strip("_")
+    if not display:
+        display = "target"
+    if not safe:
+        safe = "target"
+    return display, safe
+
+def infer_star_labels_from_tess_input() -> tuple[str, str]:
+    if str(TESS_INPUT_MODE).lower() == "pipeline_dir":
+        patt = str(TESS_PIPELINE_PATTERN).strip()
+        if patt and ("*" not in patt) and ("?" not in patt) and ("[" not in patt):
+            stem = Path(patt).stem
+        else:
+            stem = Path(TESS_PIPELINE_DIR).name
+    else:
+        stem = Path(TESS_CSV).stem
+    for suff in ["_combined_filtered", "_combined", "_lc", "_lightcurve"]:
+        if stem.endswith(suff):
+            stem = stem[:-len(suff)]
+            break
+    stem = stem.strip(" _-")
+    display = re.sub(r"[_]+", " ", stem).strip()
+    display = re.sub(r"\s+", " ", display)
+    safe = re.sub(r"[^A-Za-z0-9.+-]+", "_", display).strip("_")
+    if not display:
+        display = "target"
+    if not safe:
+        safe = "target"
+    return display, safe
+
+def resolve_analysis_outroot(star_safe: str) -> Path:
+    base = OUTROOT / star_safe if OUTPUT_TARGET_SUBDIR else OUTROOT
+    base.mkdir(parents=True, exist_ok=True)
+    return base
+
+def compute_tess_nyquist_cpd(tess) -> float:
+    try:
+        t = np.asarray(tess.t, float)
+    except Exception:
+        return np.nan
+    t = t[np.isfinite(t)]
+    if t.size < 3:
+        return np.nan
+    dt = np.diff(np.sort(t))
+    dt = dt[np.isfinite(dt) & (dt > 0)]
+    if dt.size < 1:
+        return np.nan
+    med_dt = np.nanmedian(dt)
+    if not np.isfinite(med_dt) or med_dt <= 0:
+        return np.nan
+    return 0.5 / med_dt
+
 
 # ----------------------------------------------------------------------
 # Data structures
@@ -192,43 +272,14 @@ RAW_POL_CANDIDATES = {
     "p_err": ["p_err", "pe"],
 }
 
-RAW_POL_RUN_CODE_CANDIDATES = [
-    "run", "Run", "RUN",
-    "run_id", "RunID", "runid",
-    "run_code", "RunCode", "RUN_CODE",
-    "run_label", "RunLabel",
-    "subrun", "Subrun",
-    "subrun_label", "SubrunLabel",
-]
-
 def _first_present(df: pd.DataFrame, names: list[str]) -> str | None:
     for n in names:
         if n in df.columns:
             return n
     return None
 
-def _normalize_run_token(value) -> str | None:
-    if pd.isna(value):
-        return None
-    s = str(value).strip()
-    if not s:
-        return None
-    return s
-
-
-def _base_run_token(token: str | None) -> str | None:
-    if token is None:
-        return None
-    tok = str(token).strip()
-    if not tok:
-        return None
-    if tok[-1].isalpha():
-        return tok[:-1] or tok
-    return tok
-
-
 def normalize_raw_polarimetry_dataframe(df: pd.DataFrame) -> pd.DataFrame:
-    """Return a normalized raw-polarimetry dataframe with core columns and optional run/subrun labels."""
+    """Return a minimal raw-polarimetry dataframe with jd,q,u,p,q_err,u_err,p_err."""
     cols = {}
     for key, names in RAW_POL_CANDIDATES.items():
         col = _first_present(df, names)
@@ -236,13 +287,6 @@ def normalize_raw_polarimetry_dataframe(df: pd.DataFrame) -> pd.DataFrame:
             raise ValueError(f"Raw polarimetry input is missing a column for {key!r}. Looked for {names}. Found: {list(df.columns)}")
         cols[key] = col
     out = pd.DataFrame({k: pd.to_numeric(df[v], errors="coerce") for k, v in cols.items()})
-
-    run_col = _first_present(df, RAW_POL_RUN_CODE_CANDIDATES)
-    if run_col is not None:
-        subrun = df[run_col].map(_normalize_run_token)
-        run = subrun.map(_base_run_token)
-        out["subrun_label"] = subrun
-        out["run_label"] = run
     return out
 
 def pol_assign_night_ids(df: pd.DataFrame, gap_days: float = POL_NIGHT_GAP_THRESHOLD_DAYS) -> pd.DataFrame:
@@ -256,39 +300,6 @@ def pol_assign_night_ids(df: pd.DataFrame, gap_days: float = POL_NIGHT_GAP_THRES
                 night_ids[i:] += 1
     df["night_id"] = night_ids
     return df
-
-
-def _factorize_group_labels(labels: np.ndarray) -> np.ndarray:
-    ser = pd.Series(labels, dtype="object")
-    ser = ser.fillna("__MISSING_GROUP__")
-    codes, _ = pd.factorize(ser, sort=False)
-    return codes.astype(int)
-
-
-def get_polarimetry_group_labels(df: pd.DataFrame, mode: str) -> np.ndarray:
-    if mode == "run":
-        if "run_label" in df.columns:
-            vals = df["run_label"].map(_normalize_run_token).to_numpy(object)
-        elif "subrun_label" in df.columns:
-            vals = df["subrun_label"].map(_base_run_token).to_numpy(object)
-        else:
-            raise ValueError(
-                "POL_NIGHT_GROUP_MODE='run' requires a run-like column in the polarimetry CSV. "
-                "Expected one of run/run_id/run_code/run_label/subrun/subrun_label, or a generated analysis frame that preserves run_label."
-            )
-        return vals
-    if mode == "subrun":
-        if "subrun_label" in df.columns:
-            vals = df["subrun_label"].map(_normalize_run_token).to_numpy(object)
-        elif "run_label" in df.columns:
-            vals = df["run_label"].map(_normalize_run_token).to_numpy(object)
-        else:
-            raise ValueError(
-                "POL_NIGHT_GROUP_MODE='subrun' requires a subrun-like column in the polarimetry CSV. "
-                "Expected one of run/run_id/run_code/subrun/subrun_label, or a generated analysis frame that preserves subrun_label."
-            )
-        return vals
-    raise ValueError(f"Unsupported label-based group mode: {mode}")
 
 def pol_compute_phase(df: pd.DataFrame) -> pd.DataFrame:
     jd0 = np.floor(df["jd"].min()) + 0.5
@@ -550,39 +561,6 @@ def _clean_sort(t, y, yerr=None, t_abs=None):
         t_abs = t_abs[idx]
     return t, y, yerr, t_abs
 
-
-def _clean_sort_with_group(t, y, yerr=None, t_abs=None, group_labels=None):
-    t = np.asarray(t, dtype=float)
-    y = np.asarray(y, dtype=float)
-    m = np.isfinite(t) & np.isfinite(y)
-    if yerr is not None:
-        yerr = np.asarray(yerr, dtype=float)
-        yerr = np.where(np.isfinite(yerr) & (yerr > 0), yerr, np.nan)
-        m &= np.isfinite(yerr)
-    if t_abs is not None:
-        t_abs = np.asarray(t_abs, dtype=float)
-        m &= np.isfinite(t_abs)
-    if group_labels is not None:
-        group_labels = np.asarray(group_labels, dtype=object)
-    t = t[m]
-    y = y[m]
-    if yerr is not None:
-        yerr = yerr[m]
-    if t_abs is not None:
-        t_abs = t_abs[m]
-    if group_labels is not None:
-        group_labels = group_labels[m]
-    idx = np.argsort(t)
-    t = t[idx]
-    y = y[idx]
-    if yerr is not None:
-        yerr = yerr[idx]
-    if t_abs is not None:
-        t_abs = t_abs[idx]
-    if group_labels is not None:
-        group_labels = group_labels[idx]
-    return t, y, yerr, t_abs, group_labels
-
 def _pick_first_existing(columns, candidates):
     for c in candidates:
         if c in columns:
@@ -688,18 +666,13 @@ def load_tess_input() -> TimeSeries:
         )
     raise ValueError(f"TESS_INPUT_MODE must be 'spoc_csv' or 'pipeline_dir'. Got: {TESS_INPUT_MODE}")
 
-def build_night_groups(t_abs: np.ndarray, mode: str = "gap", gap_days: float = 8.0/24.0,
-                       group_labels: np.ndarray | None = None) -> np.ndarray:
+def build_night_groups(t_abs: np.ndarray, mode: str = "gap", gap_days: float = 8.0/24.0) -> np.ndarray:
     t_abs = np.asarray(t_abs, dtype=float)
     if t_abs.size == 0:
         return np.array([], dtype=int)
     if mode == "integer_jd":
         _, inv = np.unique(np.floor(t_abs).astype(int), return_inverse=True)
         return inv.astype(int)
-    if mode in ("run", "subrun"):
-        if group_labels is None:
-            raise ValueError(f"Group mode {mode!r} requires group labels.")
-        return _factorize_group_labels(group_labels)
     if mode != "gap":
         raise ValueError(f"Unsupported group mode: {mode}")
     dt = np.diff(t_abs)
@@ -735,14 +708,11 @@ def load_polarimetry_csv(path: Path, product: str, trend_cfg: NightTrendConfig) 
         t0 = np.nanmin(t_abs)
         t_rel = t_abs - t0
         out = {}
-        group_labels = None
-        if trend_cfg.group_mode in ("run", "subrun"):
-            group_labels = get_polarimetry_group_labels(df, trend_cfg.group_mode)
         for k in ["q", "u", "p"]:
             y = df[POL_PRODUCTS[product][k]].to_numpy(dtype=float)
             yerr = df[POL_ERR_COLS[k]].to_numpy(dtype=float)
-            tt, yy, ee, ta, glab = _clean_sort_with_group(t_rel, y, yerr, t_abs=t_abs, group_labels=group_labels)
-            gid = build_night_groups(ta, mode=trend_cfg.group_mode, gap_days=trend_cfg.gap_days, group_labels=glab)
+            tt, yy, ee, ta = _clean_sort(t_rel, y, yerr, t_abs=t_abs)
+            gid = build_night_groups(ta, mode=trend_cfg.group_mode, gap_days=trend_cfg.gap_days)
             out[k] = TimeSeries(t=tt, y=yy, yerr=ee, name=f"pol_{k}", t_abs=ta, group_id=gid)
         return out
 
@@ -767,14 +737,11 @@ def load_polarimetry_csv(path: Path, product: str, trend_cfg: NightTrendConfig) 
     t0 = np.nanmin(t_abs)
     t_rel = t_abs - t0
     out = {}
-    group_labels = None
-    if trend_cfg.group_mode in ("run", "subrun"):
-        group_labels = get_polarimetry_group_labels(df_proc, trend_cfg.group_mode)
     for k in ["q", "u", "p"]:
         y = df_proc[POL_PRODUCTS[product][k]].to_numpy(dtype=float)
         yerr = df_proc[POL_ERR_COLS[k]].to_numpy(dtype=float)
-        tt, yy, ee, ta, glab = _clean_sort_with_group(t_rel, y, yerr, t_abs=t_abs, group_labels=group_labels)
-        gid = build_night_groups(ta, mode=trend_cfg.group_mode, gap_days=trend_cfg.gap_days, group_labels=glab)
+        tt, yy, ee, ta = _clean_sort(t_rel, y, yerr, t_abs=t_abs)
+        gid = build_night_groups(ta, mode=trend_cfg.group_mode, gap_days=trend_cfg.gap_days)
         out[k] = TimeSeries(t=tt, y=yy, yerr=ee, name=f"pol_{k}", t_abs=ta, group_id=gid)
     return out
 
@@ -825,20 +792,6 @@ def longest_contiguous_segment_duration(t: np.ndarray, gap_days: float) -> float
 
 def compute_Tseg(ts: TimeSeries, gap_days: float = 1.0) -> float:
     return longest_contiguous_segment_duration(ts.t, gap_days=gap_days)
-
-def compute_tess_nyquist_cpd(ts: TimeSeries) -> float:
-    t = np.asarray(ts.t, dtype=float)
-    t = t[np.isfinite(t)]
-    if t.size < 2:
-        return np.nan
-    dt = np.diff(np.sort(t))
-    dt = dt[np.isfinite(dt) & (dt > 0)]
-    if dt.size == 0:
-        return np.nan
-    med_dt = np.nanmedian(dt)
-    if not np.isfinite(med_dt) or med_dt <= 0:
-        return np.nan
-    return float(0.5 / med_dt)
 
 def make_frequency_grid(fmin: float, fmax: float, df: float, max_points: int = 60000) -> np.ndarray:
     if not np.isfinite(df) or df <= 0:
@@ -991,6 +944,161 @@ def trimmed_median(x: np.ndarray, trim_top_frac: float = 0.1) -> float:
         k = min(max(k, 1), x.size)
         x = np.partition(x, k - 1)[:k]
     return float(np.nanmedian(x))
+
+
+def tess_local_snr_grid(f_fit: float, T_noise: float, ks: float,
+                        fmin: float = FMIN, fmax: float = FMAX,
+                        max_points: int = POL_LOCAL_MAX_POINTS) -> tuple[np.ndarray, float, float]:
+    """
+    Build a dedicated local frequency grid for the TESS SNR estimate.
+
+    The window is defined entirely in frequency units:
+      - a central guard region around the fitted peak
+      - two sidebands extending out by ks * (1/T_noise)
+    """
+    T_noise = max(float(T_noise), 1e-8)
+    res = 1.0 / T_noise
+    guard_half = max(KFIT * (2.0 / T_noise), 2.0 * res)
+    side_half = max(float(ks) * res, 4.0 * res)
+    half_window = guard_half + side_half
+    df_local = max(res / 5.0, 1e-8)
+    freqs_local = make_local_frequency_grid(
+        f_fit, half_window, df_local, fmin=fmin, fmax=fmax, max_points=max_points
+    )
+    return freqs_local, guard_half, side_half
+
+def tess_local_noise_floor_from_local_periodogram(freqs: np.ndarray, power: np.ndarray, f_fit: float,
+                                                  guard_half: float, side_half: float,
+                                                  trim_top_frac: float = TRIM_TOP_FRAC,
+                                                  min_points: int = 12) -> tuple[float, int]:
+    """
+    Estimate a genuinely local noise floor from sidebands around f_fit.
+
+    No whole-spectrum fallback is used. If the initial sidebands are too sparse,
+    the sideband width is widened locally in a controlled way.
+    """
+    freqs = np.asarray(freqs, dtype=float)
+    power = np.asarray(power, dtype=float)
+    if freqs.size < 5 or power.size != freqs.size:
+        return np.nan, 0
+
+    expand = 1.0
+    n_used = 0
+    for _ in range(6):
+        outer = guard_half + expand * side_half
+        m = np.isfinite(power) & (np.abs(freqs - f_fit) >= guard_half) & (np.abs(freqs - f_fit) <= outer)
+        vals = power[m]
+        n_used = int(np.count_nonzero(np.isfinite(vals)))
+        noise = trimmed_median(vals, trim_top_frac=trim_top_frac)
+        if np.isfinite(noise) and (noise > 0) and (n_used >= min_points):
+            return float(noise), n_used
+        expand *= 1.5
+    return np.nan, n_used
+
+def tess_local_snr_from_fit(ts: TimeSeries, f_fit: float, T_noise: float, ks: float,
+                            trim_top_frac: float = TRIM_TOP_FRAC) -> tuple[float, float]:
+    """
+    Compute the TESS SNR from a dedicated local periodogram around the fitted peak.
+
+    This avoids dependence on the broad discovery grid and uses only local sidebands
+    around the fitted frequency.
+    """
+    freqs_local, guard_half, side_half = tess_local_snr_grid(f_fit, T_noise=T_noise, ks=ks)
+    power_local = lomb_scargle_power(ts, freqs_local)
+    if not np.isfinite(power_local).any():
+        return np.nan, np.nan
+
+    m_peak = np.isfinite(power_local) & (np.abs(freqs_local - f_fit) <= guard_half)
+    if np.any(m_peak):
+        p0 = float(np.nanmax(power_local[m_peak]))
+    else:
+        j = int(np.nanargmin(np.abs(freqs_local - f_fit)))
+        p0 = float(power_local[j])
+
+    noise, _n_used = tess_local_noise_floor_from_local_periodogram(
+        freqs_local, power_local, f_fit=f_fit, guard_half=guard_half,
+        side_half=side_half, trim_top_frac=trim_top_frac
+    )
+    W = float(p0 / noise) if (np.isfinite(noise) and noise > 0) else np.nan
+    snr = float(np.sqrt(W)) if np.isfinite(W) and W > 0 else np.nan
+    return snr, W
+
+
+
+def pol_local_snr_grid(f_fit: float, T_noise: float, ks: float,
+                       fmin: float = FMIN, fmax: float = FMAX,
+                       max_points: int = POL_LOCAL_MAX_POINTS) -> tuple[np.ndarray, float, float]:
+    """
+    Build a dedicated local frequency grid for the polarimetric SNR estimate.
+
+    Compared with the TESS version, use a somewhat wider guard and sideband
+    region to better sample the more structured alias/window environment.
+    """
+    T_noise = max(float(T_noise), 1e-8)
+    res = 1.0 / T_noise
+    guard_half = max(KFIT * (2.0 / T_noise), 3.0 * res)
+    side_half = max(1.5 * float(ks) * res, 8.0 * res)
+    half_window = guard_half + side_half
+    df_local = max(res / 5.0, 1e-8)
+    freqs_local = make_local_frequency_grid(
+        f_fit, half_window, df_local, fmin=fmin, fmax=fmax, max_points=max_points
+    )
+    return freqs_local, guard_half, side_half
+
+def pol_local_noise_floor_from_local_periodogram(freqs: np.ndarray, power: np.ndarray, f_fit: float,
+                                                 guard_half: float, side_half: float,
+                                                 trim_top_frac: float = TRIM_TOP_FRAC,
+                                                 min_points: int = 12) -> tuple[float, int]:
+    """
+    Estimate a local polarimetric noise floor from sidebands around f_fit,
+    widening only locally if needed. No whole-spectrum fallback is used.
+    """
+    freqs = np.asarray(freqs, dtype=float)
+    power = np.asarray(power, dtype=float)
+    if freqs.size < 5 or power.size != freqs.size:
+        return np.nan, 0
+
+    expand = 1.0
+    n_used = 0
+    for _ in range(6):
+        outer = guard_half + expand * side_half
+        m = np.isfinite(power) & (np.abs(freqs - f_fit) >= guard_half) & (np.abs(freqs - f_fit) <= outer)
+        vals = power[m]
+        n_used = int(np.count_nonzero(np.isfinite(vals)))
+        noise = trimmed_median(vals, trim_top_frac=trim_top_frac)
+        if np.isfinite(noise) and (noise > 0) and (n_used >= min_points):
+            return float(noise), n_used
+        expand *= 1.5
+    return np.nan, n_used
+
+def pol_local_snr_from_fit(ts: TimeSeries, f_fit: float, T_noise: float, ks: float,
+                           baseline_matrix: np.ndarray,
+                           trim_top_frac: float = TRIM_TOP_FRAC) -> tuple[float, float]:
+    """
+    Recompute the polarimetric SNR on a fresh ultra-local nuisance periodogram
+    centered on the fitted frequency, with frequency-defined guard/sideband
+    widths and no whole-spectrum fallback.
+    """
+    freqs_local, guard_half, side_half = pol_local_snr_grid(f_fit, T_noise=T_noise, ks=ks)
+    power_local = nuisance_periodogram(ts, freqs_local, baseline_matrix=baseline_matrix)
+    if not np.isfinite(power_local).any():
+        return np.nan, np.nan
+
+    m_peak = np.isfinite(power_local) & (np.abs(freqs_local - f_fit) <= guard_half)
+    if np.any(m_peak):
+        p0 = float(np.nanmax(power_local[m_peak]))
+    else:
+        j = int(np.nanargmin(np.abs(freqs_local - f_fit)))
+        p0 = float(power_local[j])
+
+    noise, _n_used = pol_local_noise_floor_from_local_periodogram(
+        freqs_local, power_local, f_fit=f_fit, guard_half=guard_half,
+        side_half=side_half, trim_top_frac=trim_top_frac
+    )
+    W = float(p0 / noise) if (np.isfinite(noise) and noise > 0) else np.nan
+    snr = float(np.sqrt(W)) if np.isfinite(W) and W > 0 else np.nan
+    return snr, W
+
 
 def local_noise_floor(freqs: np.ndarray, power: np.ndarray, f0: float, T: float,
                       kfit: float, ks: float, trim_top_frac: float,
@@ -1363,7 +1471,7 @@ def extract_tess_modes(tess0: TimeSeries) -> tuple[pd.DataFrame, dict, list[dict
             tess, f0=f0, T=Tfull, kfit=KFIT, fmin=FMIN, fmax=FMAX,
             baseline_matrix=make_tess_baseline_matrix(tess), n_steps=LOCAL_FIT_STEPS
         )
-        snr, W = local_snr_from_power(freqs, power, fit["best_f"], T=Tseg, ks=KS_TESS)
+        snr, W = tess_local_snr_from_fit(tess, fit["best_f"], T_noise=Tseg, ks=KS_TESS)
         if (not np.isfinite(snr)) or (snr < TESS_SNR_STOP):
             print(f"[TESS] stopping at iter {n}: SNR={snr:.2f} < {TESS_SNR_STOP:.2f}")
             break
@@ -1437,6 +1545,84 @@ def match_global_components_with_local(local_df: pd.DataFrame, global_fit: dict)
         merged.append({**lr.to_dict(), **grow})
     return pd.DataFrame(merged)
 
+
+def _guided_seed_decision(f_tess: float, f_local: float, snr_local: float, local_res: float) -> tuple[bool, bool, bool, float]:
+    freq_offset = float(abs(float(f_local) - float(f_tess))) if np.isfinite(f_local) else np.nan
+    near_tess = bool(np.isfinite(freq_offset) and (freq_offset <= float(POL_SEED_MAX_OFFSET_MULT) * float(local_res)))
+    detected = bool(np.isfinite(snr_local) and (snr_local >= float(POL_SNR_STOP)))
+    seed_for_global = bool(detected or (near_tess and np.isfinite(snr_local) and (snr_local >= float(POL_SNR_SOFT_MIN))))
+    return detected, seed_for_global, near_tess, freq_offset
+
+def _match_guided_rows_to_global_components(candidate_df: pd.DataFrame, global_fit: dict) -> pd.DataFrame:
+    if candidate_df is None or candidate_df.empty or not global_fit.get("component_rows"):
+        return pd.DataFrame()
+    g_rows = pd.DataFrame(global_fit["component_rows"])
+    remaining = list(range(len(g_rows)))
+    out_rows = []
+    for _, ar in candidate_df.iterrows():
+        if not remaining:
+            break
+        f0 = float(ar["f_local"])
+        idx = min(remaining, key=lambda j: abs(float(g_rows.iloc[j]["f"]) - f0))
+        grow = g_rows.iloc[idx].to_dict()
+        remaining.remove(idx)
+        row = dict(ar)
+        row.update({
+            "f": float(grow["f"]),
+            "amp": float(grow["amp"]),
+            "phase": float(grow["phase"]),
+            "s_coeff": float(grow["s_coeff"]),
+            "c_coeff": float(grow["c_coeff"]),
+        })
+        out_rows.append(row)
+    return pd.DataFrame(out_rows)
+
+def _compute_guided_postfit_local_snr(pol0: TimeSeries, trend_cfg: NightTrendConfig, final_df: pd.DataFrame) -> pd.DataFrame:
+    if final_df is None or final_df.empty:
+        return final_df if final_df is not None else pd.DataFrame()
+
+    baseline0 = make_pol_baseline_matrix(pol0, trend_cfg)
+    t = np.asarray(pol0.t, dtype=float)
+
+    component_models = []
+    for _, row in final_df.iterrows():
+        component_models.append(
+            component_signal(t, float(row["f"]), float(row["s_coeff"]), float(row["c_coeff"]))
+        )
+    if component_models:
+        total_signal = np.sum(np.vstack(component_models), axis=0)
+    else:
+        total_signal = np.zeros_like(t, dtype=float)
+
+    Tfull_pol = max(compute_T_full(pol0), 1e-8)
+    post_snr = []
+    post_W = []
+    for i, (_, row) in enumerate(final_df.iterrows()):
+        y_keep = np.asarray(pol0.y, dtype=float) - (total_signal - component_models[i])
+        ts_keep = TimeSeries(
+            t=pol0.t.copy(),
+            y=y_keep,
+            yerr=None if pol0.yerr is None else pol0.yerr.copy(),
+            name=pol0.name,
+            t_abs=None if pol0.t_abs is None else pol0.t_abs.copy(),
+            group_id=None if pol0.group_id is None else pol0.group_id.copy(),
+        )
+        snr, W = pol_local_snr_from_fit(
+            ts_keep, float(row["f"]), T_noise=Tfull_pol, ks=POL_LOCAL_NOISE_KS,
+            baseline_matrix=baseline0
+        )
+        post_snr.append(float(snr) if np.isfinite(snr) else np.nan)
+        post_W.append(float(W) if np.isfinite(W) else np.nan)
+
+    out = final_df.copy()
+    out["postfit_snr_local"] = post_snr
+    out["postfit_W_local"] = post_W
+    out["postfit_keep"] = out["detected"].astype(bool) | (
+        np.isfinite(pd.to_numeric(out["postfit_snr_local"], errors="coerce")) &
+        (pd.to_numeric(out["postfit_snr_local"], errors="coerce") >= float(POL_POSTFIT_SNR_MIN))
+    )
+    return out
+
 def search_guided_channel(pol0: TimeSeries, tess_table: pd.DataFrame, tess_freq_resolution: float,
                           trend_cfg: NightTrendConfig) -> tuple[pd.DataFrame, pd.DataFrame, dict, list[dict], TimeSeries, np.ndarray, np.ndarray, np.ndarray, list[dict]]:
     pol = TimeSeries(
@@ -1447,7 +1633,8 @@ def search_guided_channel(pol0: TimeSeries, tess_table: pd.DataFrame, tess_freq_
     )
     Tfull_pol = max(compute_T_full(pol0), 1e-8)
     template_df = tess_table.copy().sort_values("mode").reset_index(drop=True)
-    search_half_window = POL_SEARCH_WINDOW_MULT * max(float(tess_freq_resolution), 1.0 / Tfull_pol)
+    local_res = max(float(tess_freq_resolution), 1.0 / Tfull_pol)
+    search_half_window = POL_SEARCH_WINDOW_MULT * local_res
     df_local = max(min(float(tess_freq_resolution), 1.0 / Tfull_pol) / max(POL_OVERSAMPLE, 1e-8), 1e-8)
     print(f"[{pol0.name}] guided search: npts={len(pol0.t)} | Tfull={Tfull_pol:.3f} d | template_modes={len(template_df)} | half_window={search_half_window:.6g} c/d | df_local={df_local:.6g} c/d")
 
@@ -1462,7 +1649,9 @@ def search_guided_channel(pol0: TimeSeries, tess_table: pd.DataFrame, tess_freq_
         f_tess = float(tr["f"])
         if np.isfinite(guided_pol_fmin) and (f_tess < guided_pol_fmin):
             search_rows.append({
-                "tess_mode": mode_n, "f_tess": f_tess, "detected": False,
+                "tess_mode": mode_n, "f_tess": f_tess,
+                "detected": False, "seed_for_global": False, "near_tess": False,
+                "freq_offset": np.nan,
                 "f_local": np.nan, "amp_local": np.nan, "phase_local": np.nan,
                 "snr_local": np.nan, "W_local": np.nan,
                 "skip_reason": f"below_GUIDED_POL_FMIN({guided_pol_fmin:g})",
@@ -1472,20 +1661,24 @@ def search_guided_channel(pol0: TimeSeries, tess_table: pd.DataFrame, tess_freq_
 
         print(f"[{pol0.name}] testing TESS mode {i_tr}/{len(template_df)} (mode={mode_n}) near f={f_tess:.6f} c/d")
         local_freqs = make_local_frequency_grid(
-            f_tess, search_half_window, df_local, fmin=max(FMIN, guided_pol_fmin if np.isfinite(guided_pol_fmin) else FMIN), fmax=FMAX,
-            max_points=POL_LOCAL_MAX_POINTS
+            f_tess, search_half_window, df_local,
+            fmin=max(FMIN, guided_pol_fmin if np.isfinite(guided_pol_fmin) else FMIN),
+            fmax=FMAX, max_points=POL_LOCAL_MAX_POINTS
         )
         baseline_now = make_pol_baseline_matrix(pol, trend_cfg)
         power = nuisance_periodogram(pol, local_freqs, baseline_matrix=baseline_now)
         if not np.isfinite(power).any():
             search_rows.append({
-                "tess_mode": mode_n, "f_tess": f_tess, "detected": False,
+                "tess_mode": mode_n, "f_tess": f_tess,
+                "detected": False, "seed_for_global": False, "near_tess": False,
+                "freq_offset": np.nan,
                 "f_local": np.nan, "amp_local": np.nan, "phase_local": np.nan,
                 "snr_local": np.nan, "W_local": np.nan,
-                "skip_reason": "no_finite_power"
+                "skip_reason": "no_finite_power",
             })
             print(f"[{pol0.name} vs TESS mode {mode_n}] no finite local periodogram values")
             continue
+
         jloc = int(np.nanargmax(power))
         f0 = float(local_freqs[jloc])
         fit = fit_frequency_with_design(
@@ -1493,23 +1686,37 @@ def search_guided_channel(pol0: TimeSeries, tess_table: pd.DataFrame, tess_freq_
             baseline_matrix=baseline_now, n_steps=LOCAL_FIT_STEPS,
             hard_fmin=float(local_freqs[0]), hard_fmax=float(local_freqs[-1])
         )
-        snr, W = local_snr_from_power(
-            local_freqs, power, fit["best_f"], T=Tfull_pol, ks=POL_LOCAL_NOISE_KS,
-            n_side_bins=POL_LOCAL_NOISE_SIDE_BINS
+        snr, W = pol_local_snr_from_fit(
+            pol, fit["best_f"], T_noise=Tfull_pol, ks=POL_LOCAL_NOISE_KS,
+            baseline_matrix=baseline_now
         )
-        detected = bool(np.isfinite(snr) and (snr >= POL_SNR_STOP))
+        detected, seed_for_global, near_tess, freq_offset = _guided_seed_decision(
+            f_tess=f_tess, f_local=fit["best_f"], snr_local=snr, local_res=local_res
+        )
+
+        if detected:
+            skip_reason = ""
+        elif seed_for_global:
+            skip_reason = "marginal_seed_for_global_fit"
+        else:
+            skip_reason = "snr_below_threshold"
+
         search_rows.append({
             "tess_mode": mode_n,
             "f_tess": f_tess,
             "detected": detected,
-            "f_local": fit["best_f"] if detected else np.nan,
-            "amp_local": fit["amp"] if detected else np.nan,
-            "phase_local": fit["phase"] if detected else np.nan,
+            "seed_for_global": seed_for_global,
+            "near_tess": near_tess,
+            "freq_offset": freq_offset,
+            "f_local": float(fit["best_f"]),
+            "amp_local": float(fit["amp"]),
+            "phase_local": float(fit["phase"]),
             "snr_local": snr,
             "W_local": W,
-            "skip_reason": "" if detected else "snr_below_threshold",
+            "skip_reason": skip_reason,
         })
-        if detected:
+
+        if seed_for_global:
             snapshots.append({
                 "tess_mode": mode_n,
                 "prefit": TimeSeries(
@@ -1521,18 +1728,30 @@ def search_guided_channel(pol0: TimeSeries, tess_table: pd.DataFrame, tess_freq_
                 ),
                 "fit": fit,
             })
+
+        if detected:
             pol = prewhiten(pol, fit["full_model"])
             print(f"[{pol0.name} vs TESS mode {mode_n}] detected f={fit['best_f']:.6f} c/d | amp={fit['amp']:.4g} | SNR={snr:.2f}")
+        elif seed_for_global:
+            print(f"[{pol0.name} vs TESS mode {mode_n}] marginal seed kept for global fit | f={fit['best_f']:.6f} c/d | amp={fit['amp']:.4g} | SNR={snr:.2f} | Δf={freq_offset:.6g}")
         else:
             print(f"[{pol0.name} vs TESS mode {mode_n}] no detection | best local SNR={snr:.2f}")
 
     search_df = pd.DataFrame(search_rows)
-    accepted_raw = search_df.loc[search_df["detected"]].copy().reset_index(drop=True)
     min_sep_global = max((1.0 / Tfull_pol) * MIN_FREQ_SEP_MULT, float(tess_freq_resolution) * MIN_FREQ_SEP_MULT, 1e-8)
-    accepted = dedupe_frequency_rows(accepted_raw, "f_local", score_cols=("snr_local", "amp_local", "W_local"), min_sep=min_sep_global)
+
+    accepted_raw = search_df.loc[search_df["seed_for_global"]].copy().reset_index(drop=True)
+    if not accepted_raw.empty:
+        accepted_raw["detected_score"] = accepted_raw["detected"].astype(int)
+        accepted_raw["template_closeness"] = -pd.to_numeric(accepted_raw["freq_offset"], errors="coerce").fillna(np.inf)
+    accepted = dedupe_frequency_rows(
+        accepted_raw, "f_local",
+        score_cols=("detected_score", "snr_local", "amp_local", "W_local", "template_closeness"),
+        min_sep=min_sep_global
+    ) if not accepted_raw.empty else accepted_raw.copy()
     if len(accepted_raw) != len(accepted):
-        print(f"[{pol0.name}] merged {len(accepted_raw)-len(accepted)} near-duplicate guided detection(s) before global fit (min_sep={min_sep_global:.6g} c/d)")
-    print(f"[{pol0.name}] accepted {len(accepted)} guided detections; starting global fit")
+        print(f"[{pol0.name}] merged {len(accepted_raw)-len(accepted)} near-duplicate guided candidate(s) before global fit (min_sep={min_sep_global:.6g} c/d)")
+    print(f"[{pol0.name}] seeding global fit with {len(accepted)} guided candidate(s)")
 
     global_fit = fit_global_multisin(
         pol0,
@@ -1541,7 +1760,33 @@ def search_guided_channel(pol0: TimeSeries, tess_table: pd.DataFrame, tess_freq_
         freq_resolution=(1.0 / Tfull_pol),
         bound_mult=GLOBAL_FREQ_BOUND_MULT
     )
+
+    prelim_df = _match_guided_rows_to_global_components(accepted, global_fit)
+    prelim_df = _compute_guided_postfit_local_snr(pol0, trend_cfg, prelim_df)
+
+    kept_seed_df = prelim_df.loc[prelim_df["postfit_keep"]].copy().reset_index(drop=True) if not prelim_df.empty else prelim_df
+    if not prelim_df.empty and len(kept_seed_df) != len(prelim_df):
+        print(f"[{pol0.name}] pruned {len(prelim_df)-len(kept_seed_df)} marginal guided candidate(s) after post-fit local-SNR check")
+
+    if len(kept_seed_df) != len(accepted):
+        global_fit = fit_global_multisin(
+            pol0,
+            seed_freqs=kept_seed_df["f"].to_numpy(dtype=float) if not kept_seed_df.empty else np.array([], dtype=float),
+            baseline_matrix=baseline0,
+            freq_resolution=(1.0 / Tfull_pol),
+            bound_mult=GLOBAL_FREQ_BOUND_MULT
+        )
+
+    final_df = _match_guided_rows_to_global_components(kept_seed_df, global_fit)
+    final_df = _compute_guided_postfit_local_snr(pol0, trend_cfg, final_df)
     final_resid = prewhiten(pol0, global_fit["full_model"])
+
+    keep_modes = set()
+    if final_df is not None and not final_df.empty:
+        keep_modes = set(pd.to_numeric(final_df["tess_mode"], errors="coerce").dropna().astype(int).tolist())
+    if "postfit_keep" not in search_df.columns:
+        search_df["postfit_keep"] = False
+    search_df["postfit_keep"] = search_df["tess_mode"].isin(keep_modes)
 
     freqs_plot = make_plot_frequency_grid(pol0, oversample=1.0, gap_days=trend_cfg.gap_days, max_points=PLOT_MAX_GRID_POINTS)
     start_power = nuisance_periodogram(pol0, freqs_plot, baseline_matrix=baseline0)
@@ -1553,30 +1798,6 @@ def search_guided_channel(pol0: TimeSeries, tess_table: pd.DataFrame, tess_freq_
     start_power_full = nuisance_periodogram(pol0, freqs_plot_full, baseline_matrix=baseline0)
     end_power_full = nuisance_periodogram(final_resid, freqs_plot_full, baseline_matrix=make_pol_baseline_matrix(final_resid, trend_cfg))
 
-    final_rows = []
-    if not accepted.empty and global_fit["component_rows"]:
-        g_rows = pd.DataFrame(global_fit["component_rows"])
-        remaining = list(range(len(g_rows)))
-        for _, ar in accepted.iterrows():
-            f0 = float(ar["f_local"])
-            idx = min(remaining, key=lambda j: abs(float(g_rows.iloc[j]["f"]) - f0))
-            grow = g_rows.iloc[idx].to_dict()
-            remaining.remove(idx)
-            final_rows.append({
-                "tess_mode": int(ar["tess_mode"]),
-                "f_tess": float(ar["f_tess"]),
-                "f_local": float(ar["f_local"]),
-                "amp_local": float(ar["amp_local"]),
-                "phase_local": float(ar["phase_local"]),
-                "snr_local": float(ar["snr_local"]),
-                "W_local": float(ar["W_local"]),
-                "f": float(grow["f"]),
-                "amp": float(grow["amp"]),
-                "phase": float(grow["phase"]),
-                "s_coeff": float(grow["s_coeff"]),
-                "c_coeff": float(grow["c_coeff"]),
-            })
-    final_df = pd.DataFrame(final_rows)
     local_diags = build_guided_local_diagnostics(pol0, final_resid, search_df, trend_cfg, tess_freq_resolution)
     return (search_df, final_df, global_fit, snapshots, final_resid,
             freqs_plot, start_power, end_power, local_diags,
@@ -1624,20 +1845,23 @@ def phase_bin_medians(phase: np.ndarray, y: np.ndarray, nbin: int = 16) -> tuple
 
 def plot_tess_timeseries_and_spectra(tess0: TimeSeries, final_resid: TimeSeries, freqs: np.ndarray,
                                      Pstart: np.ndarray, Pend: np.ndarray, mode_table: pd.DataFrame,
-                                     outdir: Path, show_plots_inline: bool = False):
+                                     outdir: Path, show_plots_inline: bool = False, file_prefix: str = ""):
     outdir.mkdir(parents=True, exist_ok=True)
 
+    C_START = "#7EC8FF"
+    C_END = "#000000"
     fig, ax = plt.subplots(figsize=(11, 4.8))
     y0 = tess0.y - np.nanmedian(tess0.y)
     y1 = final_resid.y - np.nanmedian(final_resid.y)
-    ax.scatter(tess0.t, y0, s=8, alpha=0.55, label="tess start", color="#0072B2")
-    ax.scatter(final_resid.t, y1, s=8, alpha=0.65, label="tess end (resid)", color="#56B4E9")
+    ax.scatter(tess0.t, y0, s=5, alpha=0.50, label="tess start", color=C_START)
+    ax.scatter(final_resid.t, y1, s=5, alpha=0.55, label="tess end (resid)", color=C_END)
     ax.set_xlabel("Time [days]")
     ax.set_ylabel("TESS value (median-subtracted)")
+    set_robust_time_ylim(ax, y0, y1, central_pct=98.0, pad_frac=0.12)
     ax.set_title("TESS time series")
     ax.legend(loc="best", fontsize=9)
     fig.tight_layout()
-    fig.savefig(outdir / "timeseries_start_end.png", dpi=180)
+    fig.savefig(outdir / prefixed_output_name(file_prefix, "timeseries_start_end.png"), dpi=180)
     if show_plots_inline:
         plt.show()
     plt.close(fig)
@@ -1645,8 +1869,8 @@ def plot_tess_timeseries_and_spectra(tess0: TimeSeries, final_resid: TimeSeries,
     P0 = _norm_spec(Pstart)
     P1 = _norm_spec(Pend)
     fig, ax = plt.subplots(figsize=(11, 4.8))
-    ax.plot(freqs, P0, lw=0.9, color="#0072B2", label="tess start")
-    ax.plot(freqs, P1 + 1.2, lw=0.9, color="#56B4E9", linestyle="--", label="tess end (offset)")
+    ax.plot(freqs, P0, lw=0.9, color=C_START, label="tess start")
+    ax.plot(freqs, P1 + 1.2, lw=0.9, color=C_END, linestyle="--", label="tess end (offset)")
     if not mode_table.empty:
         ytop = np.nanmax(P1 + 1.2)
         for _, r in mode_table.iterrows():
@@ -1659,14 +1883,14 @@ def plot_tess_timeseries_and_spectra(tess0: TimeSeries, final_resid: TimeSeries,
     ax.set_title("TESS spectra")
     ax.legend(loc="best", fontsize=9)
     fig.tight_layout()
-    fig.savefig(outdir / "spectra_start_end.png", dpi=180)
+    fig.savefig(outdir / prefixed_output_name(file_prefix, "spectra_start_end.png"), dpi=180)
     if show_plots_inline:
         plt.show()
     plt.close(fig)
 
     fig, ax = plt.subplots(figsize=(11, 4.8))
-    ax.semilogy(freqs, np.maximum(Pstart, 1e-12), lw=0.9, color="#0072B2", label="tess start")
-    ax.semilogy(freqs, np.maximum(Pend, 1e-12), lw=0.9, color="#56B4E9", linestyle="--", label="tess end")
+    ax.semilogy(freqs, np.maximum(Pstart, 1e-12), lw=0.9, color=C_START, label="tess start")
+    ax.semilogy(freqs, np.maximum(Pend, 1e-12), lw=0.9, color=C_END, linestyle="--", label="tess end")
     if not mode_table.empty:
         for _, r in mode_table.iterrows():
             ax.axvline(float(r["f"]), lw=0.8, alpha=0.35, color="0.3")
@@ -1675,7 +1899,7 @@ def plot_tess_timeseries_and_spectra(tess0: TimeSeries, final_resid: TimeSeries,
     ax.set_title("TESS spectra (log y)")
     ax.legend(loc="best", fontsize=9)
     fig.tight_layout()
-    fig.savefig(outdir / "spectra_start_end_log_offset.png", dpi=180)
+    fig.savefig(outdir / prefixed_output_name(file_prefix, "spectra_start_end_log_offset.png"), dpi=180)
     if show_plots_inline:
         plt.show()
     plt.close(fig)
@@ -1687,7 +1911,7 @@ def plot_tess_timeseries_and_spectra(tess0: TimeSeries, final_resid: TimeSeries,
     ax.set_ylabel("Window power")
     ax.set_title("TESS spectral window")
     fig.tight_layout()
-    fig.savefig(outdir / "spectral_windows.png", dpi=180)
+    fig.savefig(outdir / prefixed_output_name(file_prefix, "spectral_windows.png"), dpi=180)
     if show_plots_inline:
         plt.show()
     plt.close(fig)
@@ -1698,31 +1922,35 @@ def plot_channel_timeseries_and_spectra(tess0: TimeSeries, tess_final_resid: Tim
                                         freqs_pol: np.ndarray, Ppo_start: np.ndarray, Ppo_end: np.ndarray,
                                         freqs_pol_full: np.ndarray, Ppo_start_full: np.ndarray, Ppo_end_full: np.ndarray,
                                         outdir: Path, guided_diags: list[dict] | None = None,
-                                        show_plots_inline: bool = False):
+                                        show_plots_inline: bool = False, file_prefix: str = ""):
     outdir.mkdir(parents=True, exist_ok=True)
 
     fig, axes = plt.subplots(nrows=2, ncols=1, figsize=(11, 7.5), sharex=False)
 
+    C_START = "#7EC8FF"
+    C_END = "#000000"
     ax = axes[0]
     t0 = tess0.y - np.nanmedian(tess0.y)
     t1 = tess_final_resid.y - np.nanmedian(tess_final_resid.y)
-    ax.scatter(tess0.t, t0, s=8, alpha=0.55, label="tess start", color="#0072B2")
-    ax.scatter(tess_final_resid.t, t1, s=8, alpha=0.65, label="tess end (resid)", color="#56B4E9")
+    ax.scatter(tess0.t, t0, s=5, alpha=0.50, label="tess start", color=C_START)
+    ax.scatter(tess_final_resid.t, t1, s=5, alpha=0.55, label="tess end (resid)", color=C_END)
     ax.set_ylabel("TESS value (median-subtracted)")
+    set_robust_time_ylim(ax, t0, t1, central_pct=98.0, pad_frac=0.12)
     ax.set_title("TESS time series")
     ax.legend(loc="best", fontsize=9)
 
     ax = axes[1]
     p0 = pol0.y - np.nanmedian(pol0.y)
     p1 = pol_final_resid.y - np.nanmedian(pol_final_resid.y)
-    ax.scatter(pol0.t, p0, s=10, alpha=0.55, label=f"{pol0.name} start", color="#E69F00")
-    ax.scatter(pol_final_resid.t, p1, s=10, alpha=0.65, label=f"{pol0.name} end (resid)", color="#CC79A7")
+    ax.scatter(pol0.t, p0, s=6, alpha=0.50, label=f"{pol0.name} start", color=C_START)
+    ax.scatter(pol_final_resid.t, p1, s=6, alpha=0.55, label=f"{pol0.name} end (resid)", color=C_END)
     ax.set_xlabel("Time [days]")
     ax.set_ylabel(f"{pol0.name} value (median-subtracted)")
+    set_robust_time_ylim(ax, p0, p1, central_pct=98.0, pad_frac=0.12)
     ax.set_title(f"{pol0.name} time series")
     ax.legend(loc="best", fontsize=9)
     fig.tight_layout()
-    fig.savefig(outdir / "timeseries_start_end.png", dpi=180)
+    fig.savefig(outdir / prefixed_output_name(file_prefix, "timeseries_start_end.png"), dpi=180)
     if show_plots_inline:
         plt.show()
     plt.close(fig)
@@ -1736,8 +1964,8 @@ def plot_channel_timeseries_and_spectra(tess0: TimeSeries, tess_final_resid: Tim
     ax = axes[0]
     T0 = _norm_spec(Pte_start)
     T1 = _norm_spec(Pte_end)
-    ax.plot(freqs_tess, T0, lw=0.9, color="#0072B2", label="tess start")
-    ax.plot(freqs_tess, T1 + 1.2, lw=0.9, color="#56B4E9", linestyle="--", label="tess end (offset)")
+    ax.plot(freqs_tess, T0, lw=0.9, color=C_START, label="tess start")
+    ax.plot(freqs_tess, T1 + 1.2, lw=0.9, color=C_END, linestyle="--", label="tess end (offset)")
     if not tess_table.empty:
         ytop = np.nanmax(T1 + 1.2)
         for _, r in tess_table.iterrows():
@@ -1753,8 +1981,8 @@ def plot_channel_timeseries_and_spectra(tess0: TimeSeries, tess_final_resid: Tim
             P0 = _norm_spec(gd["Pstart"])
             P1 = _norm_spec(gd["Pend"])
             freqs = gd["freqs"]
-            ax.plot(freqs, P0, lw=1.0, color="#E69F00", label=f"{pol0.name} start")
-            ax.plot(freqs, P1 + 1.2, lw=1.0, color="#CC79A7", linestyle="--", label=f"{pol0.name} end (offset)")
+            ax.plot(freqs, P0, lw=1.0, color=C_START, label=f"{pol0.name} start")
+            ax.plot(freqs, P1 + 1.2, lw=1.0, color=C_END, linestyle="--", label=f"{pol0.name} end (offset)")
             ax.axvline(gd["f_tess"], lw=0.9, alpha=0.6, color="0.3", label="TESS template" if i == 1 else None)
             if np.isfinite(gd["f_detected"]):
                 ax.axvline(gd["f_detected"], lw=0.9, alpha=0.8, color="#009E73", linestyle=":", label="pol detection" if i == 1 else None)
@@ -1770,15 +1998,15 @@ def plot_channel_timeseries_and_spectra(tess0: TimeSeries, tess_final_resid: Tim
         ax = axes[1]
         P0 = _norm_spec(Ppo_start)
         P1 = _norm_spec(Ppo_end)
-        ax.plot(freqs_pol, P0, lw=0.9, color="#E69F00", label=f"{pol0.name} start")
-        ax.plot(freqs_pol, P1 + 1.2, lw=0.9, color="#CC79A7", linestyle="--", label=f"{pol0.name} end (offset)")
+        ax.plot(freqs_pol, P0, lw=0.9, color=C_START, label=f"{pol0.name} start")
+        ax.plot(freqs_pol, P1 + 1.2, lw=0.9, color=C_END, linestyle="--", label=f"{pol0.name} end (offset)")
         ax.set_xlabel("Frequency [c/d]")
         ax.set_ylabel(f"{pol0.name} norm. power + offset")
         ax.set_title(f"{pol0.name} spectra")
         ax.legend(loc="best", fontsize=9)
 
     fig.tight_layout()
-    fig.savefig(outdir / "spectra_start_end.png", dpi=180)
+    fig.savefig(outdir / prefixed_output_name(file_prefix, "spectra_start_end.png"), dpi=180)
     if show_plots_inline:
         plt.show()
     plt.close(fig)
@@ -1786,8 +2014,8 @@ def plot_channel_timeseries_and_spectra(tess0: TimeSeries, tess_final_resid: Tim
     # Full-range polarimetry spectrum on a full-baseline plot grid
     fig, axes = plt.subplots(nrows=2, ncols=1, figsize=(11, 7.2), sharex=False)
     ax = axes[0]
-    ax.plot(freqs_tess, T0, lw=0.9, color="#0072B2", label="tess start")
-    ax.plot(freqs_tess, T1 + 1.2, lw=0.9, color="#56B4E9", linestyle="--", label="tess end (offset)")
+    ax.plot(freqs_tess, T0, lw=0.9, color=C_START, label="tess start")
+    ax.plot(freqs_tess, T1 + 1.2, lw=0.9, color=C_END, linestyle="--", label="tess end (offset)")
     if not tess_table.empty:
         ytop = np.nanmax(T1 + 1.2)
         for _, r in tess_table.iterrows():
@@ -1800,8 +2028,8 @@ def plot_channel_timeseries_and_spectra(tess0: TimeSeries, tess_final_resid: Tim
     ax = axes[1]
     P0_full = _norm_spec(Ppo_start_full)
     P1_full = _norm_spec(Ppo_end_full)
-    ax.plot(freqs_pol_full, P0_full, lw=0.9, color="#E69F00", label=f"{pol0.name} start")
-    ax.plot(freqs_pol_full, P1_full + 1.2, lw=0.9, color="#CC79A7", linestyle="--", label=f"{pol0.name} end (offset)")
+    ax.plot(freqs_pol_full, P0_full, lw=0.9, color=C_START, label=f"{pol0.name} start")
+    ax.plot(freqs_pol_full, P1_full + 1.2, lw=0.9, color=C_END, linestyle="--", label=f"{pol0.name} end (offset)")
     if not pol_table.empty:
         ytop = np.nanmax(P1_full + 1.2)
         for _, r in pol_table.iterrows():
@@ -1811,7 +2039,7 @@ def plot_channel_timeseries_and_spectra(tess0: TimeSeries, tess_final_resid: Tim
     ax.set_title(f"{pol0.name} spectra (full-range, full-baseline grid)")
     ax.legend(loc="best", fontsize=9)
     fig.tight_layout()
-    fig.savefig(outdir / "spectra_fullrange_start_end.png", dpi=180)
+    fig.savefig(outdir / prefixed_output_name(file_prefix, "spectra_fullrange_start_end.png"), dpi=180)
     if show_plots_inline:
         plt.show()
     plt.close(fig)
@@ -1823,7 +2051,7 @@ def plot_channel_timeseries_and_spectra(tess0: TimeSeries, tess_final_resid: Tim
             axes = [axes]
         for ax, gd in zip(axes, guided_diags):
             freqs = gd["freqs"]
-            ax.semilogy(freqs, np.maximum(gd["Pstart"], 1e-12), lw=1.0, color="#E69F00", label=f"{pol0.name} start")
+            ax.semilogy(freqs, np.maximum(gd["Pstart"], 1e-12), lw=1.0, color=C_START, label=f"{pol0.name} start")
             ax.semilogy(freqs, np.maximum(gd["Pend"], 1e-12), lw=1.0, color="#CC79A7", linestyle="--", label=f"{pol0.name} end")
             ax.axvline(gd["f_tess"], lw=0.9, alpha=0.6, color="0.3", label="TESS template")
             if np.isfinite(gd["f_detected"]):
@@ -1834,27 +2062,27 @@ def plot_channel_timeseries_and_spectra(tess0: TimeSeries, tess_final_resid: Tim
         axes[-1].set_xlabel("Frequency [c/d]")
     else:
         fig, axes = plt.subplots(nrows=2, ncols=1, figsize=(11, 7.5), sharex=False)
-        axes[0].semilogy(freqs_tess, np.maximum(Pte_start, 1e-12), lw=0.9, color="#0072B2", label="tess start")
-        axes[0].semilogy(freqs_tess, np.maximum(Pte_end, 1e-12), lw=0.9, color="#56B4E9", linestyle="--", label="tess end")
+        axes[0].semilogy(freqs_tess, np.maximum(Pte_start, 1e-12), lw=0.9, color=C_START, label="tess start")
+        axes[0].semilogy(freqs_tess, np.maximum(Pte_end, 1e-12), lw=0.9, color=C_END, linestyle="--", label="tess end")
         axes[0].legend(loc="best", fontsize=9)
         axes[0].set_ylabel("TESS power")
         axes[0].set_title("TESS spectra (log y)")
 
-        axes[1].semilogy(freqs_pol, np.maximum(Ppo_start, 1e-12), lw=0.9, color="#E69F00", label=f"{pol0.name} start")
+        axes[1].semilogy(freqs_pol, np.maximum(Ppo_start, 1e-12), lw=0.9, color=C_START, label=f"{pol0.name} start")
         axes[1].semilogy(freqs_pol, np.maximum(Ppo_end, 1e-12), lw=0.9, color="#CC79A7", linestyle="--", label=f"{pol0.name} end")
         axes[1].legend(loc="best", fontsize=9)
         axes[1].set_xlabel("Frequency [c/d]")
         axes[1].set_ylabel(f"{pol0.name} power")
         axes[1].set_title(f"{pol0.name} spectra (log y)")
     fig.tight_layout()
-    fig.savefig(outdir / "spectra_start_end_log_offset.png", dpi=180)
+    fig.savefig(outdir / prefixed_output_name(file_prefix, "spectra_start_end_log_offset.png"), dpi=180)
     if show_plots_inline:
         plt.show()
     plt.close(fig)
 
     fig, axes = plt.subplots(nrows=2, ncols=1, figsize=(11, 7.2), sharex=False)
-    axes[0].semilogy(freqs_tess, np.maximum(Pte_start, 1e-12), lw=0.9, color="#0072B2", label="tess start")
-    axes[0].semilogy(freqs_tess, np.maximum(Pte_end, 1e-12), lw=0.9, color="#56B4E9", linestyle="--", label="tess end")
+    axes[0].semilogy(freqs_tess, np.maximum(Pte_start, 1e-12), lw=0.9, color=C_START, label="tess start")
+    axes[0].semilogy(freqs_tess, np.maximum(Pte_end, 1e-12), lw=0.9, color=C_END, linestyle="--", label="tess end")
     if not tess_table.empty:
         for _, r in tess_table.iterrows():
             axes[0].axvline(float(r["f"]), lw=0.8, alpha=0.25, color="0.3")
@@ -1862,7 +2090,7 @@ def plot_channel_timeseries_and_spectra(tess0: TimeSeries, tess_final_resid: Tim
     axes[0].set_title("TESS spectra (log y)")
     axes[0].legend(loc="best", fontsize=9)
 
-    axes[1].semilogy(freqs_pol_full, np.maximum(Ppo_start_full, 1e-12), lw=0.9, color="#E69F00", label=f"{pol0.name} start")
+    axes[1].semilogy(freqs_pol_full, np.maximum(Ppo_start_full, 1e-12), lw=0.9, color=C_START, label=f"{pol0.name} start")
     axes[1].semilogy(freqs_pol_full, np.maximum(Ppo_end_full, 1e-12), lw=0.9, color="#CC79A7", linestyle="--", label=f"{pol0.name} end")
     if not pol_table.empty:
         for _, r in pol_table.iterrows():
@@ -1872,7 +2100,7 @@ def plot_channel_timeseries_and_spectra(tess0: TimeSeries, tess_final_resid: Tim
     axes[1].set_title(f"{pol0.name} spectra (full-range, log y)")
     axes[1].legend(loc="best", fontsize=9)
     fig.tight_layout()
-    fig.savefig(outdir / "spectra_fullrange_start_end_log.png", dpi=180)
+    fig.savefig(outdir / prefixed_output_name(file_prefix, "spectra_fullrange_start_end_log.png"), dpi=180)
     if show_plots_inline:
         plt.show()
     plt.close(fig)
@@ -1888,59 +2116,42 @@ def plot_channel_timeseries_and_spectra(tess0: TimeSeries, tess_final_resid: Tim
     axes[1].set_ylabel("Window power")
     axes[1].set_title(f"{pol0.name} spectral window (full-baseline grid)")
     fig.tight_layout()
-    fig.savefig(outdir / "spectral_windows.png", dpi=180)
+    fig.savefig(outdir / prefixed_output_name(file_prefix, "spectral_windows.png"), dpi=180)
     if show_plots_inline:
         plt.show()
     plt.close(fig)
 
 def plot_tess_phased_modes(tess_snapshots: list[dict], mode_table: pd.DataFrame, outdir: Path,
-                           n_phase_plots: int = 3, show_plots_inline: bool = False):
+                           n_phase_plots: int = 3, show_plots_inline: bool = False, file_prefix: str = ""):
     if mode_table.empty or not tess_snapshots:
         return
     snap_map = {int(s["mode"]): s for s in tess_snapshots if "mode" in s}
-
-    ranked = mode_table.sort_values("snr_local", ascending=False).copy()
-    valid_rows = []
-    for _, r in ranked.iterrows():
-        try:
-            mode = int(r["mode"])
-        except Exception:
-            continue
+    pick = mode_table.sort_values("snr_local", ascending=False).head(n_phase_plots).reset_index(drop=True)
+    fig, axes = plt.subplots(nrows=len(pick), ncols=1, figsize=(8.5, 3.7 * len(pick)), squeeze=False)
+    for i, (_, r) in enumerate(pick.iterrows()):
+        ax = axes[i, 0]
+        mode = int(r["mode"])
         snap = snap_map.get(mode)
         if snap is None:
             continue
-        fit = snap.get("fit")
-        prefit = snap.get("prefit")
-        if fit is None or prefit is None:
-            continue
-        if len(valid_rows) >= int(n_phase_plots):
-            break
-        valid_rows.append((r, snap))
-
-    if not valid_rows:
-        return
-
-    fig, axes = plt.subplots(nrows=len(valid_rows), ncols=1, figsize=(8.5, 3.7 * len(valid_rows)), squeeze=False)
-    for i, (r, snap) in enumerate(valid_rows):
-        ax = axes[i, 0]
-        mode = int(r["mode"])
         fit = snap["fit"]
         prefit = snap["prefit"]
         f = float(fit["best_f"])
-        y = np.asarray(prefit.y, dtype=float) - np.nanmedian(prefit.y)
+        y = prefit.y - np.nanmedian(prefit.y)
         ph = phase_fold(prefit.t, f)
-        ax.scatter(ph, y, s=8, alpha=0.7, color="0.25")
-        ax.scatter(ph + 1.0, y, s=8, alpha=0.7, color="0.25")
+        ax.scatter(ph, y, s=6, alpha=0.65, color="0.25")
+        ax.scatter(ph + 1.0, y, s=6, alpha=0.65, color="0.25")
         ph_grid = np.linspace(0.0, 2.0, 500)
         model = float(fit["s_coeff"]) * np.sin(2.0 * np.pi * ph_grid) + float(fit["c_coeff"]) * np.cos(2.0 * np.pi * ph_grid)
         model = model - np.nanmedian(model)
         ax.plot(ph_grid, model, lw=1.4, color="0.0")
+        set_robust_time_ylim(ax, y, model, central_pct=98.0, pad_frac=0.12)
         ax.set_xlim(0.0, 2.0)
         ax.set_xlabel("Phase")
         ax.set_ylabel("TESS (median-subtracted)")
         ax.set_title(f"Mode {mode} | TESS | f={float(r['f']):.6f} c/d | amp={float(r['amp']):.4g} | SNR={float(r['snr_local']):.2f}")
     fig.tight_layout()
-    fig.savefig(outdir / "phased_top_modes.png", dpi=180)
+    fig.savefig(outdir / prefixed_output_name(file_prefix, "phased_top_modes.png"), dpi=180)
     if show_plots_inline:
         plt.show()
     plt.close(fig)
@@ -1948,83 +2159,128 @@ def plot_tess_phased_modes(tess_snapshots: list[dict], mode_table: pd.DataFrame,
 def plot_channel_phased_modes(tess_snapshots: list[dict], tess_table: pd.DataFrame,
                               pol_search_df: pd.DataFrame, pol_snapshots: list[dict], pol0: TimeSeries,
                               outdir: Path, n_phase_plots: int = 3, sort_by: str = "amp",
-                              show_plots_inline: bool = False):
-    detected = pol_search_df.loc[pol_search_df["detected"]].copy() if pol_search_df is not None and len(pol_search_df) else pd.DataFrame()
+                              show_plots_inline: bool = False, file_prefix: str = ""):
+    if pol_search_df is not None and len(pol_search_df):
+        if "postfit_keep" in pol_search_df.columns:
+            detected = pol_search_df.loc[pol_search_df["postfit_keep"]].copy()
+        elif "seed_for_global" in pol_search_df.columns:
+            detected = pol_search_df.loc[pol_search_df["seed_for_global"]].copy()
+        else:
+            detected = pol_search_df.loc[pol_search_df["detected"]].copy()
+    else:
+        detected = pd.DataFrame()
     if detected.empty or not pol_snapshots:
         return
     snap_map = {int(s["tess_mode"]): s for s in pol_snapshots if "tess_mode" in s}
     tess_snap_map = {int(s["mode"]): s for s in tess_snapshots if "mode" in s}
     sort_col = sort_by if sort_by in detected.columns else ("amp_local" if "amp_local" in detected.columns else "snr_local")
-    ranked = detected.sort_values(sort_col, ascending=False).copy()
+    pick = detected.sort_values(sort_col, ascending=False).head(n_phase_plots).reset_index(drop=True)
+    fig, axes = plt.subplots(nrows=len(pick), ncols=2, figsize=(12, 3.8 * len(pick)), squeeze=False)
 
-    valid_rows = []
-    for _, pr in ranked.iterrows():
-        try:
-            tess_mode = int(pr["tess_mode"])
-        except Exception:
-            continue
-        tsnap = tess_snap_map.get(tess_mode)
-        psnap = snap_map.get(tess_mode)
-        tr = tess_table.loc[tess_table["mode"] == tess_mode]
-        if tsnap is None or psnap is None or tr.empty:
-            continue
-        if len(valid_rows) >= int(n_phase_plots):
-            break
-        valid_rows.append((pr, tr.iloc[0], tsnap, psnap))
-
-    if not valid_rows:
-        return
-
-    fig, axes = plt.subplots(nrows=len(valid_rows), ncols=2, figsize=(12, 3.8 * len(valid_rows)), squeeze=False)
-
-    for i, (pr, tr, tsnap, psnap) in enumerate(valid_rows):
+    for i, (_, pr) in enumerate(pick.iterrows()):
         tess_mode = int(pr["tess_mode"])
 
+        # TESS panel: use the local single-mode snapshot rather than a global component
         ax = axes[i, 0]
-        tfit = tsnap["fit"]
-        tprefit = tsnap["prefit"]
-        f_t = float(tfit["best_f"])
-        y_t = np.asarray(tprefit.y, dtype=float) - np.nanmedian(tprefit.y)
-        ph_t = phase_fold(tprefit.t, f_t)
-        ax.scatter(ph_t, y_t, s=8, alpha=0.7, color="0.25")
-        ax.scatter(ph_t + 1.0, y_t, s=8, alpha=0.7, color="0.25")
-        ph_grid = np.linspace(0.0, 2.0, 500)
-        model_t = float(tfit["s_coeff"]) * np.sin(2.0 * np.pi * ph_grid) + float(tfit["c_coeff"]) * np.cos(2.0 * np.pi * ph_grid)
-        model_t = model_t - np.nanmedian(model_t)
-        ax.plot(ph_grid, model_t, lw=1.4, color="0.0")
-        ax.set_title(f"Mode {tess_mode} | TESS | f={float(tr['f']):.6f} c/d | amp={float(tr['amp']):.4g} | SNR={float(tr['snr_local']):.2f}")
+        tsnap = tess_snap_map.get(tess_mode)
+        tr = tess_table.loc[tess_table["mode"] == tess_mode]
+        if tsnap is not None and not tr.empty:
+            tr = tr.iloc[0]
+            tfit = tsnap["fit"]
+            tprefit = tsnap["prefit"]
+            f_t = float(tfit["best_f"])
+            y_t = tprefit.y - np.nanmedian(tprefit.y)
+            ph_t = phase_fold(tprefit.t, f_t)
+            ax.scatter(ph_t, y_t, s=6, alpha=0.65, color="0.25")
+            ax.scatter(ph_t + 1.0, y_t, s=6, alpha=0.65, color="0.25")
+            ph_grid = np.linspace(0.0, 2.0, 500)
+            model_t = float(tfit["s_coeff"]) * np.sin(2.0 * np.pi * ph_grid) + float(tfit["c_coeff"]) * np.cos(2.0 * np.pi * ph_grid)
+            model_t = model_t - np.nanmedian(model_t)
+            ax.plot(ph_grid, model_t, lw=1.4, color="0.0")
+            set_robust_time_ylim(ax, y_t, model_t, central_pct=98.0, pad_frac=0.12)
+            ax.set_title(f"Mode {tess_mode} | TESS | f={float(tr['f']):.6f} c/d | amp={float(tr['amp']):.4g} | SNR={float(tr['snr_local']):.2f}")
         ax.set_xlim(0.0, 2.0)
         ax.set_xlabel("Phase")
         ax.set_ylabel("TESS (median-subtracted)")
 
+        # Polarimetry panel: show baseline-corrected folded data plus the local single-frequency fit
         ax = axes[i, 1]
-        pfit = psnap["fit"]
-        pprefit = psnap["prefit"]
-        f_p = float(pfit["best_f"])
-        y_p = np.asarray(pprefit.y, dtype=float) - np.asarray(pfit["baseline_model"], dtype=float)
-        y_p = y_p - np.nanmedian(y_p)
-        ph_p = phase_fold(pprefit.t, f_p)
-        ax.scatter(ph_p, y_p, s=12, alpha=0.55, color="0.25")
-        ax.scatter(ph_p + 1.0, y_p, s=12, alpha=0.55, color="0.25")
-        bph, by = phase_bin_medians(ph_p, y_p, nbin=PHASE_BIN_N)
-        if len(bph):
-            ax.scatter(bph, by, s=28, alpha=0.95, color="#D55E00", zorder=3)
-            ax.scatter(bph + 1.0, by, s=28, alpha=0.95, color="#D55E00", zorder=3, label="phase-bin median")
-        ph_grid = np.linspace(0.0, 2.0, 500)
-        model_p = float(pfit["s_coeff"]) * np.sin(2.0 * np.pi * ph_grid) + float(pfit["c_coeff"]) * np.cos(2.0 * np.pi * ph_grid)
-        model_p = model_p - np.nanmedian(model_p)
-        ax.plot(ph_grid, model_p, lw=1.4, color="0.0")
-        ax.set_title(f"Mode {tess_mode} | {pol0.name} | f={float(pr['f_local']):.6f} c/d | amp={float(pr['amp_local']):.4g} | SNR={float(pr['snr_local']):.2f}")
+        psnap = snap_map.get(tess_mode)
+        if psnap is not None:
+            pfit = psnap["fit"]
+            pprefit = psnap["prefit"]
+            f_p = float(pfit["best_f"])
+            y_p = pprefit.y - np.asarray(pfit["baseline_model"], dtype=float)
+            y_p = y_p - np.nanmedian(y_p)
+            ph_p = phase_fold(pprefit.t, f_p)
+            ax.scatter(ph_p, y_p, s=8, alpha=0.50, color="0.25")
+            ax.scatter(ph_p + 1.0, y_p, s=8, alpha=0.50, color="0.25")
+            bph, by = phase_bin_medians(ph_p, y_p, nbin=PHASE_BIN_N)
+            if len(bph):
+                ax.scatter(bph, by, s=20, alpha=0.95, color="#D55E00", zorder=3)
+                ax.scatter(bph + 1.0, by, s=20, alpha=0.95, color="#D55E00", zorder=3, label="phase-bin median")
+            ph_grid = np.linspace(0.0, 2.0, 500)
+            model_p = float(pfit["s_coeff"]) * np.sin(2.0 * np.pi * ph_grid) + float(pfit["c_coeff"]) * np.cos(2.0 * np.pi * ph_grid)
+            model_p = model_p - np.nanmedian(model_p)
+            ax.plot(ph_grid, model_p, lw=1.4, color="0.0")
+            set_robust_time_ylim(ax, y_p, model_p, by if 'by' in locals() else None, central_pct=98.0, pad_frac=0.12)
+            ax.set_title(f"Mode {tess_mode} | {pol0.name} | f={float(pr['f_local']):.6f} c/d | amp={float(pr['amp_local']):.4g} | SNR={float(pr['snr_local']):.2f}")
         ax.set_xlim(0.0, 2.0)
         ax.set_xlabel("Phase")
         ax.set_ylabel(f"{pol0.name} (median-subtracted)")
 
     fig.tight_layout()
-    fig.savefig(outdir / "phased_top_modes.png", dpi=180)
+    fig.savefig(outdir / prefixed_output_name(file_prefix, "phased_top_modes.png"), dpi=180)
     if show_plots_inline:
         plt.show()
     plt.close(fig)
 
+
+
+def set_robust_time_ylim(ax, *arrays, central_pct: float = 98.0, pad_frac: float = 0.12):
+    """Set a robust y-range using the central percentile range plus padding."""
+    vals = []
+    for arr in arrays:
+        if arr is None:
+            continue
+        a = np.asarray(arr, dtype=float).ravel()
+        a = a[np.isfinite(a)]
+        if a.size:
+            vals.append(a)
+    if not vals:
+        return
+    y = np.concatenate(vals)
+    if y.size == 0:
+        return
+
+    central_pct = float(central_pct)
+    central_pct = min(99.9, max(80.0, central_pct))
+    tail = 0.5 * (100.0 - central_pct)
+    lo = np.nanpercentile(y, tail)
+    hi = np.nanpercentile(y, 100.0 - tail)
+
+    if not np.isfinite(lo) or not np.isfinite(hi):
+        lo = np.nanmin(y)
+        hi = np.nanmax(y)
+    if not np.isfinite(lo) or not np.isfinite(hi):
+        return
+
+    if hi <= lo:
+        med = np.nanmedian(y)
+        span = np.nanpercentile(np.abs(y - med), 90.0)
+        if (not np.isfinite(span)) or span <= 0:
+            span = max(np.nanstd(y), 1e-6)
+        lo = med - span
+        hi = med + span
+
+    span = hi - lo
+    if (not np.isfinite(span)) or span <= 0:
+        span = max(np.nanstd(y), 1e-6)
+        if (not np.isfinite(span)) or span <= 0:
+            span = 1.0
+
+    pad = pad_frac * span
+    ax.set_ylim(lo - pad, hi + pad)
 
 def show_table(title: str, df: pd.DataFrame):
     print(f"\n--- {title} ---")
@@ -2080,6 +2336,7 @@ def build_guided_local_diagnostics(pol0: TimeSeries, final_resid: TimeSeries, se
 
 def run_analysis():
     print("TESS_INPUT_MODE =", TESS_INPUT_MODE)
+    print("USE_POLARIMETRY =", USE_POLARIMETRY)
     print("TESS_SNR_STOP =", TESS_SNR_STOP, "| POL_SNR_STOP =", POL_SNR_STOP)
     print("GLOBAL_FREQ_BOUND_MULT =", GLOBAL_FREQ_BOUND_MULT, "| GLOBAL_MAX_NFEV =", GLOBAL_MAX_NFEV)
     print("MIN_FREQ_SEP_MULT =", MIN_FREQ_SEP_MULT, "| TESS_DISCOVERY_EXCLUSION_MULT =", TESS_DISCOVERY_EXCLUSION_MULT)
@@ -2111,51 +2368,62 @@ def run_analysis():
         print("Requested FMAX =", requested_fmax, "| TESS Nyquist =", f"{nyq_cpd:.6g}", "| effective FMAX =", f"{effective_fmax:.6g}", "| cap_to_nyquist =", TESS_CAP_FMAX_TO_NYQUIST)
     else:
         print("Requested FMAX =", requested_fmax, "| TESS Nyquist = unavailable | effective FMAX =", f"{effective_fmax:.6g}", "| cap_to_nyquist =", TESS_CAP_FMAX_TO_NYQUIST)
-    if POL_CHANNELS:
+
+    if USE_POLARIMETRY:
         pol_dict = load_polarimetry_csv(POL_CSV, product=POL_PRODUCT, trend_cfg=trend_cfg)
+        star_label, star_safe = infer_star_labels_from_pol_path(POL_CSV)
         vprint(1, f"Loaded datasets | TESS n={len(tess.t)} | " + ", ".join([f"{k} n={len(v.t)}" for k, v in pol_dict.items()]))
     else:
         pol_dict = {}
+        star_label, star_safe = infer_star_labels_from_tess_input()
         vprint(1, f"Loaded datasets | TESS n={len(tess.t)} | photometry-only mode")
+    print("STAR_LABEL =", star_label)
+    analysis_outroot = resolve_analysis_outroot(star_safe)
 
     if DO_DETREND and DETREND_POLY_ORDER > 0:
         tess_dt = detrend_poly(tess, order=DETREND_POLY_ORDER)
-        pol_dt = {k: detrend_poly(v, order=DETREND_POLY_ORDER) for k, v in pol_dict.items()}
+        pol_dt = {k: detrend_poly(v, order=DETREND_POLY_ORDER) for k, v in pol_dict.items()} if USE_POLARIMETRY else {}
     else:
         tess_dt = tess
         pol_dt = pol_dict
 
     # TESS-only analysis
-    tess_outdir = OUTROOT / "tess"
+    tess_prefix = f"{star_safe}_tess"
+    tess_outdir = analysis_outroot / tess_prefix
     tess_outdir.mkdir(parents=True, exist_ok=True)
     vprint(1, "Starting TESS-only analysis...")
     tess_local_df, tess_global_fit, tess_snapshots, tess_final_resid, freqs_tess, Pte_start, Pte_end = extract_tess_modes(tess_dt)
     tess_table = match_global_components_with_local(tess_local_df, tess_global_fit)
-    tess_table.to_csv(tess_outdir / "peaks_table.csv", index=False)
-    pd.DataFrame(tess_global_fit["component_rows"]).to_csv(tess_outdir / "global_components_raw.csv", index=False)
+    tess_table.to_csv(tess_outdir / prefixed_output_name(tess_prefix, "peaks_table.csv"), index=False)
+    pd.DataFrame(tess_global_fit["component_rows"]).to_csv(tess_outdir / prefixed_output_name(tess_prefix, "global_components_raw.csv"), index=False)
     show_table("TESS peaks_table", tess_table)
     plot_tess_timeseries_and_spectra(tess_dt, tess_final_resid, freqs_tess, Pte_start, Pte_end, tess_table,
-                                     tess_outdir, show_plots_inline=SHOW_PLOTS_INLINE)
+                                     tess_outdir, show_plots_inline=SHOW_PLOTS_INLINE, file_prefix=tess_prefix)
     plot_tess_phased_modes(tess_snapshots, tess_table, tess_outdir,
-                           n_phase_plots=N_PHASE_PLOTS, show_plots_inline=SHOW_PLOTS_INLINE)
+                           n_phase_plots=N_PHASE_PLOTS, show_plots_inline=SHOW_PLOTS_INLINE, file_prefix=tess_prefix)
 
     outputs = {"tess": tess_table}
+
+    if not USE_POLARIMETRY:
+        vprint(1, f"Photometry-only analysis complete in {time.time()-t_all:.1f}s")
+        return outputs
 
     for k in POL_CHANNELS:
         if k not in pol_dt:
             print(f"Skipping channel {k!r}: not present.")
             continue
-        outdir = OUTROOT / k
+        channel_prefix = f"{star_safe}_{k}"
+        outdir = analysis_outroot / channel_prefix
         outdir.mkdir(parents=True, exist_ok=True)
-        print(f"\n=== Guided run for {k} ===")
+        print(f"\n=== Guided run for {star_label} {k} ===")
         (search_df, final_df, global_fit, pol_snapshots, pol_final_resid,
          freqs_pol, Ppo_start, Ppo_end, guided_diags,
          freqs_pol_full, Ppo_start_full, Ppo_end_full) = search_guided_channel(
             pol_dt[k], tess_table, 1.0 / max(compute_T_full(tess_dt), 1e-8), trend_cfg
         )
-        search_df.to_csv(outdir / "matched_search_table.csv", index=False)
-        final_df.to_csv(outdir / "peaks_table.csv", index=False)
-        pd.DataFrame(global_fit["component_rows"]).to_csv(outdir / "global_components_raw.csv", index=False)
+        search_df.to_csv(outdir / prefixed_output_name(channel_prefix, "matched_search_table.csv"), index=False)
+        final_df.to_csv(outdir / prefixed_output_name(channel_prefix, "peaks_table.csv"), index=False)
+        pd.DataFrame(global_fit["component_rows"]).to_csv(outdir / prefixed_output_name(channel_prefix, "global_components_raw.csv"), index=False)
         show_table(f"{k} matched_search_table", search_df)
         show_table(f"{k} peaks_table", final_df)
         plot_channel_timeseries_and_spectra(
@@ -2164,13 +2432,13 @@ def run_analysis():
             freqs_tess, Pte_start, Pte_end,
             freqs_pol, Ppo_start, Ppo_end,
             freqs_pol_full, Ppo_start_full, Ppo_end_full,
-            outdir, guided_diags=guided_diags, show_plots_inline=SHOW_PLOTS_INLINE
+            outdir, guided_diags=guided_diags, show_plots_inline=SHOW_PLOTS_INLINE, file_prefix=channel_prefix
         )
         plot_channel_phased_modes(
             tess_snapshots, tess_table,
             search_df, pol_snapshots, pol_dt[k],
             outdir, n_phase_plots=N_PHASE_PLOTS, sort_by=PHASE_SORT_BY,
-            show_plots_inline=SHOW_PLOTS_INLINE
+            show_plots_inline=SHOW_PLOTS_INLINE, file_prefix=channel_prefix
         )
         outputs[k] = final_df
 

@@ -287,7 +287,14 @@ TOOLTIPS = {
     "ex_no_gaia": "Skip Gaia queries and define the target from image pixels instead. Best for single-target runs.",
     "ex_gaia_fallback": "If Gaia fails, fall back to no-Gaia single-target mode.",
     "ex_no_quality0": "Do not restrict to QUALITY==0 cadences.",
-    "ex_pure_sum": "Use the full watershed-owned region for the target and sum all of those pixels instead of optimizing the aperture.",
+    "ex_pure_sum": "Use the full allowed region and sum all pixels without optimizing the aperture.",
+"ex_gaia_region_sum": "For Gaia-defined targets, sum the full Gaia-owned watershed region for each target without aperture growth.",
+"ex_external_mask_file": "Optional external aperture mask file (single-target runs only). One row per pixel row with comma-separated 1/0 or Y/N values.",
+"ex_aperture_fom": "Figure of merit used during watershed aperture growth.",
+    "ex_matlab_sat_mode": "Enable the MATLAB-style saturated-star correction workflow inside the main extractor pipeline.",
+    "ex_orbtable": "Path to tess_sector_orbfreq_midpoints.csv used for the MATLAB-style orbital phase-template correction.",
+"ex_save_pickled_figures": "Also save pickled Matplotlib figures alongside PNGs.",
+"ex_simple_aperture_mode": "Aperture mode used when running the simple extractor.",
     "ex_save_aperture_plots": "Save aperture-overlay PNGs. If unchecked, --no-aperture-plots is added.",
     "ex_matlab_pure_single_sat": "Use the pure single-target saturated-star branch modeled on the older MATLAB workflow.",
     "ex_min_pixels": "Minimum aperture size before growth is allowed to stop just because the metric no longer improves.",
@@ -322,6 +329,19 @@ TOOLTIPS = {
     "dt_huber_k": "Huber tuning constant controlling how strongly outliers are downweighted.",
     "dt_pchip_knot_spacing": "Time spacing used when building the smooth PCHIP trend.",
     "dt_gap_days": "Gap threshold used to split the light curve into chunks for chunk-wise median leveling.",
+    "dt_pre_model_pchip": "Before position-based detrending, fit a binned PCHIP spline to the light curve, subtract it, do the decorrelation on the residuals, then add the spline back afterward.",
+    "dt_pre_model_bin_days": "Time-bin size in days used to build the optional pre-model PCHIP variability spline.",
+    "dt_pre_model_stat": "Statistic used within each time bin for the pre-model PCHIP fit.",
+    "dt_pre_model_min_points": "Minimum number of cadences required in a bin before that bin is used in the pre-model PCHIP fit.",
+    "dt_pre_model_sigma_clip": "Optional sigma-clipping threshold applied within each pre-model time bin before computing the binned statistic. Set to 0 to disable.",
+    "dt_pre_model_sigma_iters": "Number of sigma-clipping iterations used inside the pre-model time bins.",
+    "dt_clip_residuals_before_detrend": "Optionally sigma-clip the residual light curve before fitting the centroid/background decorrelation model.",
+    "dt_clip_residuals_sigma": "Sigma threshold used for clipping residuals before detrending.",
+    "dt_clip_residuals_iters": "Number of sigma-clipping iterations used on the residuals before detrending.",
+    "dt_save_pickled_figures": "Save pickled Matplotlib figure objects alongside PNGs so the plots can be reopened later for zooming and inspection.",
+    "dt_apply_orbital_phase_template": "Apply the MATLAB-style orbital phase-template correction in the detrending stage using the sector orbital-frequency table.",
+    "dt_orbtable": "Path to tess_sector_orbfreq_midpoints.csv used for the orbital phase-template correction in the detrending stage.",
+    "dt_phase_bin": "Phase bin width used when building the orbital phase-template correction.",
     "dt_command_preview": "The exact detrender command the GUI will run.",
     "preview_dir": "Directory scanned for PNG previews.",
     "preview_scale_mode": "Choose how preview images are displayed: Fit scales to the visible preview pane; percentage modes use a fixed zoom level.",
@@ -463,8 +483,15 @@ class TESSGui(tk.Tk):
         self.ex_gaia_fallback = tk.BooleanVar(value=False)
         self.ex_no_quality0 = tk.BooleanVar(value=False)
         self.ex_pure_sum = tk.BooleanVar(value=False)
+        self.ex_gaia_region_sum = tk.BooleanVar(value=False)
         self.ex_save_aperture_plots = tk.BooleanVar(value=True)
+        self.ex_save_pickled_figures = tk.BooleanVar(value=False)
+        self.ex_matlab_sat_mode = tk.BooleanVar(value=False)
         self.ex_matlab_pure_single_sat = tk.BooleanVar(value=False)
+        self.ex_external_mask_file = tk.StringVar(value="")
+        self.ex_orbtable = tk.StringVar(value="tess_sector_orbfreq_midpoints.csv")
+        self.ex_aperture_fom = tk.StringVar(value="stddiff")
+        self.ex_simple_aperture_mode = tk.StringVar(value="auto")
 
         self.ex_min_pixels = tk.IntVar(value=10)
         self.ex_amp_q_lo = tk.DoubleVar(value=1.0)
@@ -484,7 +511,7 @@ class TESSGui(tk.Tk):
         self.ex_back_nfaint = tk.IntVar(value=20)
         self.ex_phase_bin = tk.DoubleVar(value=0.01)
         self.ex_matlab_ap_thresh = tk.DoubleVar(value=3000.0)
-        self.ex_disable_legacy_geometry = tk.BooleanVar(value=False)
+        self.ex_use_legacy_geometry = tk.BooleanVar(value=False)
 
         self.ex_command_preview = tk.StringVar(value="")
 
@@ -504,6 +531,19 @@ class TESSGui(tk.Tk):
         self.dt_robust_iters = tk.IntVar(value=8)
         self.dt_huber_k = tk.DoubleVar(value=1.5)
         self.dt_pchip_knot_spacing = tk.DoubleVar(value=0.5)
+        self.dt_pre_model_pchip = tk.BooleanVar(value=False)
+        self.dt_pre_model_bin_days = tk.DoubleVar(value=0.25)
+        self.dt_pre_model_stat = tk.StringVar(value="median")
+        self.dt_pre_model_min_points = tk.IntVar(value=3)
+        self.dt_pre_model_sigma_clip = tk.DoubleVar(value=0.0)
+        self.dt_pre_model_sigma_iters = tk.IntVar(value=1)
+        self.dt_clip_residuals_before_detrend = tk.BooleanVar(value=False)
+        self.dt_clip_residuals_sigma = tk.DoubleVar(value=5.0)
+        self.dt_clip_residuals_iters = tk.IntVar(value=1)
+        self.dt_save_pickled_figures = tk.BooleanVar(value=False)
+        self.dt_apply_orbital_phase_template = tk.BooleanVar(value=False)
+        self.dt_orbtable = tk.StringVar(value="tess_sector_orbfreq_midpoints.csv")
+        self.dt_phase_bin = tk.DoubleVar(value=0.01)
         self.dt_gap_days = tk.DoubleVar(value=0.5)
 
         self.dt_command_preview = tk.StringVar(value="")
@@ -699,11 +739,17 @@ class TESSGui(tk.Tk):
                         tooltip_key="ex_no_quality0", row=2, column=0, sticky="w", padx=6, pady=4)
         self._make_checkbutton(main_frame, text="Pure sum", variable=self.ex_pure_sum, command=self._update_extractor_state,
                         tooltip_key="ex_pure_sum", row=2, column=1, sticky="w", padx=6, pady=4)
+        self._make_checkbutton(main_frame, text="Gaia region sum", variable=self.ex_gaia_region_sum, command=self._update_extractor_state,
+                        tooltip_key="ex_gaia_region_sum", row=2, column=2, sticky="w", padx=6, pady=4)
+        self._make_checkbutton(main_frame, text="Save pickled figures", variable=self.ex_save_pickled_figures, command=self._update_extractor_command_preview,
+                        tooltip_key="ex_save_pickled_figures", row=2, column=3, sticky="w", padx=6, pady=4)
+        self._make_checkbutton(main_frame, text="MATLAB sat mode", variable=self.ex_matlab_sat_mode, command=self._update_extractor_state,
+                        tooltip_key="ex_matlab_sat_mode", row=3, column=0, columnspan=2, sticky="w", padx=6, pady=4)
         self._make_checkbutton(main_frame, text="MATLAB pure single saturated mode", variable=self.ex_matlab_pure_single_sat, command=self._update_extractor_state,
-                        tooltip_key="ex_matlab_pure_single_sat", row=2, column=2, columnspan=2, sticky="w", padx=6, pady=4)
+                        tooltip_key="ex_matlab_pure_single_sat", row=3, column=2, columnspan=2, sticky="w", padx=6, pady=4)
 
         self.ex_warning_label = ttk.Label(main_frame, text="", foreground="firebrick")
-        self.ex_warning_label.grid(row=3, column=0, columnspan=4, sticky="w", padx=6, pady=(4, 0))
+        self.ex_warning_label.grid(row=4, column=0, columnspan=4, sticky="w", padx=6, pady=(4, 0))
 
         adv = ttk.LabelFrame(root, text="Advanced")
         adv.grid(row=4, column=0, sticky="ew", padx=8, pady=6)
@@ -744,12 +790,21 @@ class TESSGui(tk.Tk):
         self._spin(matlab, "Back nfaint", self.ex_back_nfaint, 1, 1000, 1, 0, tooltip_key="ex_back_nfaint")
         self._entry(matlab, "Phase bin", self.ex_phase_bin, 1, 2, tooltip_key="ex_phase_bin")
         self._entry(matlab, "MATLAB ap thresh", self.ex_matlab_ap_thresh, 2, 0, tooltip_key="ex_matlab_ap_thresh")
-        self._make_checkbutton(matlab, text="Disable legacy geometry", variable=self.ex_disable_legacy_geometry,
+        self._make_checkbutton(matlab, text="Use legacy geometry", variable=self.ex_use_legacy_geometry,
                         command=self._update_extractor_command_preview, tooltip_key="ex_disable_legacy_geometry",
                         row=2, column=2, columnspan=2, sticky="w", padx=6, pady=4)
+        self._entry(matlab, "Orbtable CSV", self.ex_orbtable, 3, 0, browse="file", tooltip_key="ex_orbtable")
+
+        extras = ttk.LabelFrame(adv, text="Additional extractor options")
+        extras.grid(row=3, column=0, columnspan=4, sticky="ew", padx=6, pady=6)
+        for c in range(4):
+            extras.columnconfigure(c, weight=1)
+        self._combo(extras, "Aperture FOM", self.ex_aperture_fom, ["stddiff", "std", "mad"], 0, 0, tooltip_key="ex_aperture_fom")
+        self._combo(extras, "Simple ap mode", self.ex_simple_aperture_mode, ["auto", "fullstamp", "fixedap", "apgrow"], 0, 2, tooltip_key="ex_simple_aperture_mode")
+        self._entry(extras, "External mask file", self.ex_external_mask_file, 1, 0, browse="file", tooltip_key="ex_external_mask_file")
 
         action = ttk.LabelFrame(root, text="Actions")
-        action.grid(row=5, column=0, sticky="ew", padx=8, pady=6)
+        action.grid(row=6, column=0, sticky="ew", padx=8, pady=6)
         for c in range(5):
             action.columnconfigure(c, weight=1)
         ttk.Button(action, text="Show command", command=self._update_extractor_command_preview).grid(row=0, column=0, padx=6, pady=6, sticky="ew")
@@ -799,10 +854,23 @@ class TESSGui(tk.Tk):
         self.dt_chk_skip.grid(row=0, column=2, sticky="w", padx=6, pady=4)
         self._make_checkbutton(opts, text="Combine sectors", variable=self.dt_combine_sectors, command=self._update_detrender_command_preview, tooltip_key="dt_combine_sectors", row=0, column=3, sticky="w", padx=6, pady=4)
         self._entry(opts, "Knot spacing days", self.dt_knot_spacing, 1, 0, tooltip_key="dt_knot_spacing")
+        self._make_checkbutton(opts, text="Pre-model PCHIP", variable=self.dt_pre_model_pchip, command=self._update_detrender_command_preview, tooltip_key="dt_pre_model_pchip", row=1, column=2, sticky="w", padx=6, pady=4)
         self._spin(opts, "Robust iters", self.dt_robust_iters, 1, 100, 1, 0, tooltip_key="dt_robust_iters")
-        self._entry(opts, "Huber k", self.dt_huber_k, 1, 2, tooltip_key="dt_huber_k")
-        self.dt_pchip_entry = self._entry(opts, "PCHIP knot spacing", self.dt_pchip_knot_spacing, 2, 0, tooltip_key="dt_pchip_knot_spacing")
-        self._entry(opts, "Gap days", self.dt_gap_days, 2, 2, tooltip_key="dt_gap_days")
+        self._entry(opts, "Huber k", self.dt_huber_k, 2, 0, tooltip_key="dt_huber_k")
+        self.dt_pchip_entry = self._entry(opts, "PCHIP knot spacing", self.dt_pchip_knot_spacing, 2, 2, tooltip_key="dt_pchip_knot_spacing")
+        self._entry(opts, "Gap days", self.dt_gap_days, 3, 0, tooltip_key="dt_gap_days")
+        self._entry(opts, "Pre-model bin days", self.dt_pre_model_bin_days, 3, 2, tooltip_key="dt_pre_model_bin_days")
+        self._combo(opts, "Pre-model stat", self.dt_pre_model_stat, ["median", "mean"], 4, 0, tooltip_key="dt_pre_model_stat")
+        self._spin(opts, "Pre-model min pts", self.dt_pre_model_min_points, 1, 9999, 4, 2, tooltip_key="dt_pre_model_min_points")
+        self._entry(opts, "Pre-model sigma clip", self.dt_pre_model_sigma_clip, 5, 0, tooltip_key="dt_pre_model_sigma_clip")
+        self._spin(opts, "Pre-model sigma iters", self.dt_pre_model_sigma_iters, 1, 99, 5, 2, tooltip_key="dt_pre_model_sigma_iters")
+        self._make_checkbutton(opts, text="Clip residuals before detrend", variable=self.dt_clip_residuals_before_detrend, command=self._update_detrender_command_preview, tooltip_key="dt_clip_residuals_before_detrend", row=6, column=0, sticky="w", padx=6, pady=4)
+        self._entry(opts, "Residual clip sigma", self.dt_clip_residuals_sigma, 6, 2, tooltip_key="dt_clip_residuals_sigma")
+        self._spin(opts, "Residual clip iters", self.dt_clip_residuals_iters, 1, 99, 7, 0, tooltip_key="dt_clip_residuals_iters")
+        self._make_checkbutton(opts, text="Save pickled figures", variable=self.dt_save_pickled_figures, command=self._update_detrender_command_preview, tooltip_key="dt_save_pickled_figures", row=7, column=2, sticky="w", padx=6, pady=4)
+        self._make_checkbutton(opts, text="Apply orbital phase template", variable=self.dt_apply_orbital_phase_template, command=self._update_detrender_command_preview, tooltip_key="dt_apply_orbital_phase_template", row=8, column=0, sticky="w", padx=6, pady=4)
+        self._entry(opts, "Orbtable CSV", self.dt_orbtable, 8, 2, browse="file", tooltip_key="dt_orbtable")
+        self._entry(opts, "Orbital phase bin", self.dt_phase_bin, 9, 0, tooltip_key="dt_phase_bin")
 
         action = ttk.LabelFrame(root, text="Actions")
         action.grid(row=4, column=0, sticky="ew", padx=8, pady=6)
@@ -1004,12 +1072,12 @@ class TESSGui(tk.Tk):
             self.extractor_script, self.ex_input_mode, self.ex_tpf_dir, self.ex_single_file,
             self.ex_recursive, self.ex_output_root, self.ex_n_targets, self.ex_method,
             self.ex_gaia_radius, self.ex_no_gaia, self.ex_gaia_fallback, self.ex_no_quality0,
-            self.ex_pure_sum, self.ex_save_aperture_plots, self.ex_matlab_pure_single_sat,
+            self.ex_pure_sum, self.ex_gaia_region_sum, self.ex_save_aperture_plots, self.ex_save_pickled_figures, self.ex_matlab_sat_mode, self.ex_matlab_pure_single_sat,
             self.ex_min_pixels, self.ex_amp_q_lo, self.ex_amp_q_hi, self.ex_amp_min_frac,
             self.ex_max_radius_pix, self.ex_max_components, self.ex_min_seed_frac,
             self.ex_min_new_pixels, self.ex_core_npix, self.ex_core_min_frac,
             self.ex_sat_thresh, self.ex_sat_min_npix, self.ex_back_nfaint, self.ex_phase_bin,
-            self.ex_matlab_ap_thresh, self.ex_disable_legacy_geometry
+            self.ex_matlab_ap_thresh, self.ex_use_legacy_geometry, self.ex_external_mask_file, self.ex_orbtable, self.ex_aperture_fom, self.ex_simple_aperture_mode
         ]
         for v in vars_to_trace:
             v.trace_add("write", lambda *_: self._update_extractor_command_preview())
@@ -1020,7 +1088,7 @@ class TESSGui(tk.Tk):
             self.dt_output_dir, self.dt_pattern, self.dt_recursive, self.dt_prefix,
             self.dt_use_background, self.dt_use_pchip, self.dt_skip_xybg,
             self.dt_combine_sectors, self.dt_knot_spacing, self.dt_robust_iters,
-            self.dt_huber_k, self.dt_pchip_knot_spacing, self.dt_gap_days
+            self.dt_huber_k, self.dt_pchip_knot_spacing, self.dt_pre_model_pchip, self.dt_pre_model_bin_days, self.dt_pre_model_stat, self.dt_pre_model_min_points, self.dt_pre_model_sigma_clip, self.dt_pre_model_sigma_iters, self.dt_clip_residuals_before_detrend, self.dt_clip_residuals_sigma, self.dt_clip_residuals_iters, self.dt_save_pickled_figures, self.dt_apply_orbital_phase_template, self.dt_orbtable, self.dt_phase_bin, self.dt_gap_days
         ]
         for v in vars_to_trace:
             v.trace_add("write", lambda *_: self._update_detrender_command_preview())
@@ -1036,6 +1104,12 @@ class TESSGui(tk.Tk):
             warning.append("No-Gaia mode requires n-targets = 1.")
         if self.ex_matlab_pure_single_sat.get() and self.ex_n_targets.get() != 1:
             warning.append("MATLAB pure single saturated mode requires n-targets = 1.")
+        if self.ex_matlab_sat_mode.get() and self.ex_n_targets.get() != 1:
+            warning.append("MATLAB sat mode is generally intended for n-targets = 1.")
+        if self.ex_matlab_sat_mode.get() and not self.ex_matlab_pure_single_sat.get() and not self.ex_orbtable.get().strip():
+            warning.append("MATLAB sat mode requires an orbtable file.")
+        if self.ex_matlab_sat_mode.get() and self.ex_matlab_pure_single_sat.get():
+            warning.append("Pure single saturated mode bypasses the orbital correction from MATLAB sat mode.")
         self.ex_warning_label.configure(text="  ".join(warning))
         self._update_extractor_command_preview()
 
@@ -1054,6 +1128,26 @@ class TESSGui(tk.Tk):
         if not script:
             raise ValueError("Extractor script path is empty.")
         cmd = [sys.executable, "-u", script]
+        script_name = Path(script).name.lower()
+        is_simple = ("simple" in script_name) and ("watershed" not in script_name)
+
+        if is_simple:
+            if self.ex_input_mode.get() == "directory":
+                root = self.ex_tpf_dir.get().strip() or "."
+                pattern = "**/*_tp.fits" if self.ex_recursive.get() else "*_tp.fits"
+                input_arg = str(Path(root) / pattern)
+                cmd += ["--input", input_arg]
+                if self.ex_recursive.get():
+                    cmd.append("--recursive")
+            else:
+                single = self.ex_single_file.get().strip()
+                if not single:
+                    raise ValueError("Single-file mode is selected but no FITS file is set.")
+                cmd += ["--input", single]
+            cmd += ["--outdir", self.ex_output_root.get().strip() or "LC_products_multi"]
+            cmd += ["--n-targets", str(int(self.ex_n_targets.get()))]
+            cmd += ["--aperture-mode", self.ex_simple_aperture_mode.get().strip() or "auto"]
+            return cmd
 
         if self.ex_input_mode.get() == "directory":
             cmd += ["--tpf-dir", self.ex_tpf_dir.get().strip() or "."]
@@ -1067,7 +1161,7 @@ class TESSGui(tk.Tk):
 
         cmd += ["--output-root", self.ex_output_root.get().strip() or "LC_products_multi"]
         cmd += ["--n-targets", str(int(self.ex_n_targets.get()))]
-        if not self.ex_pure_sum.get():
+        if not (self.ex_pure_sum.get() or self.ex_gaia_region_sum.get() or self.ex_external_mask_file.get().strip()):
             cmd += ["--method", self.ex_method.get()]
         cmd += ["--gaia-radius-arcmin", str(float(self.ex_gaia_radius.get()))]
 
@@ -1079,8 +1173,18 @@ class TESSGui(tk.Tk):
             cmd.append("--no-quality0")
         if self.ex_pure_sum.get():
             cmd.append("--pure-sum")
+        if self.ex_gaia_region_sum.get():
+            cmd.append("--gaia-region-sum")
+        if self.ex_external_mask_file.get().strip():
+            cmd += ["--external-mask-file", self.ex_external_mask_file.get().strip()]
         if not self.ex_save_aperture_plots.get():
             cmd.append("--no-aperture-plots")
+        if self.ex_save_pickled_figures.get():
+            cmd.append("--save-figure-pickles")
+        if self.ex_matlab_sat_mode.get():
+            cmd.append("--matlab-sat-mode")
+            if self.ex_orbtable.get().strip():
+                cmd += ["--orbtable", self.ex_orbtable.get().strip()]
         if self.ex_matlab_pure_single_sat.get():
             cmd.append("--matlab-pure-single-sat")
 
@@ -1088,6 +1192,7 @@ class TESSGui(tk.Tk):
         cmd += ["--amp-q-lo", str(float(self.ex_amp_q_lo.get()))]
         cmd += ["--amp-q-hi", str(float(self.ex_amp_q_hi.get()))]
         cmd += ["--amp-min-frac", str(float(self.ex_amp_min_frac.get()))]
+        cmd += ["--aperture-fom", self.ex_aperture_fom.get().strip() or "stddiff"]
         cmd += ["--max-radius-pix", str(self.ex_max_radius_pix.get()).strip() or "inf"]
         cmd += ["--max-components", str(int(self.ex_max_components.get()))]
         cmd += ["--min-seed-frac-of-peak", str(float(self.ex_min_seed_frac.get()))]
@@ -1099,8 +1204,8 @@ class TESSGui(tk.Tk):
         cmd += ["--back-nfaint", str(int(self.ex_back_nfaint.get()))]
         cmd += ["--phase-bin", str(float(self.ex_phase_bin.get()))]
         cmd += ["--matlab-ap-thresh", str(float(self.ex_matlab_ap_thresh.get()))]
-        if self.ex_disable_legacy_geometry.get():
-            cmd.append("--matlab-no-legacy-geometry")
+        if self.ex_use_legacy_geometry.get():
+            cmd.append("--matlab-use-legacy-geometry")
         return cmd
 
     def build_detrender_command(self) -> list[str]:
@@ -1119,6 +1224,8 @@ class TESSGui(tk.Tk):
             cmd.append("--use-background")
         if self.dt_use_pchip.get():
             cmd.append("--use-pchip-highpass")
+        if self.dt_pre_model_pchip.get():
+            cmd.append("--pre-model-pchip")
         if self.dt_skip_xybg.get():
             cmd.append("--skip-xybg-decorrelation")
         if not self.dt_combine_sectors.get():
@@ -1127,6 +1234,22 @@ class TESSGui(tk.Tk):
         cmd += ["--robust-iters", str(int(self.dt_robust_iters.get()))]
         cmd += ["--huber-k", str(float(self.dt_huber_k.get()))]
         cmd += ["--pchip-knot-spacing", str(float(self.dt_pchip_knot_spacing.get()))]
+        cmd += ["--pre-model-bin-days", str(float(self.dt_pre_model_bin_days.get()))]
+        cmd += ["--pre-model-stat", self.dt_pre_model_stat.get().strip() or "median"]
+        cmd += ["--pre-model-min-points", str(int(self.dt_pre_model_min_points.get()))]
+        cmd += ["--pre-model-sigma-clip", str(float(self.dt_pre_model_sigma_clip.get()))]
+        cmd += ["--pre-model-sigma-iters", str(int(self.dt_pre_model_sigma_iters.get()))]
+        if self.dt_clip_residuals_before_detrend.get():
+            cmd.append("--clip-residuals-before-detrend")
+        cmd += ["--clip-residuals-sigma", str(float(self.dt_clip_residuals_sigma.get()))]
+        cmd += ["--clip-residuals-iters", str(int(self.dt_clip_residuals_iters.get()))]
+        if self.dt_save_pickled_figures.get():
+            cmd.append("--save-figure-pickles")
+        if self.dt_apply_orbital_phase_template.get():
+            cmd.append("--apply-orbital-phase-template")
+            if self.dt_orbtable.get().strip():
+                cmd += ["--orbtable", self.dt_orbtable.get().strip()]
+            cmd += ["--phase-bin", str(float(self.dt_phase_bin.get()))]
         cmd += ["--gap-days", str(float(self.dt_gap_days.get()))]
         return cmd
 
@@ -1422,6 +1545,11 @@ class TESSGui(tk.Tk):
             "ex_gaia_fallback": self.ex_gaia_fallback.get(),
             "ex_no_quality0": self.ex_no_quality0.get(),
             "ex_pure_sum": self.ex_pure_sum.get(),
+            "ex_gaia_region_sum": self.ex_gaia_region_sum.get(),
+            "ex_save_pickled_figures": self.ex_save_pickled_figures.get(),
+            "ex_external_mask_file": self.ex_external_mask_file.get(),
+            "ex_aperture_fom": self.ex_aperture_fom.get(),
+            "ex_simple_aperture_mode": self.ex_simple_aperture_mode.get(),
             "ex_save_aperture_plots": self.ex_save_aperture_plots.get(),
             "ex_matlab_pure_single_sat": self.ex_matlab_pure_single_sat.get(),
             "ex_min_pixels": self.ex_min_pixels.get(),
@@ -1439,7 +1567,7 @@ class TESSGui(tk.Tk):
             "ex_back_nfaint": self.ex_back_nfaint.get(),
             "ex_phase_bin": self.ex_phase_bin.get(),
             "ex_matlab_ap_thresh": self.ex_matlab_ap_thresh.get(),
-            "ex_disable_legacy_geometry": self.ex_disable_legacy_geometry.get(),
+            "ex_use_legacy_geometry": self.ex_use_legacy_geometry.get(),
             "dt_lightcurve_dir": self.dt_lightcurve_dir.get(),
             "dt_diagnostics_dir": self.dt_diagnostics_dir.get(),
             "dt_output_dir": self.dt_output_dir.get(),
@@ -1454,6 +1582,16 @@ class TESSGui(tk.Tk):
             "dt_robust_iters": self.dt_robust_iters.get(),
             "dt_huber_k": self.dt_huber_k.get(),
             "dt_pchip_knot_spacing": self.dt_pchip_knot_spacing.get(),
+            "dt_pre_model_pchip": self.dt_pre_model_pchip.get(),
+            "dt_pre_model_bin_days": self.dt_pre_model_bin_days.get(),
+            "dt_pre_model_stat": self.dt_pre_model_stat.get(),
+            "dt_pre_model_min_points": self.dt_pre_model_min_points.get(),
+            "dt_pre_model_sigma_clip": self.dt_pre_model_sigma_clip.get(),
+            "dt_pre_model_sigma_iters": self.dt_pre_model_sigma_iters.get(),
+            "dt_clip_residuals_before_detrend": self.dt_clip_residuals_before_detrend.get(),
+            "dt_clip_residuals_sigma": self.dt_clip_residuals_sigma.get(),
+            "dt_clip_residuals_iters": self.dt_clip_residuals_iters.get(),
+            "dt_save_pickled_figures": self.dt_save_pickled_figures.get(),
             "dt_gap_days": self.dt_gap_days.get(),
             "preview_dir": self.preview_dir.get(),
             "preview_scale_mode": self.preview_scale_mode.get(),
