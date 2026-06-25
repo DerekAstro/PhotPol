@@ -11,7 +11,6 @@ import signal
 import sys
 import tempfile
 import threading
-import re
 from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
@@ -276,7 +275,7 @@ class GuidedAnalysisGUI(tk.Tk):
         self.title(APP_TITLE)
         self.geometry(DEFAULT_GEOMETRY)
 
-        self.log_queue: queue.Queue[tuple[str, str]] = queue.Queue()
+        self.log_queue: queue.Queue[tuple[str, object]] = queue.Queue()
         self.current_process: subprocess.Popen | None = None
         self.current_output_dir: Path | None = None
         self.preview_image = None
@@ -1516,46 +1515,87 @@ else:
         self.log_text.see("end")
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
+        popen_kwargs = {
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.STDOUT,
+            "text": True,
+            "bufsize": 1,
+            "env": env,
+        }
+        if os.name == "nt":
+            # Give the analysis job its own Windows process group.
+            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            # Put the runner and all subprocesses it launches into a new Unix
+            # session/process group so Stop cannot signal the GUI or terminal.
+            popen_kwargs["start_new_session"] = True
+
         try:
-            self.current_process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-                env=env,
-            )
+            proc = subprocess.Popen(cmd, **popen_kwargs)
+            self.current_process = proc
         except Exception as exc:
             self.current_process = None
             self.status_text.set("Ready.")
             messagebox.showerror("Failed to start process", str(exc))
             return
 
-        def reader_thread():
-            proc = self.current_process
+        def reader_thread(proc=proc):
             try:
-                if proc and proc.stdout is not None:
+                if proc.stdout is not None:
                     for line in proc.stdout:
                         self.log_queue.put(("line", line))
-                rc = proc.wait() if proc else -1
-                self.log_queue.put(("done", f"{job_name} finished with exit code {rc}.\n"))
+                rc = proc.wait()
+                self.log_queue.put(("done", (proc, f"{job_name} finished with exit code {rc}.\n")))
             except Exception as exc:
-                self.log_queue.put(("done", f"{job_name} failed: {exc}\n"))
+                self.log_queue.put(("done", (proc, f"{job_name} failed: {exc}\n")))
 
         threading.Thread(target=reader_thread, daemon=True).start()
 
-    def stop_current_process(self):
-        if self.current_process is None:
+    def _force_kill_process(self, proc: subprocess.Popen):
+        """Force-kill a still-running analysis process and its descendants."""
+        if proc.poll() is not None:
             return
         try:
-            if sys.platform.startswith("win"):
-                self.current_process.terminate()
+            if os.name == "nt":
+                subprocess.run(
+                    ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
+            else:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+    def stop_current_process(self):
+        proc = self.current_process
+        if proc is None or proc.poll() is not None:
+            return
+        try:
+            if os.name == "nt":
+                # /T includes subprocesses launched by the temporary runner.
+                subprocess.run(
+                    ["taskkill", "/PID", str(proc.pid), "/T"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
             else:
                 try:
-                    os.killpg(os.getpgid(self.current_process.pid), signal.SIGTERM)
+                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                except ProcessLookupError:
+                    return
                 except Exception:
-                    self.current_process.terminate()
+                    proc.terminate()
             self.status_text.set("Stopping process...")
+            # Escalate only if the process group has not exited after 3 s.
+            self.after(3000, lambda p=proc: self._force_kill_process(p))
         except Exception as exc:
             messagebox.showerror("Stop failed", str(exc))
 
@@ -1567,11 +1607,15 @@ else:
                     self.log_text.insert("end", payload)
                     self.log_text.see("end")
                 elif kind == "done":
-                    self.log_text.insert("end", "\n" + payload + "\n")
+                    proc, message = payload
+                    self.log_text.insert("end", "\n" + str(message) + "\n")
                     self.log_text.see("end")
-                    self.current_process = None
-                    self.status_text.set("Ready.")
-                    self._refresh_preview_list()
+                    # Do not let a delayed completion message from an older job
+                    # clear the state of a newer process.
+                    if self.current_process is proc:
+                        self.current_process = None
+                        self.status_text.set("Ready.")
+                        self._refresh_preview_list()
         except queue.Empty:
             pass
         self.after(150, self._poll_log_queue)
