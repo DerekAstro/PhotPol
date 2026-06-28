@@ -126,7 +126,7 @@ TESS_DISCOVERY_EXCLUSION_MULT = 5.0  # block re-discovery within this many resol
 # --- Polarimetry night-model (Option C default; D-ready) ---
 USE_POL_NIGHT_OFFSETS = True
 USE_POL_NIGHT_SLOPES = False
-POL_NIGHT_GROUP_MODE = "gap"     # 'gap' or 'integer_jd'
+POL_NIGHT_GROUP_MODE = "gap"     # 'gap' | 'integer_jd' | 'run' | 'subrun'
 POL_NIGHT_GAP_HOURS = 8.0
 
 # --- Optional broad detrending hook (defaults off) ---
@@ -247,10 +247,48 @@ class NightTrendConfig:
 # ----------------------------------------------------------------------
 
 TESS_TIME_COL = "time_btjd"
+TESS_TIME_COL_CANDIDATES = ["time_btjd", "btjd", "time", "bjd", "jd"]
 TESS_FORCE_Y_COL = None
-TESS_Y_COL_CANDIDATES = ["flux_detrend_rel", "flux_detrended_sub", "flux_detrended_div", "flux_detrended_rel", "flux_medscaled", "flux_rel"]
-TESS_PIPELINE_RAW_Y_COLS = ["flux_rel", "flux_detrended_rel"]
-TESS_PIPELINE_DETRENDED_Y_COLS = ["flux_detrend_rel", "flux_decor_only_rel", "flux_rel", "flux_detrended_rel"]
+
+# Ordered from the most final/science-ready product to progressively earlier
+# pipeline stages. This covers the standard detrender, quaternion branch,
+# orbital-template branch, watershed/MATLAB extractors, simple extractor, and
+# SPOC converter outputs.
+TESS_Y_COL_CANDIDATES = [
+    "flux_detrend_rel",
+    "flux_orbital_corrected_rel",
+    "flux_quaternion_corrected_rel",
+    "flux_decor_only_rel",
+    "flux_quaternion_only_corrected_rel",
+    "flux_detrended_sub",
+    "flux_detrended_div",
+    "flux_detrended_rel",
+    "flux_medscaled",
+    "flux_rel",
+    "relative_flux",
+    "normalized_flux",
+    "flux",
+]
+TESS_PIPELINE_RAW_Y_COLS = [
+    "flux_rel",
+    "flux_medscaled",
+    "flux_detrended_rel",  # MATLAB saturated extractor uses this name
+    "relative_flux",
+    "normalized_flux",
+    "flux",
+]
+TESS_PIPELINE_DETRENDED_Y_COLS = [
+    "flux_detrend_rel",
+    "flux_orbital_corrected_rel",
+    "flux_quaternion_corrected_rel",
+    "flux_decor_only_rel",
+    "flux_quaternion_only_corrected_rel",
+    "flux_detrended_sub",
+    "flux_detrended_div",
+    "flux_detrended_rel",
+    "flux_medscaled",
+    "flux_rel",
+]
 
 POL_TIME_COL = "jd"
 POL_ERR_COLS = {"q": "q_err", "u": "u_err", "p": "p_err"}
@@ -272,14 +310,40 @@ RAW_POL_CANDIDATES = {
     "p_err": ["p_err", "pe"],
 }
 
+# Common column names used for observing-run or subrun labels.  A label such
+# as 12A is retained as subrun_label and reduced to 12 for run_label.
+RAW_POL_RUN_CODE_CANDIDATES = [
+    "run", "Run", "RUN", "run_id", "RunID", "runid",
+    "run_code", "RunCode", "RUN_CODE", "run_label", "RunLabel",
+    "subrun", "Subrun", "subrun_label", "SubrunLabel",
+]
+
 def _first_present(df: pd.DataFrame, names: list[str]) -> str | None:
     for n in names:
         if n in df.columns:
             return n
     return None
 
+def _normalize_run_token(value) -> str | None:
+    if pd.isna(value):
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    return s
+
+def _base_run_token(token: str | None) -> str | None:
+    if token is None:
+        return None
+    tok = str(token).strip()
+    if not tok:
+        return None
+    if tok[-1].isalpha():
+        return tok[:-1] or tok
+    return tok
+
 def normalize_raw_polarimetry_dataframe(df: pd.DataFrame) -> pd.DataFrame:
-    """Return a minimal raw-polarimetry dataframe with jd,q,u,p,q_err,u_err,p_err."""
+    """Normalize core raw-polarimetry columns and preserve run/subrun labels."""
     cols = {}
     for key, names in RAW_POL_CANDIDATES.items():
         col = _first_present(df, names)
@@ -287,6 +351,13 @@ def normalize_raw_polarimetry_dataframe(df: pd.DataFrame) -> pd.DataFrame:
             raise ValueError(f"Raw polarimetry input is missing a column for {key!r}. Looked for {names}. Found: {list(df.columns)}")
         cols[key] = col
     out = pd.DataFrame({k: pd.to_numeric(df[v], errors="coerce") for k, v in cols.items()})
+
+    run_col = _first_present(df, RAW_POL_RUN_CODE_CANDIDATES)
+    if run_col is not None:
+        subrun = df[run_col].map(_normalize_run_token)
+        run = subrun.map(_base_run_token)
+        out["subrun_label"] = subrun
+        out["run_label"] = run
     return out
 
 def pol_assign_night_ids(df: pd.DataFrame, gap_days: float = POL_NIGHT_GAP_THRESHOLD_DAYS) -> pd.DataFrame:
@@ -300,6 +371,49 @@ def pol_assign_night_ids(df: pd.DataFrame, gap_days: float = POL_NIGHT_GAP_THRES
                 night_ids[i:] += 1
     df["night_id"] = night_ids
     return df
+
+def _factorize_group_labels(labels: np.ndarray) -> np.ndarray:
+    ser = pd.Series(labels, dtype="object")
+    ser = ser.fillna("__MISSING_GROUP__")
+    codes, _ = pd.factorize(ser, sort=False)
+    return codes.astype(int)
+
+def get_polarimetry_group_labels(df: pd.DataFrame, mode: str) -> np.ndarray:
+    """Return label values used by the run/subrun baseline-group modes."""
+    if mode == "run":
+        if "run_label" in df.columns:
+            vals = df["run_label"].map(_normalize_run_token).to_numpy(object)
+        elif "subrun_label" in df.columns:
+            vals = df["subrun_label"].map(_base_run_token).to_numpy(object)
+        else:
+            # Also accept the original run-like columns in precomputed frames.
+            run_col = _first_present(df, RAW_POL_RUN_CODE_CANDIDATES)
+            if run_col is None:
+                raise ValueError(
+                    "POL_NIGHT_GROUP_MODE='run' requires a run-like column in the polarimetry CSV. "
+                    "Expected one of run/run_id/run_code/run_label/subrun/subrun_label, "
+                    "or a generated analysis frame that preserves run_label."
+                )
+            vals = df[run_col].map(_normalize_run_token).map(_base_run_token).to_numpy(object)
+        return vals
+
+    if mode == "subrun":
+        if "subrun_label" in df.columns:
+            vals = df["subrun_label"].map(_normalize_run_token).to_numpy(object)
+        elif "run_label" in df.columns:
+            vals = df["run_label"].map(_normalize_run_token).to_numpy(object)
+        else:
+            run_col = _first_present(df, RAW_POL_RUN_CODE_CANDIDATES)
+            if run_col is None:
+                raise ValueError(
+                    "POL_NIGHT_GROUP_MODE='subrun' requires a run/subrun-like column in the polarimetry CSV. "
+                    "Expected one of run/run_id/run_code/run_label/subrun/subrun_label, "
+                    "or a generated analysis frame that preserves subrun_label."
+                )
+            vals = df[run_col].map(_normalize_run_token).to_numpy(object)
+        return vals
+
+    raise ValueError(f"Unsupported label-based group mode: {mode}")
 
 def pol_compute_phase(df: pd.DataFrame) -> pd.DataFrame:
     jd0 = np.floor(df["jd"].min()) + 0.5
@@ -561,32 +675,119 @@ def _clean_sort(t, y, yerr=None, t_abs=None):
         t_abs = t_abs[idx]
     return t, y, yerr, t_abs
 
+def _clean_sort_with_group(t, y, yerr=None, t_abs=None, group_labels=None):
+    """Apply the same finite-row filtering and sorting to optional group labels."""
+    t = np.asarray(t, dtype=float)
+    y = np.asarray(y, dtype=float)
+    m = np.isfinite(t) & np.isfinite(y)
+    if yerr is not None:
+        yerr = np.asarray(yerr, dtype=float)
+        yerr = np.where(np.isfinite(yerr) & (yerr > 0), yerr, np.nan)
+        m &= np.isfinite(yerr)
+    if t_abs is not None:
+        t_abs = np.asarray(t_abs, dtype=float)
+        m &= np.isfinite(t_abs)
+    if group_labels is not None:
+        group_labels = np.asarray(group_labels, dtype=object)
+
+    t = t[m]
+    y = y[m]
+    if yerr is not None:
+        yerr = yerr[m]
+    if t_abs is not None:
+        t_abs = t_abs[m]
+    if group_labels is not None:
+        group_labels = group_labels[m]
+
+    idx = np.argsort(t)
+    t = t[idx]
+    y = y[idx]
+    if yerr is not None:
+        yerr = yerr[idx]
+    if t_abs is not None:
+        t_abs = t_abs[idx]
+    if group_labels is not None:
+        group_labels = group_labels[idx]
+    return t, y, yerr, t_abs, group_labels
+
 def _pick_first_existing(columns, candidates):
-    for c in candidates:
-        if c in columns:
-            return c
+    column_map = {str(c).strip().lower(): c for c in columns}
+    for candidate in candidates:
+        found = column_map.get(str(candidate).strip().lower())
+        if found is not None:
+            return found
     return None
+
+
+def _infer_numeric_flux_column(df: pd.DataFrame, excluded=()) -> str | None:
+    """Conservative fallback for pipeline CSVs with an unfamiliar flux name."""
+    excluded_lower = {str(c).strip().lower() for c in excluded}
+    reject_tokens = (
+        "time", "err", "error", "sigma", "uncert", "quality", "flag",
+        "model", "trend", "systematic", "background", "centroid", "phase",
+        "valid", "sample", "count", "npix", "camera", "sector", "cadence",
+    )
+    ranked = []
+    for col in df.columns:
+        name = str(col).strip()
+        lname = name.lower()
+        if lname in excluded_lower or "flux" not in lname:
+            continue
+        if any(token in lname for token in reject_tokens):
+            continue
+        numeric = pd.to_numeric(df[col], errors="coerce")
+        finite_fraction = float(np.mean(np.isfinite(numeric.to_numpy(float)))) if len(df) else 0.0
+        if finite_fraction < 0.5:
+            continue
+        score = 0
+        if "detrend" in lname or "corrected" in lname:
+            score += 40
+        if "relative" in lname or lname.endswith("_rel") or "normalized" in lname or "medscaled" in lname:
+            score += 20
+        if lname == "flux":
+            score += 5
+        ranked.append((score, finite_fraction, name))
+    if not ranked:
+        return None
+    ranked.sort(key=lambda item: (-item[0], -item[1], item[2]))
+    return ranked[0][2]
+
 
 def _read_tess_csv_with_candidates(path: Path, y_candidates) -> tuple[np.ndarray, np.ndarray, np.ndarray, str]:
     df = pd.read_csv(path)
-    vprint(1, f"Read polarimetry CSV | rows={len(df)}")
-    if TESS_TIME_COL not in df.columns:
-        raise ValueError(f"{path}: missing '{TESS_TIME_COL}'. Found: {list(df.columns)}")
+    vprint(1, f"Read TESS CSV | rows={len(df)}")
+
+    time_col = _pick_first_existing(df.columns, TESS_TIME_COL_CANDIDATES)
+    if time_col is None:
+        raise ValueError(
+            f"{path}: missing a recognized TESS time column. "
+            f"Expected one of {TESS_TIME_COL_CANDIDATES}; found: {list(df.columns)}"
+        )
+
     forced_col = TESS_FORCE_Y_COL
-    if forced_col is not None:
-        if forced_col not in df.columns:
-            raise ValueError(f"{path}: required TESS column '{forced_col}' not found. Found: {list(df.columns)}")
-        y_col = forced_col
+    if forced_col is not None and str(forced_col).strip():
+        y_col = _pick_first_existing(df.columns, [forced_col])
+        if y_col is None:
+            raise ValueError(
+                f"{path}: required TESS column '{forced_col}' not found. "
+                f"Found: {list(df.columns)}"
+            )
     else:
         y_col = _pick_first_existing(df.columns, y_candidates)
         if y_col is None:
-            raise ValueError(f"{path}: missing any of {list(y_candidates)}. Found: {list(df.columns)}")
-    vprint(1, f"Using TESS file: {path} | flux column: {y_col}")
-    t_abs = df[TESS_TIME_COL].to_numpy(dtype=float)
-    y = df[y_col].to_numpy(dtype=float)
+            y_col = _infer_numeric_flux_column(df, excluded=[time_col])
+        if y_col is None:
+            raise ValueError(
+                f"{path}: no usable photometric flux column found. "
+                f"Recognized candidates: {list(y_candidates)}; found: {list(df.columns)}"
+            )
+
+    vprint(1, f"Using TESS file: {path} | time column: {time_col} | flux column: {y_col}")
+    t_abs = pd.to_numeric(df[time_col], errors="coerce").to_numpy(dtype=float)
+    y = pd.to_numeric(df[y_col], errors="coerce").to_numpy(dtype=float)
     t_rel = t_abs - np.nanmin(t_abs)
     t_rel, y, _, t_abs = _clean_sort(t_rel, y, None, t_abs=t_abs)
-    return t_rel, y, t_abs, y_col
+    return t_rel, y, t_abs, str(y_col)
 
 def load_tess_csv(path: Path) -> TimeSeries:
     _, y, t_abs, y_col = _read_tess_csv_with_candidates(path, TESS_Y_COL_CANDIDATES)
@@ -666,13 +867,20 @@ def load_tess_input() -> TimeSeries:
         )
     raise ValueError(f"TESS_INPUT_MODE must be 'spoc_csv' or 'pipeline_dir'. Got: {TESS_INPUT_MODE}")
 
-def build_night_groups(t_abs: np.ndarray, mode: str = "gap", gap_days: float = 8.0/24.0) -> np.ndarray:
+def build_night_groups(t_abs: np.ndarray, mode: str = "gap", gap_days: float = 8.0/24.0,
+                       group_labels: np.ndarray | None = None) -> np.ndarray:
     t_abs = np.asarray(t_abs, dtype=float)
     if t_abs.size == 0:
         return np.array([], dtype=int)
     if mode == "integer_jd":
         _, inv = np.unique(np.floor(t_abs).astype(int), return_inverse=True)
         return inv.astype(int)
+    if mode in ("run", "subrun"):
+        if group_labels is None:
+            raise ValueError(f"Group mode {mode!r} requires run/subrun labels.")
+        if len(group_labels) != len(t_abs):
+            raise ValueError("Group-label array length does not match the polarimetry time array.")
+        return _factorize_group_labels(group_labels)
     if mode != "gap":
         raise ValueError(f"Unsupported group mode: {mode}")
     dt = np.diff(t_abs)
@@ -708,11 +916,19 @@ def load_polarimetry_csv(path: Path, product: str, trend_cfg: NightTrendConfig) 
         t0 = np.nanmin(t_abs)
         t_rel = t_abs - t0
         out = {}
+        group_labels = None
+        if trend_cfg.group_mode in ("run", "subrun"):
+            group_labels = get_polarimetry_group_labels(df, trend_cfg.group_mode)
         for k in ["q", "u", "p"]:
             y = df[POL_PRODUCTS[product][k]].to_numpy(dtype=float)
             yerr = df[POL_ERR_COLS[k]].to_numpy(dtype=float)
-            tt, yy, ee, ta = _clean_sort(t_rel, y, yerr, t_abs=t_abs)
-            gid = build_night_groups(ta, mode=trend_cfg.group_mode, gap_days=trend_cfg.gap_days)
+            tt, yy, ee, ta, glab = _clean_sort_with_group(
+                t_rel, y, yerr, t_abs=t_abs, group_labels=group_labels
+            )
+            gid = build_night_groups(
+                ta, mode=trend_cfg.group_mode, gap_days=trend_cfg.gap_days,
+                group_labels=glab,
+            )
             out[k] = TimeSeries(t=tt, y=yy, yerr=ee, name=f"pol_{k}", t_abs=ta, group_id=gid)
         return out
 
@@ -737,11 +953,19 @@ def load_polarimetry_csv(path: Path, product: str, trend_cfg: NightTrendConfig) 
     t0 = np.nanmin(t_abs)
     t_rel = t_abs - t0
     out = {}
+    group_labels = None
+    if trend_cfg.group_mode in ("run", "subrun"):
+        group_labels = get_polarimetry_group_labels(df_proc, trend_cfg.group_mode)
     for k in ["q", "u", "p"]:
         y = df_proc[POL_PRODUCTS[product][k]].to_numpy(dtype=float)
         yerr = df_proc[POL_ERR_COLS[k]].to_numpy(dtype=float)
-        tt, yy, ee, ta = _clean_sort(t_rel, y, yerr, t_abs=t_abs)
-        gid = build_night_groups(ta, mode=trend_cfg.group_mode, gap_days=trend_cfg.gap_days)
+        tt, yy, ee, ta, glab = _clean_sort_with_group(
+            t_rel, y, yerr, t_abs=t_abs, group_labels=group_labels
+        )
+        gid = build_night_groups(
+            ta, mode=trend_cfg.group_mode, gap_days=trend_cfg.gap_days,
+            group_labels=glab,
+        )
         out[k] = TimeSeries(t=tt, y=yy, yerr=ee, name=f"pol_{k}", t_abs=ta, group_id=gid)
     return out
 

@@ -95,6 +95,22 @@ Run / Preview
 -------------
 The preview tab scans the chosen output root recursively for PNG files.
 
+Polarimetry grouping modes
+--------------------------
+gap
+  Start a new baseline group whenever the time gap exceeds Gap hours.
+
+integer_jd
+  Group all measurements with the same integer Julian Date.
+
+run
+  Group subruns such as 12A, 12B, and 12C under their parent run 12.
+  The polarimetry input must contain a recognized run/subrun label column.
+
+subrun
+  Keep complete labels such as 12A, 12B, and 12C as separate baseline groups.
+  The polarimetry input must contain a recognized run/subrun label column.
+
 TESS-only frequency limit
 -------------------------
 Cap Fmax to TESS Nyquist
@@ -157,7 +173,7 @@ TOOLTIPS = {
     "channels": "Choose which polarimetric channels to analyze. Usually q, u, and p.",
     "use_offsets": "Include per-night offsets in the polarimetric baseline model.",
     "use_slopes": "Include per-night slopes in the polarimetric baseline model.",
-    "group_mode": "How nights/groups are defined for the polarimetric baseline model.",
+    "group_mode": "How polarimetry baseline groups are defined: by time gap, integer JD, parent observing run, or full subrun label.",
     "gap_hours": "Gap threshold in hours used when group_mode = gap.",
     "do_detrend": "Apply the optional broad polynomial detrending hook before the main analysis.",
     "detrend_order": "Polynomial order used by the optional broad detrending hook.",
@@ -618,7 +634,7 @@ class GuidedAnalysisGUI(tk.Tk):
         self._check(chans, "p", self.channel_p, 0, 2, tooltip_key="channels", command=self._update_run_plan_preview)
         self._check(chans, "Use night offsets", self.use_offsets, 1, 0, tooltip_key="use_offsets", command=self._update_run_plan_preview)
         self._check(chans, "Use night slopes", self.use_slopes, 1, 1, tooltip_key="use_slopes", command=self._update_run_plan_preview)
-        self._combo(chans, "Group mode", self.group_mode, ["gap", "integer_jd"], 2, 0, tooltip_key="group_mode")
+        self._combo(chans, "Group mode", self.group_mode, ["gap", "integer_jd", "run", "subrun"], 2, 0, tooltip_key="group_mode")
         self._entry(chans, "Gap hours", self.gap_hours, 2, 2, tooltip_key="gap_hours")
 
         extras = ttk.LabelFrame(root, text="Optional detrending / plots / preprocessing diagnostics")
@@ -1196,7 +1212,7 @@ def _py_literal(value):
     return repr(value)
 
 def _replace_assignment(src: str, varname: str, py_expr: str) -> str:
-    pattern = re.compile(rf"(?m)^{{re.escape(varname)}}\s*=\s*.*$")
+    pattern = re.compile(rf"(?m)^{{re.escape(varname)}}\\s*=\\s*.*$")
     repl = f"{{varname}} = {{py_expr}}"
     new_src, n = pattern.subn(repl, src, count=1)
     if n == 0:
@@ -1317,7 +1333,7 @@ if CFG["analysis_mode"] == "guided_analysis":
         failures = []
 
         for i, csv_path in enumerate(files, start=1):
-            print("\n" + "-" * 88)
+            print("\\n" + "-" * 88)
             print(f"[{{i}}/{{len(files)}}] CSV: {{csv_path}}")
             target_out = outroot / csv_path.stem
             existing = list(target_out.rglob("*peaks_table*.csv")) if target_out.exists() else []
@@ -1342,7 +1358,7 @@ if CFG["analysis_mode"] == "guided_analysis":
                 traceback.print_exc()
                 continue
 
-        print("\n" + "=" * 88)
+        print("\\n" + "=" * 88)
         print(f"Batch summary: success={{n_ok}} | skipped={{n_skip}} | failed={{n_fail}} | total={{len(files)}}")
         if failures:
             print("Failed files:")
@@ -1361,7 +1377,7 @@ elif CFG["analysis_mode"] == "joint_search":
     if 'import matplotlib.pyplot as plt' in src and 'matplotlib.use(' not in src:
         src = src.replace(
             'import matplotlib.pyplot as plt',
-            'import matplotlib\nmatplotlib.use("Agg")\nimport matplotlib.pyplot as plt',
+            'import matplotlib\\nmatplotlib.use("Agg")\\nimport matplotlib.pyplot as plt',
             1
         )
 
@@ -1384,11 +1400,11 @@ elif CFG["analysis_mode"] == "joint_search":
 
     pol_csv_for_joint = str(Path(CFG["pol_csv"]).expanduser().resolve())
     pol_product = CFG["pol_product"]
-    pol_required = {
+    pol_required = {{
         "nm": ["q_nm", "u_nm", "p_nm"],
         "resid_nm_pchip": ["q_resid_nm_pchip", "u_resid_nm_pchip", "p_resid_nm_pchip"],
         "pw_resid_nm_pchip": ["q_pw_resid_nm_pchip", "u_pw_resid_nm_pchip", "p_pw_resid_nm_pchip"],
-    }
+    }}
     pol_head = pd.read_csv(pol_csv_for_joint, nrows=5)
     needed = ["jd"] + pol_required.get(pol_product, []) + ["q_err", "u_err", "p_err"]
     missing = [c for c in needed if c not in pol_head.columns]
@@ -1477,7 +1493,7 @@ elif CFG["analysis_mode"] == "joint_search":
 
     print("Running joint-search companion via patched temporary file:")
     print("  ", temp_path)
-    globals_dict = {"__name__": "__main__", "__file__": str(temp_path)}
+    globals_dict = {{"__name__": "__main__", "__file__": str(temp_path)}}
     exec(compile(src, str(temp_path), "exec"), globals_dict)
 
 else:
