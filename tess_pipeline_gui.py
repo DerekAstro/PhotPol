@@ -266,6 +266,63 @@ Gap days
   Gap threshold used to split the light curve into chunks for chunk-wise
   median leveling.
 
+QLP-style quaternion regression
+  --use-quaternion-regression
+  Adds short-timescale spacecraft-pointing regressors built from camera
+  quaternion engineering data. For raw 2-second quaternion files, the detrender
+  bins the three quaternion axes to each light-curve cadence, computes their
+  mean, standard deviation, and skew, forms the QLP pairwise products and
+  squares, standardizes the resulting 36 features, and fits them with iterative
+  3-sigma clipping.
+
+Quaternion source
+  --quaternion-source
+  Optional local raw-quaternion file, TESSVectors CSV, or directory containing
+  sector-specific files. An explicitly selected source takes priority over the
+  automatic cache. Raw files provide the full 36 QLP-style regressors;
+  pre-binned TESSVectors files use the statistics available in those products.
+
+Automatic TESSVectors download / cache
+  --quaternion-auto-download, --tessvectors-cache-dir
+  When enabled and no explicit Quaternion source is supplied, the detrender
+  infers the sector, camera, and cadence, downloads only the required HEASARC
+  TESSVectors CSV if it is missing, and keeps it in the selected cache directory.
+  Existing cached files are reused without downloading again. Camera must be
+  selected explicitly if it cannot be inferred from the light-curve metadata.
+
+Quaternion camera
+  --quaternion-camera
+  Select camera 1-4, or auto. Auto uses a camera column in the light-curve file
+  or source table when possible. Choose the camera explicitly if the source
+  contains multiple cameras and it cannot be inferred.
+
+Quaternion time offset
+  --quaternion-time-offset-days
+  Use "auto" to align the span centers of barycentric light-curve time and
+  spacecraft engineering time. If the light-curve CSV contains a timecorr
+  column, that is used instead and is preferred. A numerical value supplies
+  the barycentric-minus-spacecraft offset in days.
+
+Quaternion min samples
+  --quaternion-min-samples
+  Minimum number of raw quaternion samples required inside a light-curve
+  cadence before its mean/std/skew features are accepted.
+
+Quaternion clip sigma / iterations
+  --quaternion-clip-sigma, --quaternion-clip-iters
+  Control the iterative outlier rejection in the QLP-style linear fit.
+
+Save quaternion diagnostics
+  --save-quaternion-diagnostics
+  Writes an NPZ file containing features, coefficients, coverage, and alignment
+  information, plus a PNG showing the fitted quaternion model and corrected
+  light curve.
+
+  For variability preservation, the GUI selects Pre-model PCHIP by default
+  when quaternion regression is first turned on. The PCHIP model is removed
+  before the quaternion fit and restored afterward. You may uncheck Pre-model
+  PCHIP to fit the quaternion regressors directly to the original light curve.
+
 Notes
 -----
 • The command preview is the authoritative description of what the GUI will do.
@@ -342,6 +399,16 @@ TOOLTIPS = {
     "dt_apply_orbital_phase_template": "Apply the MATLAB-style orbital phase-template correction in the detrending stage using the sector orbital-frequency table.",
     "dt_orbtable": "Path to tess_sector_orbfreq_midpoints.csv used for the orbital phase-template correction in the detrending stage.",
     "dt_phase_bin": "Phase bin width used when building the orbital phase-template correction.",
+    "dt_use_quaternion_regression": "Add QLP-style camera-quaternion regressors to remove short-timescale pointing systematics. Pre-model PCHIP is selected by default when this is first enabled, but may then be unchecked.",
+    "dt_quaternion_source": "Optional explicit raw quaternion FITS/CSV, TESSVectors CSV, or directory. Leave blank to use automatic TESSVectors downloading.",
+    "dt_quaternion_auto_download": "Automatically download only the missing sector/camera/cadence TESSVectors file and reuse it from the local cache on later runs.",
+    "dt_tessvectors_cache_dir": "Local cache root for automatically downloaded TESSVectors files. Files are organized by 020_Cadence, 120_Cadence, and FFI_Cadence.",
+    "dt_quaternion_camera": "TESS camera used for quaternion regressors. Auto infers it from metadata when possible; select 1-4 when automatic downloading cannot infer it.",
+    "dt_quaternion_min_samples": "Minimum number of raw 2-second quaternion samples required within each light-curve cadence.",
+    "dt_quaternion_clip_sigma": "Sigma threshold for iterative QLP-style outlier rejection during the quaternion regression.",
+    "dt_quaternion_clip_iters": "Maximum number of QLP-style sigma-clipping iterations.",
+    "dt_quaternion_time_offset": "Barycentric-minus-spacecraft time offset in days, or auto. A timecorr column in the light-curve CSV is preferred when available.",
+    "dt_save_quaternion_diagnostics": "Save an NPZ with quaternion features/coefficients/coverage and a diagnostic PNG.",
     "dt_command_preview": "The exact detrender command the GUI will run.",
     "preview_dir": "Directory scanned for PNG previews.",
     "preview_scale_mode": "Choose how preview images are displayed: Fit scales to the visible preview pane; percentage modes use a fixed zoom level.",
@@ -459,6 +526,7 @@ class TESSGui(tk.Tk):
         self.preview_image = None
 
         self._build_vars()
+        self._quaternion_was_enabled = False
         self._build_ui()
         self._poll_log_queue()
         self._update_extractor_state()
@@ -544,6 +612,18 @@ class TESSGui(tk.Tk):
         self.dt_apply_orbital_phase_template = tk.BooleanVar(value=False)
         self.dt_orbtable = tk.StringVar(value="tess_sector_orbfreq_midpoints.csv")
         self.dt_phase_bin = tk.DoubleVar(value=0.01)
+
+        self.dt_use_quaternion_regression = tk.BooleanVar(value=False)
+        self.dt_quaternion_source = tk.StringVar(value="")
+        self.dt_quaternion_auto_download = tk.BooleanVar(value=True)
+        self.dt_tessvectors_cache_dir = tk.StringVar(value="~/.cache/photpol/tessvectors")
+        self.dt_quaternion_camera = tk.StringVar(value="auto")
+        self.dt_quaternion_min_samples = tk.IntVar(value=3)
+        self.dt_quaternion_clip_sigma = tk.DoubleVar(value=3.0)
+        self.dt_quaternion_clip_iters = tk.IntVar(value=5)
+        self.dt_quaternion_time_offset = tk.StringVar(value="auto")
+        self.dt_save_quaternion_diagnostics = tk.BooleanVar(value=True)
+
         self.dt_gap_days = tk.DoubleVar(value=0.5)
 
         self.dt_command_preview = tk.StringVar(value="")
@@ -854,7 +934,7 @@ class TESSGui(tk.Tk):
         self.dt_chk_skip.grid(row=0, column=2, sticky="w", padx=6, pady=4)
         self._make_checkbutton(opts, text="Combine sectors", variable=self.dt_combine_sectors, command=self._update_detrender_command_preview, tooltip_key="dt_combine_sectors", row=0, column=3, sticky="w", padx=6, pady=4)
         self._entry(opts, "Knot spacing days", self.dt_knot_spacing, 1, 0, tooltip_key="dt_knot_spacing")
-        self._make_checkbutton(opts, text="Pre-model PCHIP", variable=self.dt_pre_model_pchip, command=self._update_detrender_command_preview, tooltip_key="dt_pre_model_pchip", row=1, column=2, sticky="w", padx=6, pady=4)
+        self._make_checkbutton(opts, text="Pre-model PCHIP (recommended with quaternion)", variable=self.dt_pre_model_pchip, command=self._update_detrender_command_preview, tooltip_key="dt_pre_model_pchip", row=1, column=2, sticky="w", padx=6, pady=4)
         self._spin(opts, "Robust iters", self.dt_robust_iters, 1, 100, 1, 0, tooltip_key="dt_robust_iters")
         self._entry(opts, "Huber k", self.dt_huber_k, 2, 0, tooltip_key="dt_huber_k")
         self.dt_pchip_entry = self._entry(opts, "PCHIP knot spacing", self.dt_pchip_knot_spacing, 2, 2, tooltip_key="dt_pchip_knot_spacing")
@@ -872,8 +952,124 @@ class TESSGui(tk.Tk):
         self._entry(opts, "Orbtable CSV", self.dt_orbtable, 8, 2, browse="file", tooltip_key="dt_orbtable")
         self._entry(opts, "Orbital phase bin", self.dt_phase_bin, 9, 0, tooltip_key="dt_phase_bin")
 
+        quat = ttk.LabelFrame(root, text="QLP-style quaternion regression")
+        quat.grid(row=4, column=0, sticky="ew", padx=8, pady=6)
+        for c in range(4):
+            quat.columnconfigure(c, weight=1)
+
+        self.dt_chk_quaternion = self._make_checkbutton(
+            quat, text="Use quaternion regression",
+            variable=self.dt_use_quaternion_regression,
+            command=self._update_detrender_state,
+            tooltip_key="dt_use_quaternion_regression",
+            row=0, column=0, columnspan=2, sticky="w", padx=6, pady=4,
+        )
+
+        ttk.Label(quat, text="Quaternion source (optional)").grid(
+            row=1, column=0, sticky="w", padx=6, pady=4
+        )
+        self.dt_quaternion_source_entry = ttk.Entry(
+            quat, textvariable=self.dt_quaternion_source
+        )
+        self.dt_quaternion_source_entry.grid(
+            row=1, column=1, sticky="ew", padx=6, pady=4
+        )
+        self._tooltip(self.dt_quaternion_source_entry, "dt_quaternion_source")
+        self.dt_quaternion_file_button = ttk.Button(
+            quat, text="Browse file...",
+            command=lambda: self._browse_file(
+                self.dt_quaternion_source,
+                [("Quaternion/vector files", "*.fits *.fits.gz *.fit *.csv *.csv.gz *.csv.xz *.ecsv *.txt"),
+                 ("All files", "*.*")]
+            ),
+        )
+        self.dt_quaternion_file_button.grid(row=1, column=2, padx=6, pady=4)
+        self._tooltip(self.dt_quaternion_file_button, "dt_quaternion_source")
+        self.dt_quaternion_dir_button = ttk.Button(
+            quat, text="Browse dir...",
+            command=lambda: self._browse_dir(self.dt_quaternion_source),
+        )
+        self.dt_quaternion_dir_button.grid(row=1, column=3, padx=6, pady=4)
+        self._tooltip(self.dt_quaternion_dir_button, "dt_quaternion_source")
+
+        self.dt_chk_quaternion_auto_download = self._make_checkbutton(
+            quat, text="Auto-download missing TESSVectors",
+            variable=self.dt_quaternion_auto_download,
+            command=self._update_detrender_state,
+            tooltip_key="dt_quaternion_auto_download",
+            row=2, column=0, columnspan=2, sticky="w", padx=6, pady=4,
+        )
+        ttk.Label(quat, text="TESSVectors cache").grid(
+            row=3, column=0, sticky="w", padx=6, pady=4
+        )
+        self.dt_tessvectors_cache_entry = ttk.Entry(
+            quat, textvariable=self.dt_tessvectors_cache_dir
+        )
+        self.dt_tessvectors_cache_entry.grid(
+            row=3, column=1, columnspan=2, sticky="ew", padx=6, pady=4
+        )
+        self._tooltip(self.dt_tessvectors_cache_entry, "dt_tessvectors_cache_dir")
+        self.dt_tessvectors_cache_button = ttk.Button(
+            quat, text="Browse...",
+            command=lambda: self._browse_dir(self.dt_tessvectors_cache_dir),
+        )
+        self.dt_tessvectors_cache_button.grid(row=3, column=3, padx=6, pady=4)
+        self._tooltip(self.dt_tessvectors_cache_button, "dt_tessvectors_cache_dir")
+
+        self.dt_quaternion_camera_combo = self._combo(
+            quat, "Camera", self.dt_quaternion_camera,
+            ["auto", "1", "2", "3", "4"], 4, 0,
+            tooltip_key="dt_quaternion_camera"
+        )
+        self.dt_quaternion_min_samples_spin = self._spin(
+            quat, "Min samples / cadence", self.dt_quaternion_min_samples,
+            1, 999, 4, 2, tooltip_key="dt_quaternion_min_samples"
+        )
+        self.dt_quaternion_clip_sigma_entry = self._entry(
+            quat, "Clip sigma", self.dt_quaternion_clip_sigma,
+            5, 0, tooltip_key="dt_quaternion_clip_sigma"
+        )
+        self.dt_quaternion_clip_iters_spin = self._spin(
+            quat, "Clip iterations", self.dt_quaternion_clip_iters,
+            1, 99, 5, 2, tooltip_key="dt_quaternion_clip_iters"
+        )
+        self.dt_quaternion_time_offset_entry = self._entry(
+            quat, "Time offset days", self.dt_quaternion_time_offset,
+            6, 0, tooltip_key="dt_quaternion_time_offset"
+        )
+        self.dt_chk_quaternion_diagnostics = self._make_checkbutton(
+            quat, text="Save quaternion diagnostics",
+            variable=self.dt_save_quaternion_diagnostics,
+            command=self._update_detrender_command_preview,
+            tooltip_key="dt_save_quaternion_diagnostics",
+            row=6, column=2, columnspan=2, sticky="w", padx=6, pady=4,
+        )
+        ttk.Label(
+            quat,
+            text="Leave Quaternion source blank to download and cache only the required TESSVectors file. "
+                 "Raw 2-second files remain supported for the full 36-feature model.",
+            wraplength=1050,
+        ).grid(row=7, column=0, columnspan=4, sticky="w", padx=6, pady=(2, 6))
+
+        self.dt_quaternion_widgets = [
+            self.dt_quaternion_source_entry,
+            self.dt_quaternion_file_button,
+            self.dt_quaternion_dir_button,
+            self.dt_chk_quaternion_auto_download,
+            self.dt_quaternion_camera_combo,
+            self.dt_quaternion_min_samples_spin,
+            self.dt_quaternion_clip_sigma_entry,
+            self.dt_quaternion_clip_iters_spin,
+            self.dt_quaternion_time_offset_entry,
+            self.dt_chk_quaternion_diagnostics,
+        ]
+        self.dt_quaternion_cache_widgets = [
+            self.dt_tessvectors_cache_entry,
+            self.dt_tessvectors_cache_button,
+        ]
+
         action = ttk.LabelFrame(root, text="Actions")
-        action.grid(row=4, column=0, sticky="ew", padx=8, pady=6)
+        action.grid(row=5, column=0, sticky="ew", padx=8, pady=6)
         for c in range(5):
             action.columnconfigure(c, weight=1)
         ttk.Button(action, text="Show command", command=self._update_detrender_command_preview).grid(row=0, column=0, padx=6, pady=6, sticky="ew")
@@ -1088,7 +1284,12 @@ class TESSGui(tk.Tk):
             self.dt_output_dir, self.dt_pattern, self.dt_recursive, self.dt_prefix,
             self.dt_use_background, self.dt_use_pchip, self.dt_skip_xybg,
             self.dt_combine_sectors, self.dt_knot_spacing, self.dt_robust_iters,
-            self.dt_huber_k, self.dt_pchip_knot_spacing, self.dt_pre_model_pchip, self.dt_pre_model_bin_days, self.dt_pre_model_stat, self.dt_pre_model_min_points, self.dt_pre_model_sigma_clip, self.dt_pre_model_sigma_iters, self.dt_clip_residuals_before_detrend, self.dt_clip_residuals_sigma, self.dt_clip_residuals_iters, self.dt_save_pickled_figures, self.dt_apply_orbital_phase_template, self.dt_orbtable, self.dt_phase_bin, self.dt_gap_days
+            self.dt_huber_k, self.dt_pchip_knot_spacing, self.dt_pre_model_pchip, self.dt_pre_model_bin_days, self.dt_pre_model_stat, self.dt_pre_model_min_points, self.dt_pre_model_sigma_clip, self.dt_pre_model_sigma_iters, self.dt_clip_residuals_before_detrend, self.dt_clip_residuals_sigma, self.dt_clip_residuals_iters, self.dt_save_pickled_figures, self.dt_apply_orbital_phase_template, self.dt_orbtable, self.dt_phase_bin,
+            self.dt_use_quaternion_regression, self.dt_quaternion_source,
+            self.dt_quaternion_auto_download, self.dt_tessvectors_cache_dir,
+            self.dt_quaternion_camera, self.dt_quaternion_min_samples, self.dt_quaternion_clip_sigma,
+            self.dt_quaternion_clip_iters, self.dt_quaternion_time_offset,
+            self.dt_save_quaternion_diagnostics, self.dt_gap_days
         ]
         for v in vars_to_trace:
             v.trace_add("write", lambda *_: self._update_detrender_command_preview())
@@ -1116,11 +1317,35 @@ class TESSGui(tk.Tk):
     def _update_detrender_state(self):
         skip = self.dt_skip_xybg.get()
         pchip = self.dt_use_pchip.get()
+        use_quat = self.dt_use_quaternion_regression.get()
         self.dt_chk_background.configure(state=("disabled" if skip else "normal"))
         try:
             self.dt_pchip_entry.configure(state=("normal" if pchip else "disabled"))
         except Exception:
             pass
+
+        # Protect intrinsic variability by default, but only when quaternion
+        # regression transitions from off to on. After that the user may
+        # uncheck Pre-model PCHIP and it will remain off.
+        was_quat = bool(getattr(self, "_quaternion_was_enabled", False))
+        if use_quat and not was_quat and not self.dt_pre_model_pchip.get():
+            self.dt_pre_model_pchip.set(True)
+        self._quaternion_was_enabled = bool(use_quat)
+
+        for widget in getattr(self, "dt_quaternion_widgets", []):
+            try:
+                if widget is self.dt_quaternion_camera_combo:
+                    widget.configure(state=("readonly" if use_quat else "disabled"))
+                else:
+                    widget.configure(state=("normal" if use_quat else "disabled"))
+            except Exception:
+                pass
+        cache_enabled = use_quat and bool(self.dt_quaternion_auto_download.get())
+        for widget in getattr(self, "dt_quaternion_cache_widgets", []):
+            try:
+                widget.configure(state=("normal" if cache_enabled else "disabled"))
+            except Exception:
+                pass
         self._update_detrender_command_preview()
 
     def build_extractor_command(self) -> list[str]:
@@ -1250,6 +1475,29 @@ class TESSGui(tk.Tk):
             if self.dt_orbtable.get().strip():
                 cmd += ["--orbtable", self.dt_orbtable.get().strip()]
             cmd += ["--phase-bin", str(float(self.dt_phase_bin.get()))]
+        if self.dt_use_quaternion_regression.get():
+            source = self.dt_quaternion_source.get().strip()
+            auto_download = bool(self.dt_quaternion_auto_download.get())
+            if not source and not auto_download:
+                raise ValueError(
+                    "Quaternion regression needs an explicit source or Auto-download missing TESSVectors."
+                )
+            cmd.append("--use-quaternion-regression")
+            if source:
+                cmd += ["--quaternion-source", source]
+            if auto_download:
+                cache_dir = self.dt_tessvectors_cache_dir.get().strip()
+                if not cache_dir:
+                    raise ValueError("TESSVectors cache directory is empty.")
+                cmd.append("--quaternion-auto-download")
+                cmd += ["--tessvectors-cache-dir", cache_dir]
+            cmd += ["--quaternion-camera", self.dt_quaternion_camera.get().strip() or "auto"]
+            cmd += ["--quaternion-min-samples", str(int(self.dt_quaternion_min_samples.get()))]
+            cmd += ["--quaternion-clip-sigma", str(float(self.dt_quaternion_clip_sigma.get()))]
+            cmd += ["--quaternion-clip-iters", str(int(self.dt_quaternion_clip_iters.get()))]
+            cmd += ["--quaternion-time-offset-days", self.dt_quaternion_time_offset.get().strip() or "auto"]
+            if self.dt_save_quaternion_diagnostics.get():
+                cmd.append("--save-quaternion-diagnostics")
         cmd += ["--gap-days", str(float(self.dt_gap_days.get()))]
         return cmd
 
@@ -1592,6 +1840,19 @@ class TESSGui(tk.Tk):
             "dt_clip_residuals_sigma": self.dt_clip_residuals_sigma.get(),
             "dt_clip_residuals_iters": self.dt_clip_residuals_iters.get(),
             "dt_save_pickled_figures": self.dt_save_pickled_figures.get(),
+            "dt_apply_orbital_phase_template": self.dt_apply_orbital_phase_template.get(),
+            "dt_orbtable": self.dt_orbtable.get(),
+            "dt_phase_bin": self.dt_phase_bin.get(),
+            "dt_use_quaternion_regression": self.dt_use_quaternion_regression.get(),
+            "dt_quaternion_source": self.dt_quaternion_source.get(),
+            "dt_quaternion_auto_download": self.dt_quaternion_auto_download.get(),
+            "dt_tessvectors_cache_dir": self.dt_tessvectors_cache_dir.get(),
+            "dt_quaternion_camera": self.dt_quaternion_camera.get(),
+            "dt_quaternion_min_samples": self.dt_quaternion_min_samples.get(),
+            "dt_quaternion_clip_sigma": self.dt_quaternion_clip_sigma.get(),
+            "dt_quaternion_clip_iters": self.dt_quaternion_clip_iters.get(),
+            "dt_quaternion_time_offset": self.dt_quaternion_time_offset.get(),
+            "dt_save_quaternion_diagnostics": self.dt_save_quaternion_diagnostics.get(),
             "dt_gap_days": self.dt_gap_days.get(),
             "preview_dir": self.preview_dir.get(),
             "preview_scale_mode": self.preview_scale_mode.get(),
@@ -1623,6 +1884,15 @@ class TESSGui(tk.Tk):
                     var.set(value)
                 except Exception:
                     pass
+
+        # Preserve an explicitly saved Pre-model PCHIP choice. For older
+        # settings files that do not contain that key, retain the default-on
+        # behavior when quaternion regression is enabled.
+        if "dt_pre_model_pchip" in data:
+            self._quaternion_was_enabled = bool(self.dt_use_quaternion_regression.get())
+        else:
+            self._quaternion_was_enabled = False
+
         self._update_extractor_state()
         self._update_detrender_state()
         self._refresh_preview_list()
