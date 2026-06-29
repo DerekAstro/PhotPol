@@ -60,22 +60,30 @@ Pipeline/custom CSV directory (batch one file at a time)
   This is intended for photometry-only batch work over many CSVs.
 
 SPOC lc.fits conversion
-  Run spoc_lightcurve_converter.py first, then feed the converted CSV into the
-  guided analysis as a normal TESS CSV.
+  Run spoc_lightcurve_converter.py first, then automatically feed the CSV it
+  creates into guided or joint analysis. The input may be one light-curve FITS
+  file, a directory, or a glob pattern, including paths containing spaces.
+  Target-pixel files (*-tp.fits and *-fast-tp.fits) are not accepted here;
+  process those through a photometric extractor first, or choose the matching
+  *-lc.fits / *-fast-lc.fits product.
 
-SPOC converter command template
---------------------------------
-The converter command is configurable because different converter versions may
-not use exactly the same CLI.
+SPOC multi-sector conversion
+----------------------------
+The converter can process multiple sectors for one TIC. Each input product is
+quality-filtered and normalized independently before combination. The default
+normalization is a sigma-clipped median division, with flux errors divided by
+the same normalization factor.
 
-Placeholders available in the template:
-  {python}   Python executable
-  {script}   converter script path
-  {input}    selected SPOC input path / glob
-  {output}   converted CSV output path
+When more than one cadence product exists for the same TIC and sector, the
+default cadence policy keeps the shortest cadence for the combined file. The
+other available policies are longest and all. Per-sector CSVs may still be
+written even when only one cadence is selected for the combined file.
 
-Default template:
-  {python} -u {script} --input {input} --output {output}
+The converter remains a standalone command-line program. The GUI calls its
+normal switches directly and reads a JSON manifest afterward to identify the
+combined CSV that should be sent into the analysis. If the selected inputs
+contain more than one TIC, the GUI stops with a clear ambiguity message rather
+than silently choosing a target.
 
 Common guided-analysis options
 ------------------------------
@@ -111,6 +119,27 @@ subrun
   Keep complete labels such as 12A, 12B, and 12C as separate baseline groups.
   The polarimetry input must contain a recognized run/subrun label column.
 
+TESS uncertainty weighting
+--------------------------
+none
+  Ignore TESS uncertainty columns and give every retained cadence equal weight.
+
+formal
+  Use the normalized uncertainty column corresponding to the selected flux
+  stream. Nonfinite values are replaced robustly and a configurable lower
+  error floor prevents a few tiny formal errors from dominating the fit.
+
+sector_rescaled
+  Use the formal relative errors, but rescale them separately within each TESS
+  sector so the median uncertainty matches that sector's robust
+  first-difference scatter. This is the default for converted multi-sector
+  SPOC data. If a usable uncertainty column is absent, analysis falls back to
+  equal weights with a message in the log.
+
+The same selected TESS weights are used consistently for frequency discovery,
+local refinement, prewhitening, local-SNR calculations, and final sinusoidal
+fits in both guided and joint modes.
+
 TESS-only frequency limit
 -------------------------
 Cap Fmax to TESS Nyquist
@@ -145,9 +174,18 @@ TOOLTIPS = {
     "pipeline_flux": "Preferred flux-family selection in pipeline_dir mode: raw, detrended, or auto.",
     "pipeline_recursive": "Search the pipeline/custom light-curve directory recursively.",
     "pipeline_batch_skip_existing": "In batch-per-file CSV directory mode, skip files whose output directory already contains a peaks-table CSV.",
-    "spoc_input": "SPOC lc.fits input path or glob used by the converter.",
-    "spoc_output_csv": "CSV path that the converter should write before the guided analysis starts.",
-    "spoc_template": "Command template used to run the SPOC converter. Use {python}, {script}, {input}, and {output} placeholders.",
+    "spoc_input": "One SPOC *-lc.fits/*-fast-lc.fits file, a directory, or a glob pattern. Target-pixel *-tp.fits files are rejected with a clear message. Paths containing spaces are passed safely.",
+    "spoc_pattern": "Glob pattern used when the SPOC input is a directory, for example *lc.fits.",
+    "spoc_recursive": "Search recursively when the SPOC input is a directory or recursive glob.",
+    "spoc_output_dir": "Directory where the converter writes per-sector CSVs, combined TIC CSVs, and its JSON manifest.",
+    "spoc_flux": "Science stream placed in flux_medscaled/flux_selected_rel: auto prefers PDCSAP, or explicitly choose PDCSAP or SAP.",
+    "spoc_quality": "good keeps only QUALITY==0 cadences; all retains every finite cadence.",
+    "spoc_normalization": "Per-sector normalization: sigma-clipped median division, ordinary median division, or none.",
+    "spoc_normalization_sigma": "Sigma threshold used by sigma-clipped-median normalization.",
+    "spoc_normalization_iters": "Maximum iterations used by sigma-clipped-median normalization.",
+    "spoc_cadence_policy": "When a TIC has more than one cadence product in the same sector, shortest keeps the fastest product in the combined CSV.",
+    "spoc_combine_by_tic": "Write a normalized, time-sorted multi-sector CSV for each TIC and automatically use it for analysis when exactly one TIC is present.",
+    "spoc_write_per_sector": "Also retain one converted CSV for each individual SPOC input product.",
     "pol_csv": "Polarimetry CSV: either raw/basic polarimetry or a precomputed analysis-frame CSV.",
     "use_polarimetry": "Guided mode only. When unchecked, run only the TESS frequency search and global multisinusoid fit, skipping all polarimetry steps.",
     "pol_product": "Polarimetry product to analyze: nm, resid_nm_pchip, or pw_resid_nm_pchip.",
@@ -161,6 +199,8 @@ TOOLTIPS = {
     "fmin": "Minimum frequency in cycles/day.",
     "fmax": "Maximum frequency in cycles/day.",
     "tess_cap_fmax_to_nyquist": "When enabled, use the smaller of the GUI Fmax value and the TESS Nyquist frequency for the current dataset. This is the default and is especially useful in batch mode.",
+    "tess_weight_mode": "TESS cadence weighting: none gives equal weights; formal uses normalized flux errors; sector_rescaled additionally matches each sector's median error to its robust first-difference scatter.",
+    "tess_error_floor_frac": "Lower uncertainty floor as a fraction of the median error within each sector/group. A value of 0.25 limits any cadence to at most 16 times the median inverse-variance weight.",
     "tess_grid_mode": "Use the full baseline or the longest contiguous chunk to set the TESS discovery grid.",
     "tess_snr_stop": "Stop the sequential TESS search when the local SNR drops below this value.",
     "max_tess_modes": "Maximum number of sequential TESS modes to extract before the global fit.",
@@ -197,6 +237,27 @@ TOOLTIPS = {
 
 def quote_cmd(cmd: list[str]) -> str:
     return " ".join(shlex.quote(str(x)) for x in cmd)
+
+
+def _looks_like_tess_target_pixel_path(value: str | Path) -> bool:
+    """Return True for standard TESS target-pixel product filenames."""
+    name = Path(str(value)).name.lower()
+    return name.endswith(("-tp.fits", "-tp.fits.gz", "_tp.fits", "_tp.fits.gz"))
+
+
+def _looks_like_spoc_lightcurve_path(value: str | Path) -> bool:
+    """Return True for standard SPOC light-curve product filenames."""
+    name = Path(str(value)).name.lower()
+    return name.endswith(("-lc.fits", "-lc.fits.gz", "_lc.fits", "_lc.fits.gz"))
+
+
+def _target_pixel_guidance(path: str | Path) -> str:
+    name = Path(str(path)).name
+    return (
+        f"{name} is a TESS target-pixel file, not a SPOC light-curve file.\n\n"
+        "Choose the corresponding *-lc.fits or *-fast-lc.fits product, or "
+        "process the target-pixel file through the PhotPol extractor first."
+    )
 
 
 class ToolTip:
@@ -329,8 +390,17 @@ class GuidedAnalysisGUI(tk.Tk):
         self.tess_force_y_col = tk.StringVar(value="")
 
         self.spoc_input = tk.StringVar(value="")
-        self.spoc_output_csv = tk.StringVar(value="combined_filtered.csv")
-        self.spoc_template = tk.StringVar(value="{python} -u {script} --input {input} --output {output}")
+        self.spoc_pattern = tk.StringVar(value="*lc.fits")
+        self.spoc_recursive = tk.BooleanVar(value=True)
+        self.spoc_output_dir = tk.StringVar(value="spoc_csvs")
+        self.spoc_flux = tk.StringVar(value="auto")
+        self.spoc_quality = tk.StringVar(value="good")
+        self.spoc_normalization = tk.StringVar(value="sigma-clipped-median")
+        self.spoc_normalization_sigma = tk.DoubleVar(value=4.0)
+        self.spoc_normalization_iters = tk.IntVar(value=5)
+        self.spoc_cadence_policy = tk.StringVar(value="shortest")
+        self.spoc_combine_by_tic = tk.BooleanVar(value=True)
+        self.spoc_write_per_sector = tk.BooleanVar(value=True)
 
         # polarimetry / output
         self.use_polarimetry = tk.BooleanVar(value=True)
@@ -348,6 +418,8 @@ class GuidedAnalysisGUI(tk.Tk):
         self.fmin = tk.DoubleVar(value=0.01)
         self.fmax = tk.DoubleVar(value=50.0)
         self.tess_cap_fmax_to_nyquist = tk.BooleanVar(value=True)
+        self.tess_weight_mode = tk.StringVar(value="sector_rescaled")
+        self.tess_error_floor_frac = tk.DoubleVar(value=0.25)
         self.tess_grid_mode = tk.StringVar(value="full_baseline")
         self.tess_snr_stop = tk.DoubleVar(value=4.0)
         self.max_tess_modes = tk.IntVar(value=20)
@@ -607,6 +679,8 @@ class GuidedAnalysisGUI(tk.Tk):
         self.inline_plots_chk = self._check(outdisp, "Inline plots", self.show_plots_inline, 1, 0, tooltip_key="show_inline", command=self._update_run_plan_preview)
         self._spin(outdisp, "Verbose", self.verbose, 0, 5, 1, 2, tooltip_key="verbose")
         self._spin(outdisp, "LSQ verbose", self.lsq_verbose, 0, 5, 2, 0, tooltip_key="lsq_verbose")
+        self._combo(outdisp, "TESS error weighting", self.tess_weight_mode, ["none", "formal", "sector_rescaled"], 3, 0, tooltip_key="tess_weight_mode")
+        self._entry(outdisp, "TESS error floor / median", self.tess_error_floor_frac, 3, 2, tooltip_key="tess_error_floor_frac")
 
         main = ttk.LabelFrame(root, text="Main analysis settings")
         main.grid(row=3, column=0, sticky="ew", padx=8, pady=6)
@@ -712,7 +786,8 @@ class GuidedAnalysisGUI(tk.Tk):
             self.guided_script, self.joint_script, self.converter_script, self.analysis_mode, self.use_polarimetry,
             self.pol_csv, self.pol_product, self.save_generated_frame, self.generated_analysis_dir,
             self.output_target_subdir, self.outroot, self.show_plots_inline, self.verbose, self.lsq_verbose,
-            self.fmin, self.fmax, self.tess_grid_mode, self.tess_snr_stop, self.max_tess_modes,
+            self.fmin, self.fmax, self.tess_weight_mode, self.tess_error_floor_frac,
+            self.tess_grid_mode, self.tess_snr_stop, self.max_tess_modes,
             self.pol_snr_stop, self.max_pol_modes, self.guided_pol_fmin, self.search_window_mult,
             self.noise_ks, self.noise_bins, self.channel_q, self.channel_u, self.channel_p,
             self.use_offsets, self.use_slopes, self.group_mode, self.gap_hours,
@@ -763,14 +838,52 @@ class GuidedAnalysisGUI(tk.Tk):
         spocf.grid(row=3, column=0, sticky="ew", padx=8, pady=6)
         for c in range(4):
             spocf.columnconfigure(c, weight=1)
-        self._entry(spocf, "SPOC input path or glob", self.spoc_input, 0, 0, browse="file", tooltip_key="spoc_input", filetypes=[("FITS files", "*.fits *.fits.gz"), ("All files", "*.*")])
-        self._entry(spocf, "Converted CSV output", self.spoc_output_csv, 1, 0, browse="file", tooltip_key="spoc_output_csv", filetypes=[("CSV files", "*.csv"), ("All files", "*.*")])
-        self._entry(spocf, "Converter command template", self.spoc_template, 2, 0, tooltip_key="spoc_template")
+
+        self._entry(
+            spocf, "SPOC input file / directory / glob", self.spoc_input, 0, 0,
+            browse=None, tooltip_key="spoc_input",
+        )
+        file_btn = ttk.Button(spocf, text="Browse lc.fits...", command=self._browse_spoc_lc_file)
+        file_btn.grid(row=0, column=2, padx=6, pady=4)
+        self._tooltip(file_btn, "spoc_input")
+        dir_btn = ttk.Button(spocf, text="Browse dir...", command=lambda: self._browse_dir(self.spoc_input))
+        dir_btn.grid(row=0, column=3, padx=6, pady=4)
+        self._tooltip(dir_btn, "spoc_input")
+
+        self._entry(spocf, "Directory pattern", self.spoc_pattern, 1, 0, tooltip_key="spoc_pattern")
+        self._check(spocf, "Recursive", self.spoc_recursive, 1, 2, tooltip_key="spoc_recursive", command=self._update_run_plan_preview)
+        self._entry(spocf, "Converted output directory", self.spoc_output_dir, 2, 0, browse="dir", tooltip_key="spoc_output_dir")
+
+        self._combo(spocf, "Science flux", self.spoc_flux, ["auto", "pdcsap", "sap"], 3, 0, tooltip_key="spoc_flux")
+        self._combo(spocf, "Quality policy", self.spoc_quality, ["good", "all"], 3, 2, tooltip_key="spoc_quality")
+        self._combo(
+            spocf, "Normalization", self.spoc_normalization,
+            ["sigma-clipped-median", "median", "none"], 4, 0,
+            tooltip_key="spoc_normalization",
+        )
+        self._combo(
+            spocf, "Cadence policy", self.spoc_cadence_policy,
+            ["shortest", "longest", "all"], 4, 2,
+            tooltip_key="spoc_cadence_policy",
+        )
+        self._entry(spocf, "Normalization sigma", self.spoc_normalization_sigma, 5, 0, tooltip_key="spoc_normalization_sigma")
+        self._spin(spocf, "Normalization iterations", self.spoc_normalization_iters, 1, 99, 5, 2, tooltip_key="spoc_normalization_iters")
+        self._check(
+            spocf, "Combine sectors by TIC", self.spoc_combine_by_tic, 6, 0,
+            tooltip_key="spoc_combine_by_tic", command=self._update_run_plan_preview,
+        )
+        self._check(
+            spocf, "Write per-sector CSVs", self.spoc_write_per_sector, 6, 2,
+            tooltip_key="spoc_write_per_sector", command=self._update_run_plan_preview,
+        )
 
         self._trace_vars([
             self.tess_input_mode, self.tess_csv, self.pipeline_dir, self.pipeline_pattern,
             self.pipeline_recursive, self.pipeline_batch_skip_existing, self.pipeline_flux, self.tess_force_y_col,
-            self.spoc_input, self.spoc_output_csv, self.spoc_template,
+            self.spoc_input, self.spoc_pattern, self.spoc_recursive, self.spoc_output_dir,
+            self.spoc_flux, self.spoc_quality, self.spoc_normalization,
+            self.spoc_normalization_sigma, self.spoc_normalization_iters,
+            self.spoc_cadence_policy, self.spoc_combine_by_tic, self.spoc_write_per_sector,
         ], self._update_run_plan_preview)
         self._trace_vars([self.tess_input_mode], self._update_tess_mode_state)
 
@@ -982,28 +1095,70 @@ class GuidedAnalysisGUI(tk.Tk):
             ch.append("p")
         return ch
 
+    def _spoc_manifest_path(self) -> str:
+        outdir = self.spoc_output_dir.get().strip()
+        if not outdir:
+            return ""
+        return str((Path(outdir).expanduser().resolve() / "spoc_conversion_manifest.json"))
+
     def _build_converter_command(self) -> list[str] | None:
         if self.tess_input_mode.get() != "spoc_lc_fits":
             return None
+
         script = self.converter_script.get().strip()
-        input_path = self.spoc_input.get().strip()
-        output_csv = self.spoc_output_csv.get().strip()
-        template = self.spoc_template.get().strip()
+        input_spec = self.spoc_input.get().strip()
+        output_dir = self.spoc_output_dir.get().strip()
+        pattern = self.spoc_pattern.get().strip() or "*lc.fits"
         if not script:
             raise ValueError("SPOC converter mode selected but converter script path is empty.")
-        if not input_path:
-            raise ValueError("SPOC converter mode selected but SPOC input path/glob is empty.")
-        if not output_csv:
-            raise ValueError("SPOC converter mode selected but converted CSV output path is empty.")
-        if not template:
-            raise ValueError("SPOC converter command template is empty.")
-        rendered = template.format(
-            python=sys.executable,
-            script=script,
-            input=input_path,
-            output=output_csv,
-        )
-        return shlex.split(rendered)
+        if not input_spec:
+            raise ValueError("SPOC converter mode selected but the input file/directory/glob is empty.")
+
+        # Catch the common accidental selection of a TPF before launching a
+        # subprocess. Directory and glob inputs are validated by the converter.
+        explicit_path = Path(input_spec).expanduser()
+        if explicit_path.is_file() and _looks_like_tess_target_pixel_path(explicit_path):
+            raise ValueError(_target_pixel_guidance(explicit_path))
+
+        if not output_dir:
+            raise ValueError("SPOC converter mode selected but the converted output directory is empty.")
+        if not bool(self.spoc_combine_by_tic.get()) and not bool(self.spoc_write_per_sector.get()):
+            raise ValueError("Enable at least one SPOC output type: combined by TIC or per-sector CSVs.")
+
+        command = [
+            sys.executable,
+            "-u",
+            script,
+            "--input",
+            input_spec,
+            "--pattern",
+            pattern,
+            "--output-dir",
+            str(Path(output_dir).expanduser().resolve()),
+            "--flux",
+            self.spoc_flux.get().strip(),
+            "--quality",
+            self.spoc_quality.get().strip(),
+            "--normalization",
+            self.spoc_normalization.get().strip(),
+            "--normalization-sigma",
+            str(float(self.spoc_normalization_sigma.get())),
+            "--normalization-iters",
+            str(int(self.spoc_normalization_iters.get())),
+            "--cadence-policy",
+            self.spoc_cadence_policy.get().strip(),
+            "--manifest-json",
+            self._spoc_manifest_path(),
+        ]
+        if bool(self.spoc_recursive.get()):
+            command.append("--recursive")
+        if bool(self.spoc_combine_by_tic.get()):
+            command.append("--combine-by-tic")
+        if bool(self.spoc_write_per_sector.get()):
+            command.append("--write-per-sector")
+        else:
+            command.append("--no-write-per-sector")
+        return command
 
     def _build_config(self) -> dict:
         channels = self._channels_list()
@@ -1025,6 +1180,18 @@ class GuidedAnalysisGUI(tk.Tk):
             "pipeline_batch_skip_existing": bool(self.pipeline_batch_skip_existing.get()),
             "pipeline_flux": self.pipeline_flux.get().strip(),
             "tess_force_y_col": self.tess_force_y_col.get().strip(),
+            "spoc_input": self.spoc_input.get().strip(),
+            "spoc_pattern": self.spoc_pattern.get().strip(),
+            "spoc_recursive": bool(self.spoc_recursive.get()),
+            "spoc_output_dir": self.spoc_output_dir.get().strip(),
+            "spoc_flux": self.spoc_flux.get().strip(),
+            "spoc_quality": self.spoc_quality.get().strip(),
+            "spoc_normalization": self.spoc_normalization.get().strip(),
+            "spoc_normalization_sigma": float(self.spoc_normalization_sigma.get()),
+            "spoc_normalization_iters": int(self.spoc_normalization_iters.get()),
+            "spoc_cadence_policy": self.spoc_cadence_policy.get().strip(),
+            "spoc_combine_by_tic": bool(self.spoc_combine_by_tic.get()),
+            "spoc_write_per_sector": bool(self.spoc_write_per_sector.get()),
             "use_polarimetry": use_polarimetry_active,
             "pol_csv": self.pol_csv.get().strip(),
             "pol_product": self.pol_product.get().strip(),
@@ -1038,6 +1205,8 @@ class GuidedAnalysisGUI(tk.Tk):
             "fmin": float(self.fmin.get()),
             "fmax": float(self.fmax.get()),
             "tess_cap_fmax_to_nyquist": bool(self.tess_cap_fmax_to_nyquist.get()),
+            "tess_weight_mode": self.tess_weight_mode.get().strip(),
+            "tess_error_floor_frac": float(self.tess_error_floor_frac.get()),
             "tess_grid_mode": self.tess_grid_mode.get().strip(),
             "tess_snr_stop": float(self.tess_snr_stop.get()),
             "max_tess_modes": int(self.max_tess_modes.get()),
@@ -1094,6 +1263,10 @@ class GuidedAnalysisGUI(tk.Tk):
             raise ValueError("Polarimetry CSV path is empty.")
         if not cfg["outroot"]:
             raise ValueError("Output root is empty.")
+        if cfg["tess_weight_mode"] not in {"none", "formal", "sector_rescaled"}:
+            raise ValueError("TESS error weighting must be none, formal, or sector_rescaled.")
+        if cfg["tess_error_floor_frac"] < 0:
+            raise ValueError("TESS error floor / median must be non-negative.")
 
         if cfg["tess_input_mode"] == "existing_csv":
             if not cfg["tess_csv"]:
@@ -1109,7 +1282,10 @@ class GuidedAnalysisGUI(tk.Tk):
             cfg["converter_command"] = None
         elif cfg["tess_input_mode"] == "spoc_lc_fits":
             cfg["converter_command"] = self._build_converter_command()
-            cfg["tess_csv"] = self.spoc_output_csv.get().strip()
+            cfg["converter_manifest"] = self._spoc_manifest_path()
+            # The temporary runner replaces this with the preferred CSV from
+            # the converter manifest before importing either analysis backend.
+            cfg["tess_csv"] = ""
         else:
             raise ValueError(f"Unsupported TESS input mode: {cfg['tess_input_mode']}")
         return cfg
@@ -1137,7 +1313,15 @@ class GuidedAnalysisGUI(tk.Tk):
             else:
                 lines.append("SPOC converter command:")
                 lines.append("  " + quote_cmd(cfg["converter_command"]))
-                lines.append(f"Converted CSV: {cfg['tess_csv']}")
+                lines.append(f"Converted output directory: {cfg['spoc_output_dir']}")
+                lines.append(f"Manifest: {cfg['converter_manifest']}")
+                lines.append(
+                    "Conversion: "
+                    f"flux={cfg['spoc_flux']} | quality={cfg['spoc_quality']} | "
+                    f"normalization={cfg['spoc_normalization']} | "
+                    f"cadence={cfg['spoc_cadence_policy']} | "
+                    f"combine_by_tic={cfg['spoc_combine_by_tic']}"
+                )
             lines.extend([
                 f"Use polarimetry: {cfg['use_polarimetry']}",
                 f"Polarimetry CSV: {cfg['pol_csv'] if cfg['use_polarimetry'] else '(not used)'}",
@@ -1146,6 +1330,7 @@ class GuidedAnalysisGUI(tk.Tk):
                 f"Output root: {cfg['outroot']}",
                 f"Target subdirectory: {cfg['output_target_subdir']}",
                 f"Cap Fmax to Nyquist: {cfg['tess_cap_fmax_to_nyquist']}",
+                f"TESS weighting: {cfg['tess_weight_mode']} | error floor/median={cfg['tess_error_floor_frac']}",
                 f"Phase zero: {cfg['phase_zero_mode']}" + (f" (BTJD={cfg['phase_zero_btjd']})" if cfg['phase_zero_mode']=='custom_btjd' else (" (absolute TESS BTJD=0.0)" if cfg['phase_zero_mode']=='btjd_zero' else "")),
             ])
             if cfg["analysis_mode"] == "guided_analysis":
@@ -1180,6 +1365,7 @@ import importlib.util
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -1194,11 +1380,45 @@ print("GUI runner starting")
 print("Analysis mode =", CFG["analysis_mode"])
 
 if CFG.get("converter_command"):
+    manifest_path = Path(CFG.get("converter_manifest", "")).expanduser().resolve()
+    try:
+        manifest_path.unlink()
+    except FileNotFoundError:
+        pass
+
     print("Running SPOC converter:")
-    print("  " + " ".join(CFG["converter_command"]))
+    print("  " + " ".join(shlex.quote(str(arg)) for arg in CFG["converter_command"]))
     rc = subprocess.run(CFG["converter_command"]).returncode
     if rc != 0:
         raise SystemExit(f"SPOC converter failed with exit code {{rc}}")
+
+    if not manifest_path.exists():
+        raise SystemExit(f"SPOC converter finished but did not write its manifest: {{manifest_path}}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    preferred = manifest.get("preferred_analysis_csv")
+    if not preferred:
+        candidates = manifest.get("combined_outputs") or manifest.get("per_sector_outputs") or []
+        if len(candidates) > 1:
+            listing = "\\n".join(f"  - {{item}}" for item in candidates[:20])
+            raise SystemExit(
+                "SPOC conversion produced more than one possible analysis CSV, usually because "
+                "the input contained multiple TICs or sector combination was disabled. "
+                "Select inputs for one TIC or choose one converted CSV explicitly.\\n" + listing
+            )
+        if len(candidates) == 1:
+            preferred = candidates[0]
+    if not preferred:
+        failures = manifest.get("failures") or []
+        raise SystemExit(
+            "SPOC conversion did not produce a usable analysis CSV. "
+            f"Manifest failures: {{failures[:5]}}"
+        )
+    preferred_path = Path(preferred).expanduser().resolve()
+    if not preferred_path.exists():
+        raise SystemExit(f"Manifest-selected SPOC CSV does not exist: {{preferred_path}}")
+    CFG["tess_csv"] = str(preferred_path)
+    print("SPOC conversion complete; analysis input CSV:")
+    print("  ", preferred_path)
 
 def _py_literal(value):
     if isinstance(value, str):
@@ -1248,6 +1468,8 @@ def _apply_guided_common_settings(mod, *, outroot_override: Path | None = None, 
     mod.FMIN = float(CFG["fmin"])
     mod.FMAX = float(CFG["fmax"])
     setattr(mod, "TESS_CAP_FMAX_TO_NYQUIST", bool(CFG.get("tess_cap_fmax_to_nyquist", True)))
+    setattr(mod, "TESS_WEIGHT_MODE", CFG.get("tess_weight_mode", "sector_rescaled"))
+    setattr(mod, "TESS_ERROR_FLOOR_FRAC", float(CFG.get("tess_error_floor_frac", 0.25)))
     mod.TESS_GRID_MODE = CFG["tess_grid_mode"]
     mod.TESS_SNR_STOP = float(CFG["tess_snr_stop"])
     mod.MAX_TESS_MODES = int(CFG["max_tess_modes"])
@@ -1449,6 +1671,9 @@ elif CFG["analysis_mode"] == "joint_search":
         "TESS_PIPELINE_PATTERN": _py_literal(tess_pipeline_pattern),
         "TESS_PIPELINE_RECURSIVE": _py_literal(bool(tess_pipeline_recursive)),
         "TESS_PIPELINE_FLUX": _py_literal(tess_pipeline_flux),
+        "TESS_FORCE_Y_COL": _py_literal(CFG["tess_force_y_col"] if CFG["tess_force_y_col"] else None),
+        "TESS_WEIGHT_MODE": _py_literal(CFG.get("tess_weight_mode", "sector_rescaled")),
+        "TESS_ERROR_FLOOR_FRAC": _py_literal(float(CFG.get("tess_error_floor_frac", 0.25))),
         "POL_CSV": _py_literal(f'Path({{repr(pol_csv_for_joint)}})'),
         "POL_PRODUCT": _py_literal(pol_product),
         "FMIN": _py_literal(float(CFG["fmin"])),
@@ -1747,6 +1972,30 @@ else:
         if path:
             var.set(path)
 
+    def _browse_spoc_lc_file(self):
+        path = filedialog.askopenfilename(
+            title="Choose a SPOC light-curve FITS file",
+            filetypes=[
+                ("SPOC light-curve FITS", ("*lc.fits", "*lc.fits.gz")),
+                ("All FITS files", ("*.fits", "*.fits.gz")),
+            ],
+        )
+        if not path:
+            return
+        if _looks_like_tess_target_pixel_path(path):
+            messagebox.showerror("Target-pixel file selected", _target_pixel_guidance(path))
+            return
+        if not _looks_like_spoc_lightcurve_path(path):
+            proceed = messagebox.askyesno(
+                "Unrecognized light-curve filename",
+                f"{Path(path).name} does not have the usual *-lc.fits or *-fast-lc.fits name.\n\n"
+                "Continue only if this FITS file contains a standard SPOC light-curve table "
+                "with SAP_FLUX or PDCSAP_FLUX columns.",
+            )
+            if not proceed:
+                return
+        self.spoc_input.set(path)
+
     def _open_folder(self, path: Path):
         path = path.expanduser().resolve()
         if not path.exists():
@@ -1769,11 +2018,15 @@ else:
             "guided_script", "joint_script", "converter_script", "analysis_mode",
             "tess_input_mode", "tess_csv", "pipeline_dir", "pipeline_pattern",
             "pipeline_recursive", "pipeline_batch_skip_existing", "pipeline_flux",
-            "tess_force_y_col", "spoc_input", "spoc_output_csv", "spoc_template",
+            "tess_force_y_col", "spoc_input", "spoc_pattern", "spoc_recursive",
+            "spoc_output_dir", "spoc_flux", "spoc_quality", "spoc_normalization",
+            "spoc_normalization_sigma", "spoc_normalization_iters",
+            "spoc_cadence_policy", "spoc_combine_by_tic", "spoc_write_per_sector",
             "use_polarimetry", "pol_csv", "pol_product", "save_generated_frame",
             "generated_analysis_dir", "output_target_subdir", "outroot",
             "show_plots_inline", "verbose", "lsq_verbose", "fmin", "fmax",
-            "tess_cap_fmax_to_nyquist", "tess_grid_mode", "tess_snr_stop",
+            "tess_cap_fmax_to_nyquist", "tess_weight_mode", "tess_error_floor_frac",
+            "tess_grid_mode", "tess_snr_stop",
             "max_tess_modes", "pol_snr_stop", "max_pol_modes", "guided_pol_fmin",
             "search_window_mult", "noise_ks", "noise_bins", "use_offsets",
             "use_slopes", "group_mode", "gap_hours", "do_detrend", "detrend_order",

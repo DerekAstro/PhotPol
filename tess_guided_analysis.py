@@ -260,10 +260,16 @@ TESS_Y_COL_CANDIDATES = [
     "flux_quaternion_corrected_rel",
     "flux_decor_only_rel",
     "flux_quaternion_only_corrected_rel",
+    # Explicit science stream written by the updated SPOC converter. Keep this
+    # ahead of the legacy SAP/PDCSAP compatibility columns so a user-selected
+    # SAP stream is not silently replaced by PDCSAP during analysis.
+    "flux_selected_rel",
     "flux_detrended_sub",
     "flux_detrended_div",
     "flux_detrended_rel",
     "flux_medscaled",
+    "pdcsap_flux_rel",
+    "sap_flux_rel",
     "flux_rel",
     "relative_flux",
     "normalized_flux",

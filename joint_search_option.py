@@ -1,12 +1,9 @@
 # Auto-exported companion script from notebook v6
 
-import argparse
 import numpy as np
 import pandas as pd
 from dataclasses import dataclass
 from pathlib import Path
-import re
-matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 try:
@@ -34,6 +31,17 @@ TESS_PIPELINE_DIR = Path("tess_pipeline_lcs")
 TESS_PIPELINE_PATTERN = "*.csv"
 TESS_PIPELINE_RECURSIVE = False
 TESS_PIPELINE_FLUX = "raw"                # "raw" | "detrended" | "auto"
+TESS_FORCE_Y_COL = None
+
+# --- TESS uncertainty weighting ---
+# none: equal weights; formal: use normalized flux uncertainties as written;
+# sector_rescaled: preserve cadence-to-cadence formal-error variations while
+# matching each sector's median error to its robust first-difference scatter.
+TESS_WEIGHT_MODE = "sector_rescaled"      # "none" | "formal" | "sector_rescaled"
+TESS_ERROR_FLOOR_FRAC = 0.25
+TESS_SECTOR_RESCALE_MIN_POINTS = 20
+TESS_SECTOR_SCALE_MIN = 0.10
+TESS_SECTOR_SCALE_MAX = 100.0
 
 POL_CSV  = Path("bet Cep_IND_nm_pchip_analysis_frame.csv")  # <-- change
 
@@ -55,7 +63,6 @@ MAX_ITERS = 20
 KFIT = 3.0
 SNR_STOP = 2.0
 W_PREFILTER = 1.5
-MIN_FREQ_SEP_MULT = 5.0  # minimum separation for distinct summary/merged modes, in units of 1/T_full
 
 # --- Local noise floor ---
 KS_TESS = 15.0
@@ -68,7 +75,7 @@ N_SIDE_BINS = 30
 # --- Polarimetry night-model (Option C default; D-ready) ---
 USE_POL_NIGHT_OFFSETS = True
 USE_POL_NIGHT_SLOPES  = False    # keep False for now; easy upgrade to Option D later
-POL_NIGHT_GROUP_MODE  = "gap"    # 'gap' or 'integer_jd'
+POL_NIGHT_GROUP_MODE  = "gap"    # 'gap' | 'integer_jd' | 'run' | 'subrun'
 POL_NIGHT_GAP_HOURS   = 8.0      # used if mode='gap'
 
 # --- Optional broad detrending hook (defaults off) ---
@@ -86,6 +93,14 @@ SCALE_FREE_WEIGHT_BASIS = "tseg" # currently "tseg" (unit-free, modestly favors 
 MANUAL_W_TESS = 1.0
 MANUAL_W_POL = 1.0
 
+# --- Phase reference ---
+PHASE_ZERO_MODE = "local_start"   # "local_start" | "btjd_zero" | "custom_btjd"
+PHASE_ZERO_BTJD = 0.0
+
+# --- Optional extra summary-spectrum outputs ---
+SUMMARY_SAVE_PERIOD_VERSION = False
+SUMMARY_SAVE_LOG_AMPLITUDE_VERSION = False
+
 
 # --- Notebook display ---
 SHOW_PLOTS_INLINE = True
@@ -93,49 +108,6 @@ SHOW_PLOTS_INLINE = True
 # --- Output ---
 OUTROOT = Path("joint_phot_pol_outputs_optionC")
 OUTROOT.mkdir(parents=True, exist_ok=True)
-OUTPUT_TARGET_SUBDIR = False
-
-# --- Phase reference ---
-PHASE_ZERO_MODE = "local_start"   # "local_start" | "btjd_zero" | "custom_btjd"
-PHASE_ZERO_BTJD = 0.0
-BTJD_OFFSET = 2457000.0
-
-# --- Optional extra summary-spectrum outputs ---
-SUMMARY_SAVE_PERIOD_VERSION = False
-SUMMARY_SAVE_LOG_AMPLITUDE_VERSION = False
-
-
-POL_FILENAME_SUFFIXES = [
-    "_IND_nm_pchip_analysis_frame",
-    "_nm_pchip_analysis_frame",
-    "_analysis_frame",
-    "_IND",
-]
-
-def infer_star_labels_from_pol_path(path: Path | str) -> tuple[str, str]:
-    stem = Path(path).stem
-    for suff in sorted(POL_FILENAME_SUFFIXES, key=len, reverse=True):
-        if stem.endswith(suff):
-            stem = stem[:-len(suff)]
-            break
-    stem = stem.strip(" _-")
-    display = re.sub(r"[_]+", " ", stem).strip()
-    display = re.sub(r"\s+", " ", display)
-    safe = re.sub(r"[^A-Za-z0-9.+-]+", "_", display).strip("_")
-    if not display:
-        display = "target"
-    if not safe:
-        safe = "target"
-    return display, safe
-
-def prefixed_output_name(prefix: str, basename: str) -> str:
-    prefix = str(prefix).strip()
-    return f"{prefix}_{basename}" if prefix else basename
-
-def resolve_analysis_outroot(star_safe: str) -> Path:
-    base = OUTROOT / star_safe if OUTPUT_TARGET_SUBDIR else OUTROOT
-    base.mkdir(parents=True, exist_ok=True)
-    return base
 
 @dataclass
 class TimeSeries:
@@ -176,14 +148,61 @@ def _clean_sort(t, y, yerr=None, t_abs=None):
     return t, y, yerr, t_abs
 
 TESS_TIME_COL = "time_btjd"
-TESS_Y_COL_CANDIDATES = ["flux_detrended_rel", "flux_medscaled"]
+TESS_TIME_COL_CANDIDATES = ["time_btjd", "btjd", "time", "bjd", "jd"]
+TESS_Y_COL_CANDIDATES = [
+    "flux_detrend_rel",
+    "flux_orbital_corrected_rel",
+    "flux_quaternion_corrected_rel",
+    "flux_decor_only_rel",
+    "flux_quaternion_only_corrected_rel",
+    "flux_selected_rel",
+    "flux_detrended_sub",
+    "flux_detrended_div",
+    "flux_detrended_rel",
+    "flux_medscaled",
+    "pdcsap_flux_rel",
+    "sap_flux_rel",
+    "flux_rel",
+    "relative_flux",
+    "normalized_flux",
+    "flux",
+]
+TESS_ERROR_COL_CANDIDATES_BY_FLUX = {
+    "flux_selected_rel": ["flux_selected_err_rel"],
+    "pdcsap_flux_rel": ["pdcsap_flux_err_rel", "flux_selected_err_rel"],
+    "sap_flux_rel": ["sap_flux_err_rel", "flux_selected_err_rel"],
+    "flux_detrended_rel": ["pdcsap_flux_err_rel", "flux_selected_err_rel", "flux_err_rel"],
+    "flux_medscaled": ["flux_selected_err_rel", "pdcsap_flux_err_rel", "sap_flux_err_rel", "flux_err_rel"],
+    "flux_rel": ["sap_flux_err_rel", "flux_selected_err_rel", "flux_err_rel"],
+    "relative_flux": ["relative_flux_err", "flux_err_rel", "flux_error_rel"],
+    "normalized_flux": ["normalized_flux_err", "flux_err_rel", "flux_error_rel"],
+    "flux_detrend_rel": ["flux_detrend_err_rel", "flux_err_rel", "flux_error_rel"],
+    "flux_orbital_corrected_rel": ["flux_orbital_corrected_err_rel", "flux_err_rel", "flux_error_rel"],
+    "flux_quaternion_corrected_rel": ["flux_quaternion_corrected_err_rel", "flux_err_rel", "flux_error_rel"],
+    "flux_decor_only_rel": ["flux_decor_only_err_rel", "flux_err_rel", "flux_error_rel"],
+    "flux_quaternion_only_corrected_rel": ["flux_quaternion_only_corrected_err_rel", "flux_err_rel", "flux_error_rel"],
+    "flux_detrended_sub": ["flux_detrended_sub_err", "flux_err", "flux_error"],
+    "flux_detrended_div": ["flux_detrended_div_err_rel", "flux_err_rel", "flux_error_rel"],
+}
+TESS_GENERIC_ERROR_COL_CANDIDATES = [
+    "flux_selected_err_rel", "flux_err_rel", "flux_error_rel",
+    "relative_flux_err", "normalized_flux_err",
+]
 
 # Custom TESS-pipeline CSV support:
 #   raw extractor outputs are typically time_btjd + flux_rel, with one branch
 #   writing flux_detrended_rel instead;
 #   detrender outputs include flux_rel, flux_detrend_rel, and flux_decor_only_rel.
-TESS_PIPELINE_RAW_Y_COLS = ["flux_rel", "flux_detrended_rel"]
-TESS_PIPELINE_DETRENDED_Y_COLS = ["flux_detrend_rel", "flux_decor_only_rel", "flux_rel", "flux_detrended_rel"]
+TESS_PIPELINE_RAW_Y_COLS = [
+    "flux_rel", "flux_medscaled", "flux_detrended_rel",
+    "relative_flux", "normalized_flux", "flux",
+]
+TESS_PIPELINE_DETRENDED_Y_COLS = [
+    "flux_detrend_rel", "flux_orbital_corrected_rel", "flux_quaternion_corrected_rel",
+    "flux_decor_only_rel", "flux_quaternion_only_corrected_rel",
+    "flux_detrended_sub", "flux_detrended_div", "flux_detrended_rel",
+    "flux_medscaled", "flux_rel",
+]
 
 POL_TIME_COL = "jd"
 POL_ERR_COLS = {"q": "q_err", "u": "u_err", "p": "p_err"}
@@ -194,13 +213,111 @@ POL_PRODUCTS = {
     "pw_resid_nm_pchip":{"q": "q_pw_resid_nm_pchip","u": "u_pw_resid_nm_pchip","p": "p_pw_resid_nm_pchip"},
 }
 
-def build_night_groups(t_abs: np.ndarray, mode: str = "gap", gap_days: float = 8.0/24.0) -> np.ndarray:
+
+RAW_POL_RUN_CODE_CANDIDATES = [
+    "run", "Run", "RUN",
+    "run_id", "RunID", "runid",
+    "run_code", "RunCode", "RUN_CODE",
+    "run_label", "RunLabel",
+    "subrun", "Subrun",
+    "subrun_label", "SubrunLabel",
+]
+
+def _normalize_run_token(value) -> str | None:
+    if pd.isna(value):
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    return s
+
+def _base_run_token(token: str | None) -> str | None:
+    if token is None:
+        return None
+    tok = str(token).strip()
+    if not tok:
+        return None
+    if tok[-1].isalpha():
+        return tok[:-1] or tok
+    return tok
+
+def _factorize_group_labels(labels: np.ndarray) -> np.ndarray:
+    ser = pd.Series(labels, dtype="object")
+    ser = ser.fillna("__MISSING_GROUP__")
+    codes, _ = pd.factorize(ser, sort=False)
+    return codes.astype(int)
+
+def get_polarimetry_group_labels(df: pd.DataFrame, mode: str) -> np.ndarray:
+    if mode == "run":
+        if "run_label" in df.columns:
+            vals = df["run_label"].map(_normalize_run_token).to_numpy(object)
+        elif "subrun_label" in df.columns:
+            vals = df["subrun_label"].map(_base_run_token).to_numpy(object)
+        else:
+            run_col = _pick_first_existing(df.columns, RAW_POL_RUN_CODE_CANDIDATES)
+            if run_col is None:
+                raise ValueError(
+                    "POL_NIGHT_GROUP_MODE='run' requires a run-like column in the polarimetry CSV. "
+                    "Expected one of run/run_id/run_code/run_label/subrun/subrun_label."
+                )
+            vals = pd.Series(df[run_col]).map(_base_run_token).to_numpy(object)
+        return vals
+    if mode == "subrun":
+        if "subrun_label" in df.columns:
+            vals = df["subrun_label"].map(_normalize_run_token).to_numpy(object)
+        elif "run_label" in df.columns:
+            vals = df["run_label"].map(_normalize_run_token).to_numpy(object)
+        else:
+            run_col = _pick_first_existing(df.columns, RAW_POL_RUN_CODE_CANDIDATES)
+            if run_col is None:
+                raise ValueError(
+                    "POL_NIGHT_GROUP_MODE='subrun' requires a subrun-like column in the polarimetry CSV. "
+                    "Expected one of run/run_id/run_code/subrun/subrun_label."
+                )
+            vals = pd.Series(df[run_col]).map(_normalize_run_token).to_numpy(object)
+        return vals
+    raise ValueError(f"Unsupported label-based group mode: {mode}")
+
+def _clean_sort_with_group(t, y, yerr=None, t_abs=None, group_labels=None):
+    t = np.asarray(t, dtype=float)
+    y = np.asarray(y, dtype=float)
+    m = np.isfinite(t) & np.isfinite(y)
+    if yerr is not None:
+        yerr = np.asarray(yerr, dtype=float)
+        yerr = np.where(np.isfinite(yerr) & (yerr > 0), yerr, np.nan)
+        m &= np.isfinite(yerr)
+        yerr = yerr[m]
+    if t_abs is not None:
+        t_abs = np.asarray(t_abs, dtype=float)
+        m &= np.isfinite(t_abs)
+        t_abs = t_abs[m]
+    if group_labels is not None:
+        gl = np.asarray(group_labels, dtype=object)[m]
+    else:
+        gl = None
+    t, y = t[m], y[m]
+    idx = np.argsort(t)
+    t, y = t[idx], y[idx]
+    if yerr is not None:
+        yerr = yerr[idx]
+    if t_abs is not None:
+        t_abs = t_abs[idx]
+    if gl is not None:
+        gl = gl[idx]
+    return t, y, yerr, t_abs, gl
+
+def build_night_groups(t_abs: np.ndarray, mode: str = "gap", gap_days: float = 8.0/24.0,
+                       group_labels: np.ndarray | None = None) -> np.ndarray:
     t_abs = np.asarray(t_abs, dtype=float)
     if t_abs.size == 0:
         return np.array([], dtype=int)
     if mode == "integer_jd":
-        vals, inv = np.unique(np.floor(t_abs).astype(int), return_inverse=True)
+        _, inv = np.unique(np.floor(t_abs).astype(int), return_inverse=True)
         return inv.astype(int)
+    if mode in ("run", "subrun"):
+        if group_labels is None:
+            raise ValueError(f"POL_NIGHT_GROUP_MODE={mode!r} requires group_labels.")
+        return _factorize_group_labels(np.asarray(group_labels, dtype=object))
     if mode != "gap":
         raise ValueError(f"Unsupported group mode: {mode}")
     dt = np.diff(t_abs)
@@ -213,29 +330,253 @@ def build_night_groups(t_abs: np.ndarray, mode: str = "gap", gap_days: float = 8
     return group_id
 
 def _pick_first_existing(columns, candidates):
-    for c in candidates:
-        if c in columns:
-            return c
+    column_map = {str(c).strip().lower(): c for c in columns}
+    for candidate in candidates:
+        found = column_map.get(str(candidate).strip().lower())
+        if found is not None:
+            return found
     return None
 
-def _read_tess_csv_with_candidates(path: Path, y_candidates, label_prefix: str) -> tuple[np.ndarray, np.ndarray, np.ndarray, str]:
+
+def _infer_numeric_flux_column(df: pd.DataFrame, excluded=()) -> str | None:
+    excluded_lower = {str(c).strip().lower() for c in excluded}
+    reject_tokens = (
+        "time", "err", "error", "sigma", "uncert", "quality", "flag",
+        "model", "trend", "systematic", "background", "centroid", "phase",
+        "valid", "sample", "count", "npix", "camera", "sector", "cadence",
+    )
+    ranked = []
+    for col in df.columns:
+        name = str(col).strip()
+        lname = name.lower()
+        if lname in excluded_lower or "flux" not in lname:
+            continue
+        if any(token in lname for token in reject_tokens):
+            continue
+        numeric = pd.to_numeric(df[col], errors="coerce")
+        finite_fraction = float(np.mean(np.isfinite(numeric.to_numpy(float)))) if len(df) else 0.0
+        if finite_fraction < 0.5:
+            continue
+        score = 0
+        if "detrend" in lname or "corrected" in lname:
+            score += 40
+        if "relative" in lname or lname.endswith("_rel") or "normalized" in lname or "medscaled" in lname:
+            score += 20
+        if lname == "flux":
+            score += 5
+        ranked.append((score, finite_fraction, name))
+    if not ranked:
+        return None
+    ranked.sort(key=lambda item: (-item[0], -item[1], item[2]))
+    return ranked[0][2]
+
+
+def _tess_error_candidates_for_flux(y_col: str) -> list[str]:
+    lname = str(y_col).strip().lower()
+    candidates = list(TESS_ERROR_COL_CANDIDATES_BY_FLUX.get(lname, []))
+    for name in TESS_GENERIC_ERROR_COL_CANDIDATES:
+        if name not in candidates:
+            candidates.append(name)
+    return candidates
+
+
+def _tess_group_labels_from_frame(df: pd.DataFrame, path: Path) -> np.ndarray:
+    sector_col = _pick_first_existing(df.columns, ["sector", "tess_sector"])
+    source_col = _pick_first_existing(df.columns, ["source_file"])
+    if sector_col is not None:
+        labels = []
+        for i, value in enumerate(df[sector_col]):
+            if pd.notna(value) and str(value).strip() != "":
+                try:
+                    fval = float(value)
+                    if np.isfinite(fval) and fval.is_integer():
+                        labels.append(f"sector:{int(fval)}")
+                    else:
+                        labels.append(f"sector:{str(value).strip()}")
+                except Exception:
+                    labels.append(f"sector:{str(value).strip()}")
+            elif source_col is not None and pd.notna(df[source_col].iloc[i]):
+                labels.append(f"file:{str(df[source_col].iloc[i]).strip()}")
+            else:
+                labels.append(f"file:{path.name}")
+        return np.asarray(labels, dtype=object)
+    if source_col is not None:
+        return np.asarray([
+            f"file:{str(v).strip()}" if pd.notna(v) and str(v).strip() else f"file:{path.name}"
+            for v in df[source_col]
+        ], dtype=object)
+    return np.full(len(df), f"file:{path.name}", dtype=object)
+
+
+def _clean_sort_tess_arrays(t, y, yerr=None, t_abs=None, group_labels=None):
+    t = np.asarray(t, dtype=float)
+    y = np.asarray(y, dtype=float)
+    m = np.isfinite(t) & np.isfinite(y)
+    if t_abs is not None:
+        t_abs = np.asarray(t_abs, dtype=float)
+        m &= np.isfinite(t_abs)
+    if yerr is not None:
+        yerr = np.asarray(yerr, dtype=float)
+    if group_labels is not None:
+        group_labels = np.asarray(group_labels, dtype=object)
+    t = t[m]
+    y = y[m]
+    if t_abs is not None:
+        t_abs = t_abs[m]
+    if yerr is not None:
+        yerr = yerr[m]
+    if group_labels is not None:
+        group_labels = group_labels[m]
+    idx = np.argsort(t)
+    t = t[idx]
+    y = y[idx]
+    if t_abs is not None:
+        t_abs = t_abs[idx]
+    if yerr is not None:
+        yerr = yerr[idx]
+    if group_labels is not None:
+        group_labels = group_labels[idx]
+    return t, y, yerr, t_abs, group_labels
+
+
+def _robust_first_difference_sigma(t: np.ndarray, y: np.ndarray) -> float:
+    t = np.asarray(t, dtype=float)
+    y = np.asarray(y, dtype=float)
+    m = np.isfinite(t) & np.isfinite(y)
+    t = t[m]
+    y = y[m]
+    if y.size < 3:
+        return np.nan
+    idx = np.argsort(t)
+    t = t[idx]
+    y = y[idx]
+    dt = np.diff(t)
+    dy = np.diff(y)
+    good = np.isfinite(dt) & (dt > 0) & np.isfinite(dy)
+    positive_dt = dt[good]
+    if positive_dt.size:
+        med_dt = np.nanmedian(positive_dt)
+        if np.isfinite(med_dt) and med_dt > 0:
+            good &= dt <= 10.0 * med_dt
+    dy = dy[good]
+    if dy.size < 2:
+        return np.nan
+    center = np.nanmedian(dy)
+    mad = np.nanmedian(np.abs(dy - center))
+    if np.isfinite(mad) and mad > 0:
+        return float((1.4826 * mad) / np.sqrt(2.0))
+    std = np.nanstd(dy)
+    return float(std / np.sqrt(2.0)) if np.isfinite(std) and std > 0 else np.nan
+
+
+def _prepare_tess_errors(t: np.ndarray, y: np.ndarray, yerr_raw: np.ndarray | None,
+                         group_id: np.ndarray | None,
+                         mode: str | None = None,
+                         error_floor_frac: float | None = None) -> tuple[np.ndarray | None, list[dict]]:
+    mode = str(TESS_WEIGHT_MODE if mode is None else mode).strip().lower()
+    if mode not in {"none", "formal", "sector_rescaled"}:
+        raise ValueError(f"TESS_WEIGHT_MODE must be 'none', 'formal', or 'sector_rescaled'; got {mode!r}")
+    if mode == "none":
+        return None, []
+    if yerr_raw is None:
+        print(f"[TESS weights] mode={mode}: no matching normalized uncertainty column; using equal weights.")
+        return None, []
+    err = np.asarray(yerr_raw, dtype=float).copy()
+    good_global = np.isfinite(err) & (err > 0)
+    if np.count_nonzero(good_global) < 3:
+        print(f"[TESS weights] mode={mode}: fewer than three usable uncertainty values; using equal weights.")
+        return None, []
+    gid = np.zeros(len(err), dtype=int) if group_id is None else np.asarray(group_id, dtype=int)
+    if gid.shape != err.shape:
+        raise ValueError("TESS group_id and uncertainty arrays have different lengths.")
+    floor_frac = float(TESS_ERROR_FLOOR_FRAC if error_floor_frac is None else error_floor_frac)
+    if not np.isfinite(floor_frac) or floor_frac < 0:
+        raise ValueError("TESS_ERROR_FLOOR_FRAC must be finite and non-negative.")
+    global_med = float(np.nanmedian(err[good_global]))
+    diagnostics = []
+    for g in np.unique(gid):
+        m = gid == g
+        e = err[m]
+        good = np.isfinite(e) & (e > 0)
+        group_med = float(np.nanmedian(e[good])) if np.any(good) else global_med
+        if not np.isfinite(group_med) or group_med <= 0:
+            group_med = global_med
+        e = np.where(good, e, group_med)
+        scatter = _robust_first_difference_sigma(np.asarray(t)[m], np.asarray(y)[m])
+        scale = 1.0
+        if mode == "sector_rescaled" and np.count_nonzero(m) >= int(TESS_SECTOR_RESCALE_MIN_POINTS):
+            if np.isfinite(scatter) and scatter > 0 and group_med > 0:
+                scale = float(np.clip(scatter / group_med, float(TESS_SECTOR_SCALE_MIN), float(TESS_SECTOR_SCALE_MAX)))
+        e = e * scale
+        med_scaled = float(np.nanmedian(e[np.isfinite(e) & (e > 0)]))
+        floor_value = floor_frac * med_scaled if np.isfinite(med_scaled) else 0.0
+        if floor_value > 0:
+            e = np.maximum(e, floor_value)
+        err[m] = e
+        diagnostics.append({
+            "group": int(g), "n": int(np.count_nonzero(m)),
+            "formal_median": group_med, "robust_fd_sigma": scatter,
+            "scale_factor": scale, "used_median": float(np.nanmedian(e)),
+            "floor_value": floor_value,
+        })
+    final_good = np.isfinite(err) & (err > 0)
+    if np.count_nonzero(final_good) != len(err):
+        final_med = float(np.nanmedian(err[final_good])) if np.any(final_good) else global_med
+        err = np.where(final_good, err, final_med)
+    print(f"[TESS weights] mode={mode} | groups={len(diagnostics)} | floor_frac={floor_frac:g}")
+    for row in diagnostics:
+        print(
+            "  group={group} N={n} formal_med={formal_median:.6g} "
+            "fd_sigma={robust_fd_sigma:.6g} scale={scale_factor:.6g} "
+            "used_med={used_median:.6g} floor={floor_value:.6g}".format(**row)
+        )
+    return err, diagnostics
+
+
+def _read_tess_csv_with_candidates(path: Path, y_candidates, label_prefix: str = "tess"):
     df = pd.read_csv(path)
-    if TESS_TIME_COL not in df.columns:
-        raise ValueError(f"{path}: missing '{TESS_TIME_COL}'. Found: {list(df.columns)}")
-    y_col = _pick_first_existing(df.columns, y_candidates)
-    if y_col is None:
-        raise ValueError(f"{path}: missing any of {list(y_candidates)}. Found: {list(df.columns)}")
-    t_abs = df[TESS_TIME_COL].to_numpy(dtype=float)
-    y = df[y_col].to_numpy(dtype=float)
+    time_col = _pick_first_existing(df.columns, TESS_TIME_COL_CANDIDATES)
+    if time_col is None:
+        raise ValueError(f"{path}: missing a recognized TESS time column. Found: {list(df.columns)}")
+    if TESS_FORCE_Y_COL is not None and str(TESS_FORCE_Y_COL).strip():
+        y_col = _pick_first_existing(df.columns, [TESS_FORCE_Y_COL])
+        if y_col is None:
+            raise ValueError(f"{path}: required TESS column {TESS_FORCE_Y_COL!r} not found. Found: {list(df.columns)}")
+    else:
+        # flux_selected_rel is an explicit science-stream choice written by the
+        # SPOC converter, so honor it ahead of generic raw/detrended heuristics.
+        y_col = _pick_first_existing(df.columns, ["flux_selected_rel"])
+        if y_col is None:
+            y_col = _pick_first_existing(df.columns, y_candidates)
+        if y_col is None:
+            y_col = _infer_numeric_flux_column(df, excluded=[time_col])
+        if y_col is None:
+            raise ValueError(f"{path}: missing a usable flux column. Found: {list(df.columns)}")
+    err_col = _pick_first_existing(df.columns, _tess_error_candidates_for_flux(str(y_col)))
+    t_abs = pd.to_numeric(df[time_col], errors="coerce").to_numpy(dtype=float)
+    y = pd.to_numeric(df[y_col], errors="coerce").to_numpy(dtype=float)
+    yerr_raw = pd.to_numeric(df[err_col], errors="coerce").to_numpy(dtype=float) if err_col is not None else None
+    group_labels = _tess_group_labels_from_frame(df, Path(path))
     t_rel = t_abs - np.nanmin(t_abs)
-    t_rel, y, _, t_abs = _clean_sort(t_rel, y, None, t_abs=t_abs)
-    return t_rel, y, t_abs, y_col
+    t_rel, y, yerr_raw, t_abs, group_labels = _clean_sort_tess_arrays(
+        t_rel, y, yerr_raw, t_abs=t_abs, group_labels=group_labels
+    )
+    print(f"Using TESS file: {path} | time={time_col} | flux={y_col} | error={err_col or 'none'}")
+    return t_rel, y, yerr_raw, t_abs, group_labels, str(y_col), (None if err_col is None else str(err_col))
+
 
 def load_tess_csv(path: Path) -> TimeSeries:
-    _, y, t_abs, y_col = _read_tess_csv_with_candidates(path, TESS_Y_COL_CANDIDATES, "spoc_csv")
-    t_rel = t_abs - np.nanmin(t_abs)
-    t_rel, y, _, t_abs = _clean_sort(t_rel, y, None, t_abs=t_abs)
-    return TimeSeries(t=t_rel, y=y, yerr=None, name=f"tess({y_col})", t_abs=t_abs, group_id=None)
+    t_rel, y, yerr_raw, t_abs, labels, y_col, err_col = _read_tess_csv_with_candidates(
+        path, TESS_Y_COL_CANDIDATES, "spoc_csv"
+    )
+    group_id = _factorize_group_labels(labels) if labels is not None else np.zeros(len(y), dtype=int)
+    yerr, _ = _prepare_tess_errors(t_rel, y, yerr_raw, group_id)
+    return TimeSeries(
+        t=t_rel, y=y, yerr=yerr,
+        name=f"tess({y_col}; err={err_col or 'none'}; weights={TESS_WEIGHT_MODE})",
+        t_abs=t_abs, group_id=group_id,
+    )
+
 
 def load_tess_pipeline_dir(dirpath: Path, flux_mode: str = "raw", pattern: str = "*.csv", recursive: bool = False) -> TimeSeries:
     dirpath = Path(dirpath)
@@ -255,11 +596,13 @@ def load_tess_pipeline_dir(dirpath: Path, flux_mode: str = "raw", pattern: str =
     else:
         raise ValueError(f"TESS_PIPELINE_FLUX must be 'raw', 'detrended', or 'auto'. Got: {flux_mode}")
 
-    t_all, y_all, file_names, used_cols = [], [], [], []
+    t_all, y_all, err_all, label_all = [], [], [], []
+    file_names, used_cols, used_err_cols = [], [], []
     skipped = []
+    any_error_column = False
     for path in files:
         try:
-            _, y, t_abs, y_col = _read_tess_csv_with_candidates(path, candidates, "pipeline_dir")
+            _, y, yerr_raw, t_abs, labels, y_col, err_col = _read_tess_csv_with_candidates(path, candidates, "pipeline_dir")
         except Exception as exc:
             skipped.append((path.name, str(exc)))
             continue
@@ -268,8 +611,12 @@ def load_tess_pipeline_dir(dirpath: Path, flux_mode: str = "raw", pattern: str =
             continue
         t_all.append(t_abs)
         y_all.append(y)
+        err_all.append(yerr_raw if yerr_raw is not None else np.full(len(y), np.nan, dtype=float))
+        any_error_column = any_error_column or (yerr_raw is not None)
+        label_all.append(labels if labels is not None else np.full(len(y), f"file:{path.name}", dtype=object))
         file_names.append(path.name)
         used_cols.append(y_col)
+        used_err_cols.append(err_col or "none")
 
     if not t_all:
         msg = f"No usable TESS pipeline CSVs found in {dirpath} matching {pattern!r}"
@@ -279,25 +626,29 @@ def load_tess_pipeline_dir(dirpath: Path, flux_mode: str = "raw", pattern: str =
 
     t_abs = np.concatenate(t_all)
     y = np.concatenate(y_all)
+    yerr_raw = np.concatenate(err_all) if any_error_column else None
+    labels = np.concatenate(label_all)
     t_rel = t_abs - np.nanmin(t_abs)
-    t_rel, y, _, t_abs = _clean_sort(t_rel, y, None, t_abs=t_abs)
+    t_rel, y, yerr_raw, t_abs, labels = _clean_sort_tess_arrays(
+        t_rel, y, yerr_raw, t_abs=t_abs, group_labels=labels
+    )
+    group_id = _factorize_group_labels(labels)
+    yerr, _ = _prepare_tess_errors(t_rel, y, yerr_raw, group_id)
 
     print(f"Loaded {len(file_names)} TESS pipeline CSV file(s) from {dirpath}")
-    uniq_cols = sorted(set(used_cols))
-    print("  flux columns used:", uniq_cols)
+    print("  flux columns used:", sorted(set(used_cols)))
+    print("  error columns used:", sorted(set(used_err_cols)))
     if skipped:
         print(f"  skipped {len(skipped)} file(s) that did not match the requested format")
         for name, reason in skipped[:5]:
             print("   -", name, "->", reason)
 
     return TimeSeries(
-        t=t_rel,
-        y=y,
-        yerr=None,
-        name=f"tess_pipeline({mode}; {len(file_names)} files)",
-        t_abs=t_abs,
-        group_id=None,
+        t=t_rel, y=y, yerr=yerr,
+        name=f"tess_pipeline({mode}; {len(file_names)} files; weights={TESS_WEIGHT_MODE})",
+        t_abs=t_abs, group_id=group_id,
     )
+
 
 def load_tess_input() -> TimeSeries:
     mode = str(TESS_INPUT_MODE).lower()
@@ -313,7 +664,6 @@ def load_tess_input() -> TimeSeries:
     raise ValueError(f"TESS_INPUT_MODE must be 'spoc_csv' or 'pipeline_dir'. Got: {TESS_INPUT_MODE}")
 
 def load_polarimetry_csv(path: Path, product: str, trend_cfg: NightTrendConfig) -> dict:
-    star_label, _star_safe = infer_star_labels_from_pol_path(path)
     if product not in POL_PRODUCTS:
         raise ValueError(f"POL_PRODUCT must be one of {list(POL_PRODUCTS.keys())}. Got: {product}")
     df = pd.read_csv(path)
@@ -328,13 +678,17 @@ def load_polarimetry_csv(path: Path, product: str, trend_cfg: NightTrendConfig) 
     t0 = np.nanmin(t_abs)
     t_rel = t_abs - t0
 
+    group_labels = None
+    if trend_cfg.group_mode in ("run", "subrun"):
+        group_labels = get_polarimetry_group_labels(df, trend_cfg.group_mode)
+
     out = {}
     for k in ["q", "u", "p"]:
         y = df[POL_PRODUCTS[product][k]].to_numpy(dtype=float)
         yerr = df[POL_ERR_COLS[k]].to_numpy(dtype=float)
-        tt, yy, ee, ta = _clean_sort(t_rel, y, yerr, t_abs=t_abs)
-        gid = build_night_groups(ta, mode=trend_cfg.group_mode, gap_days=trend_cfg.gap_days)
-        out[k] = TimeSeries(t=tt, y=yy, yerr=ee, name=f"{star_label} {k}", t_abs=ta, group_id=gid)
+        tt, yy, ee, ta, glab = _clean_sort_with_group(t_rel, y, yerr, t_abs=t_abs, group_labels=group_labels)
+        gid = build_night_groups(ta, mode=trend_cfg.group_mode, gap_days=trend_cfg.gap_days, group_labels=glab)
+        out[k] = TimeSeries(t=tt, y=yy, yerr=ee, name=f"pol_{k}", t_abs=ta, group_id=gid)
     return out
 
 def detrend_poly(ts: TimeSeries, order: int = 1) -> TimeSeries:
@@ -374,15 +728,15 @@ def estimate_scale_free_weight(ts: TimeSeries, basis: str = "tseg") -> float:
         return np.sqrt(tseg)
     raise ValueError(f"Unknown SCALE_FREE_WEIGHT_BASIS={basis!r}")
 
-def estimate_dataset_weight(ts: TimeSeries, mode: str = "equal", scale_free_basis: str = "tseg", manual_weight: float | None = None) -> float:
+def estimate_dataset_weight(ts: TimeSeries, mode: str = "equal", scale_free_basis: str = "tseg") -> float:
     mode = str(mode).lower()
     if mode == "equal":
         return 1.0
     if mode == "scale_free":
         return estimate_scale_free_weight(ts, basis=scale_free_basis)
     if mode == "manual":
-        w = 1.0 if manual_weight is None else float(manual_weight)
-        return w if np.isfinite(w) and (w > 0) else 1.0
+        nm = str(getattr(ts, "name", "")).lower()
+        return float(MANUAL_W_TESS) if "tess" in nm else float(MANUAL_W_POL)
     raise ValueError(f"Unknown JOINT_WEIGHT_MODE={mode!r}")
 
 def compute_T_full(ts: TimeSeries) -> float:
@@ -405,15 +759,9 @@ def longest_contiguous_segment_duration(t: np.ndarray, gap_days: float) -> float
 def compute_Tseg(ts: TimeSeries, gap_days: float = 1.0) -> float:
     return longest_contiguous_segment_duration(ts.t, gap_days=gap_days)
 
-def make_frequency_grid(fmin: float, fmax: float, df: float, max_points: int | None = None) -> np.ndarray:
-    if not np.isfinite(df) or df <= 0:
-        raise ValueError("Frequency spacing df must be finite and positive.")
+def make_frequency_grid(fmin: float, fmax: float, df: float) -> np.ndarray:
     n = int(np.floor((fmax - fmin) / df)) + 1
-    if n <= 1:
-        return np.array([fmin], dtype=float)
-    if max_points is not None and n > int(max_points):
-        return np.linspace(fmin, fmax, int(max_points), dtype=float)
-    return fmin + df * np.arange(max(n, 1), dtype=float)
+    return fmin + df * np.arange(max(n, 1))
 
 def lomb_scargle_power(ts: TimeSeries, freqs: np.ndarray) -> np.ndarray:
     if _HAVE_ASTROPY:
@@ -598,304 +946,20 @@ def signal_from_beta(t: np.ndarray, f: float, beta: np.ndarray) -> np.ndarray:
 def baseline_from_beta(baseline_matrix: np.ndarray, beta: np.ndarray) -> np.ndarray:
     return baseline_matrix @ beta[2:]
 
-
-def weighted_linear_solve_with_cov(y: np.ndarray, X: np.ndarray, w: np.ndarray | None = None) -> dict:
-    y = np.asarray(y, dtype=float)
-    X = np.asarray(X, dtype=float)
-    if w is None:
-        w = np.ones_like(y, dtype=float)
-    else:
-        w = np.asarray(w, dtype=float)
-        w = np.where(np.isfinite(w) & (w > 0), w, 0.0)
-    sw = np.sqrt(w)
-    Xw = X * sw[:, None]
-    yw = y * sw
-    beta, *_ = np.linalg.lstsq(Xw, yw, rcond=None)
-    yhat = X @ beta
-    resid = y - yhat
-    rss = float(np.sum(w * resid * resid))
-    try:
-        xtwx = Xw.T @ Xw
-        cov = np.linalg.pinv(xtwx)
-        dof = max(int(np.count_nonzero(w > 0)) - X.shape[1], 1)
-        sigma2 = rss / float(dof)
-        cov = cov * sigma2
-    except Exception:
-        cov = np.full((X.shape[1], X.shape[1]), np.nan, dtype=float)
-    return {"beta": beta, "yhat": yhat, "rss": rss, "resid": resid, "cov": cov}
-
-def amp_uncertainty_from_cov(s_coeff: float, c_coeff: float, cov_sc: np.ndarray | None) -> float:
-    if cov_sc is None:
-        return np.nan
-    cov_sc = np.asarray(cov_sc, dtype=float)
-    if cov_sc.shape != (2, 2) or not np.isfinite(cov_sc).any():
-        return np.nan
-    amp = float(np.hypot(s_coeff, c_coeff))
-    if amp > 0 and np.isfinite(amp):
-        grad = np.array([s_coeff / amp, c_coeff / amp], dtype=float)
-    else:
-        grad = np.array([1.0 / np.sqrt(2.0), 1.0 / np.sqrt(2.0)], dtype=float)
-    try:
-        var = float(grad @ cov_sc @ grad)
-    except Exception:
-        return np.nan
-    if not np.isfinite(var) or var < 0:
-        return np.nan
-    return float(np.sqrt(var))
-
-
-def phase_uncertainty_from_cov(s_coeff: float, c_coeff: float, cov_sc: np.ndarray | None) -> float:
-    if cov_sc is None:
-        return np.nan
-    cov_sc = np.asarray(cov_sc, dtype=float)
-    if cov_sc.shape != (2, 2) or not np.isfinite(cov_sc).any():
-        return np.nan
-    amp2 = float(s_coeff * s_coeff + c_coeff * c_coeff)
-    if not np.isfinite(amp2) or amp2 <= 0:
-        return np.nan
-    grad = np.array([-c_coeff / amp2, s_coeff / amp2], dtype=float)
-    try:
-        var = float(grad @ cov_sc @ grad)
-    except Exception:
-        return np.nan
-    if not np.isfinite(var) or var < 0:
-        return np.nan
-    return float(np.sqrt(var))
-
-def safe_period_days(freq):
-    arr = pd.to_numeric(pd.Series(freq), errors="coerce").to_numpy(dtype=float)
-    out = np.full(arr.shape, np.nan, dtype=float)
-    m = np.isfinite(arr) & (arr > 0)
-    out[m] = 1.0 / arr[m]
-    return out
-
-def add_period_columns(df: pd.DataFrame, mappings: list[tuple[str, str]]) -> pd.DataFrame:
-    if df is None:
-        return df
-    out = df.copy()
-    insert_offset = 0
-    for fcol, pcol in mappings:
-        if fcol not in out.columns:
-            continue
-        period = safe_period_days(out[fcol])
-        loc = out.columns.get_loc(fcol) + 1 + insert_offset
-        if pcol in out.columns:
-            out[pcol] = period
-        else:
-            out.insert(loc, pcol, period)
-        insert_offset += 1
-    return out
-
-def make_fullbaseline_plot_frequency_grid(ts: TimeSeries, oversample: float = 1.0,
-                                          max_points: int = 2400) -> np.ndarray:
-    Tfull = max(compute_T_full(ts), 1e-8)
-    df = (1.0 / Tfull) / max(oversample, 1e-8)
-    return make_frequency_grid(FMIN, FMAX, df, max_points=max_points)
-
-def amplitude_spectrum_joint(ts: TimeSeries, freqs: np.ndarray, baseline_matrix: np.ndarray) -> np.ndarray:
-    freqs = np.asarray(freqs, dtype=float)
-    amps = np.full_like(freqs, np.nan, dtype=float)
-    if ts.yerr is not None:
-        w = 1.0 / np.square(ts.yerr)
-        w = np.where(np.isfinite(w) & (w > 0), w, 0.0)
-    else:
-        w = np.ones_like(ts.y)
-    for i, f in enumerate(freqs):
-        X = design_matrix_with_sinusoid(ts.t, float(f), baseline_matrix)
-        fit = weighted_linear_solve_with_cov(ts.y, X, w)
-        beta = np.asarray(fit["beta"], dtype=float)
-        if beta.size >= 2:
-            amps[i] = float(np.hypot(beta[0], beta[1]))
-    return amps
-
-def _summary_xlim_from_table(summary_df: pd.DataFrame, freq_cols: list[str]) -> float:
-    vals = []
-    for c in freq_cols:
-        if c in summary_df.columns:
-            arr = pd.to_numeric(summary_df[c], errors="coerce").to_numpy(dtype=float)
-            arr = arr[np.isfinite(arr)]
-            if arr.size:
-                vals.append(arr)
-    if not vals:
-        return min(10.0, float(FMAX))
-    vmax = float(np.nanmax(np.concatenate(vals)))
-    if not np.isfinite(vmax):
-        return min(10.0, float(FMAX))
-    return min(float(FMAX), max(10.0, 1.15 * vmax))
-
-def _summary_ylim_from_amp(amp: np.ndarray) -> float:
-    arr = np.asarray(amp, dtype=float)
-    arr = arr[np.isfinite(arr)]
-    if arr.size == 0:
-        return 1.0
-    hi = np.nanpercentile(arr, 99.5)
-    if not np.isfinite(hi) or hi <= 0:
-        hi = np.nanmax(arr)
-    if not np.isfinite(hi) or hi <= 0:
-        hi = 1.0
-    return 1.15 * float(hi)
-
-def build_joint_summary_table(channel_results: dict[str, pd.DataFrame], tess_ts: TimeSeries) -> pd.DataFrame:
-    min_sep = max((1.0 / max(compute_T_full(tess_ts), 1e-8)) * MIN_FREQ_SEP_MULT, 1e-8)
-    master = []
-    for ch, df in channel_results.items():
-        if df is None or df.empty:
-            continue
-        for _, r in df.iterrows():
-            f = pd.to_numeric(pd.Series([r.get("f_tess", np.nan)]), errors="coerce").to_numpy(dtype=float)[0]
-            snr = pd.to_numeric(pd.Series([r.get("snr_tess", np.nan)]), errors="coerce").to_numpy(dtype=float)[0]
-            if not (np.isfinite(f) and np.isfinite(snr) and (snr >= SNR_STOP)):
-                continue
-            master.append({
-                "tess_f_cd": float(f),
-                "tess_amp_rel": float(r.get("amp_tess", np.nan)),
-                "tess_amp_err_rel": float(r.get("amp_tess_err", np.nan)),
-                "tess_phase_rad": float(r.get("phase_tess", np.nan)),
-                "tess_phase_err_rad": float(r.get("phase_tess_err", np.nan)),
-                "tess_snr": float(snr),
-            })
-    cols = [
-        "mode", "tess_f_cd", "tess_period_d", "tess_amp_ppt", "tess_amp_err_ppt", "tess_phase_rad", "tess_phase_err_rad",
-        "q_f_cd", "q_period_d", "q_amp_ppm", "q_amp_err_ppm", "q_phase_rad", "q_phase_err_rad",
-        "u_f_cd", "u_period_d", "u_amp_ppm", "u_amp_err_ppm", "u_phase_rad", "u_phase_err_rad",
-        "p_f_cd", "p_period_d", "p_amp_ppm", "p_amp_err_ppm", "p_phase_rad", "p_phase_err_rad",
-    ]
-    if not master:
-        return pd.DataFrame(columns=cols)
-    mdf = pd.DataFrame(master).sort_values(["tess_snr", "tess_amp_rel"], ascending=[False, False]).reset_index(drop=True)
-    kept = []
-    for _, r in mdf.iterrows():
-        f = float(r["tess_f_cd"])
-        if all(abs(f - float(k["tess_f_cd"])) >= min_sep for k in kept):
-            kept.append(r.to_dict())
-    tdf = pd.DataFrame(kept).sort_values("tess_f_cd").reset_index(drop=True)
-    rows = []
-    for i, tr in tdf.iterrows():
-        tf = float(tr["tess_f_cd"])
-        row = {"mode": i + 1, "tess_f_cd": tf,
-               "tess_period_d": np.nan if not (np.isfinite(tf) and tf > 0) else 1.0 / tf,
-               "tess_amp_ppt": np.nan if not np.isfinite(tr.get("tess_amp_rel", np.nan)) else 1000.0 * float(tr.get("tess_amp_rel", np.nan)),
-               "tess_amp_err_ppt": np.nan if not np.isfinite(tr.get("tess_amp_err_rel", np.nan)) else 1000.0 * float(tr.get("tess_amp_err_rel", np.nan)),
-               "tess_phase_rad": float(tr.get("tess_phase_rad", np.nan)),
-               "tess_phase_err_rad": float(tr.get("tess_phase_err_rad", np.nan))}
-        for ch in ["q","u","p"]:
-            df = channel_results.get(ch)
-            fcol=f"{ch}_f_cd"; pcol=f"{ch}_period_d"; acol=f"{ch}_amp_ppm"; aecol=f"{ch}_amp_err_ppm"; phcol=f"{ch}_phase_rad"; phecol=f"{ch}_phase_err_rad"
-            row.update({fcol:np.nan,pcol:np.nan,acol:np.nan,aecol:np.nan,phcol:np.nan,phecol:np.nan})
-            if df is None or df.empty:
-                continue
-            tmp = df.copy()
-            tmp["__dist__"] = np.abs(pd.to_numeric(tmp["f_tess"], errors="coerce") - tf)
-            tmp = tmp.sort_values(["__dist__", "snr_pol"], ascending=[True, False])
-            pr = tmp.iloc[0]
-            pf = float(pr.get("f_pol", np.nan)) if np.isfinite(pr.get("f_pol", np.nan)) else np.nan
-            pa = float(pr.get("amp_pol", np.nan)) if np.isfinite(pr.get("amp_pol", np.nan)) else np.nan
-            pae = float(pr.get("amp_pol_err", np.nan)) if np.isfinite(pr.get("amp_pol_err", np.nan)) else np.nan
-            row[fcol]=pf; row[pcol]=np.nan if not (np.isfinite(pf) and pf>0) else 1.0/pf; row[acol]=pa; row[aecol]=pae
-            row[phcol]=float(pr.get("phase_pol", np.nan)) if np.isfinite(pr.get("phase_pol", np.nan)) else np.nan
-            row[phecol]=float(pr.get("phase_pol_err", np.nan)) if np.isfinite(pr.get("phase_pol_err", np.nan)) else np.nan
-        rows.append(row)
-    return pd.DataFrame(rows, columns=cols)
-
-
-
-def _summary_period_xlim_from_table(summary_df: pd.DataFrame, period_cols: list[str]) -> float:
-    vals = []
-    for c in period_cols:
-        if c in summary_df.columns:
-            arr = pd.to_numeric(summary_df[c], errors="coerce").to_numpy(dtype=float)
-            arr = arr[np.isfinite(arr)]
-            if arr.size:
-                vals.append(arr)
-    if not vals:
-        return max(2.0, 1.0 / max(float(FMAX), 1e-8))
-    vmax = float(np.nanmax(np.concatenate(vals)))
-    if not np.isfinite(vmax) or vmax <= 0:
-        return max(2.0, 1.0 / max(float(FMAX), 1e-8))
-    return 1.15 * vmax
-
-def _plot_joint_summary_spectrum_panels(summary_df: pd.DataFrame, panels: list[tuple[np.ndarray, np.ndarray, str, str, str, str]],
-                                        outpath: Path, x_mode: str = "frequency", y_scale: str = "linear",
-                                        show_plots_inline: bool = False):
-    fig, axes = plt.subplots(nrows=3, ncols=1, figsize=(11, 9.5), sharex=True)
-    x_mode = str(x_mode).lower(); y_scale = str(y_scale).lower()
-    xmax = _summary_period_xlim_from_table(summary_df, ["tess_period_d","q_period_d","u_period_d","p_period_d"]) if x_mode=="period" else _summary_xlim_from_table(summary_df, ["tess_f_cd","q_f_cd","u_f_cd","p_f_cd"])
-    for ax, (freqs, amp, fcol, pcol, ylabel, title) in zip(axes, panels):
-        freqs = np.asarray(freqs, dtype=float); amp = np.asarray(amp, dtype=float)
-        if x_mode=="period":
-            m = np.isfinite(freqs) & (freqs > 0) & np.isfinite(amp)
-            x = 1.0/freqs[m]; y = amp[m]
-            order = np.argsort(x); x=x[order]; y=y[order]
-            line_vals = pd.to_numeric(summary_df.get(pcol), errors="coerce").to_numpy(dtype=float) if pcol in summary_df.columns else np.array([], dtype=float)
-        else:
-            m = np.isfinite(freqs) & np.isfinite(amp)
-            x = freqs[m]; y = amp[m]
-            line_vals = pd.to_numeric(summary_df.get(fcol), errors="coerce").to_numpy(dtype=float) if fcol in summary_df.columns else np.array([], dtype=float)
-        if y_scale=="log":
-            m2 = np.isfinite(y) & (y > 0); x=x[m2]; y=y[m2]
-            ax.semilogy(x,y,lw=0.9,color="k")
-            if y.size:
-                ymin = max(np.nanpercentile(y,2.0), np.nanmin(y[y>0]))
-                ymax = max(np.nanpercentile(y,99.5)*1.2, ymin*5.0)
-                ax.set_ylim(ymin, ymax)
-        else:
-            ax.plot(x,y,lw=0.9,color="k")
-            ax.set_ylim(0.0, _summary_ylim_from_amp(y))
-        for f in line_vals:
-            if np.isfinite(f):
-                ax.axvline(float(f), color="red", lw=0.8)
-        ax.set_ylabel(ylabel); ax.set_title(title)
-        ax.set_xlim(0.0 if x_mode=="period" else float(FMIN), xmax)
-        ax.grid(alpha=0.15)
-    axes[-1].set_xlabel("Period [d]" if x_mode=="period" else "Frequency [c/d]")
-    fig.tight_layout()
-    fig.savefig(outpath, dpi=180, bbox_inches="tight")
-    if show_plots_inline:
-        plt.show()
-    plt.close(fig)
-
-def plot_joint_summary_amplitude_spectra(summary_df: pd.DataFrame, tess_ts: TimeSeries, pol_dict: dict[str, TimeSeries],
-                                         trend_cfg: NightTrendConfig, outpath: Path,
-                                         show_plots_inline: bool = False):
-    if summary_df is None or summary_df.empty:
-        return
-    freqs_t = make_fullbaseline_plot_frequency_grid(tess_ts, oversample=1.0, max_points=2400)
-    amp_t = 1000.0 * amplitude_spectrum_joint(tess_ts, freqs_t, make_tess_baseline_matrix(tess_ts))
-    q_ts = pol_dict.get("q"); u_ts = pol_dict.get("u")
-    if q_ts is None or u_ts is None:
-        return
-    freqs_q = make_fullbaseline_plot_frequency_grid(q_ts, oversample=1.0, max_points=2400)
-    amp_q = amplitude_spectrum_joint(q_ts, freqs_q, make_pol_baseline_matrix(q_ts, trend_cfg))
-    freqs_u = make_fullbaseline_plot_frequency_grid(u_ts, oversample=1.0, max_points=2400)
-    amp_u = amplitude_spectrum_joint(u_ts, freqs_u, make_pol_baseline_matrix(u_ts, trend_cfg))
-    panels = [(freqs_t, amp_t, "tess_f_cd", "tess_period_d", "Amplitude (ppt)", "TESS photometry"),
-              (freqs_q, amp_q, "q_f_cd", "q_period_d", "Amplitude (ppm)", "q polarimetry"),
-              (freqs_u, amp_u, "u_f_cd", "u_period_d", "Amplitude (ppm)", "u polarimetry")]
-    _plot_joint_summary_spectrum_panels(summary_df, panels, outpath, x_mode="frequency", y_scale="linear", show_plots_inline=show_plots_inline)
-    stem = outpath.stem; suffix = outpath.suffix or ".png"; parent = outpath.parent
-    if SUMMARY_SAVE_PERIOD_VERSION:
-        _plot_joint_summary_spectrum_panels(summary_df, panels, parent / f"{stem}_period{suffix}", x_mode="period", y_scale="linear", show_plots_inline=show_plots_inline)
-    if SUMMARY_SAVE_LOG_AMPLITUDE_VERSION:
-        _plot_joint_summary_spectrum_panels(summary_df, panels, parent / f"{stem}_log{suffix}", x_mode="frequency", y_scale="log", show_plots_inline=show_plots_inline)
-    if SUMMARY_SAVE_PERIOD_VERSION and SUMMARY_SAVE_LOG_AMPLITUDE_VERSION:
-        _plot_joint_summary_spectrum_panels(summary_df, panels, parent / f"{stem}_period_log{suffix}", x_mode="period", y_scale="log", show_plots_inline=show_plots_inline)
-
-
-def save_summary_table(summary_df: pd.DataFrame, csv_path: Path, xlsx_path: Path | None = None):
-    summary_df.to_csv(csv_path, index=False)
-    if xlsx_path is not None:
-        try:
-            summary_df.to_excel(xlsx_path, index=False)
-        except Exception as exc:
-            print(f"[summary] could not write Excel table {xlsx_path}: {exc}")
-
+def signal_weights(ts: TimeSeries) -> np.ndarray:
+    if ts.yerr is None:
+        return np.ones_like(ts.y, dtype=float)
+    w = 1.0 / np.square(ts.yerr)
+    w = np.where(np.isfinite(w) & (w > 0), w, 0.0)
+    positive = w[w > 0]
+    if positive.size:
+        med = np.nanmedian(positive)
+        if np.isfinite(med) and med > 0:
+            w = w / med
+    return w
 
 def nuisance_periodogram(ts: TimeSeries, freqs: np.ndarray, baseline_matrix: np.ndarray) -> np.ndarray:
-    if ts.yerr is not None:
-        w = 1.0 / np.square(ts.yerr)
-        w = np.where(np.isfinite(w) & (w > 0), w, 0.0)
-    else:
-        w = np.ones_like(ts.y)
+    w = signal_weights(ts)
     null_fit = weighted_linear_solve(ts.y, baseline_matrix, w)
     rss0 = max(null_fit["rss"], 1e-30)
     power = np.full_like(freqs, np.nan, dtype=float)
@@ -917,11 +981,7 @@ def refine_peak(f0: float, df_ref: float, refine_factor: int, fmin: float, fmax:
 
 def fit_frequency_with_design(ts: TimeSeries, f0: float, T: float, kfit: float, fmin: float, fmax: float,
                               baseline_matrix: np.ndarray, n_steps: int = 2001) -> dict:
-    if ts.yerr is not None:
-        w = 1.0 / np.square(ts.yerr)
-        w = np.where(np.isfinite(w) & (w > 0), w, 0.0)
-    else:
-        w = np.ones_like(ts.y)
+    w = signal_weights(ts)
     df_fit = kfit * (2.0 / T)
     f_lo = max(fmin, f0 - df_fit)
     f_hi = min(fmax, f0 + df_fit)
@@ -930,7 +990,7 @@ def fit_frequency_with_design(ts: TimeSeries, f0: float, T: float, kfit: float, 
     fits = [None] * len(freqs)
     for i, f in enumerate(freqs):
         X = design_matrix_with_sinusoid(ts.t, f, baseline_matrix)
-        fit = weighted_linear_solve_with_cov(ts.y, X, w)
+        fit = weighted_linear_solve(ts.y, X, w)
         fits[i] = fit
         rss[i] = fit["rss"]
     j = int(np.nanargmin(rss))
@@ -938,113 +998,26 @@ def fit_frequency_with_design(ts: TimeSeries, f0: float, T: float, kfit: float, 
     fit_best = fits[j]
     beta = np.asarray(fit_best["beta"], dtype=float)
     amp, phase = sinusoid_coeffs_to_amp_phase(beta)
-    cov_sc = np.asarray(fit_best.get("cov", np.full((2, 2), np.nan)), dtype=float)[:2, :2]
-    amp_err = amp_uncertainty_from_cov(float(beta[0]), float(beta[1]), cov_sc)
-    phase_err = phase_uncertainty_from_cov(float(beta[0]), float(beta[1]), cov_sc)
     signal_model = signal_from_beta(ts.t, f_best, beta)
     baseline_model = baseline_from_beta(baseline_matrix, beta)
     full_model = signal_model + baseline_model
-    return {"best_f": f_best, "amp": amp, "phase": phase, "amp_err": amp_err, "phase_err": phase_err,
-            "rss": float(fit_best["rss"]), "beta": beta, "signal_model": signal_model,
-            "baseline_model": baseline_model, "full_model": full_model, "resid": ts.y - full_model,
-            "df_fit": float(df_fit), "cov": np.asarray(fit_best.get("cov", np.full((len(beta), len(beta)), np.nan)), dtype=float)}
-
+    return {
+        "best_f": f_best,
+        "amp": amp,
+        "phase": phase,
+        "rss": float(fit_best["rss"]),
+        "beta": beta,
+        "signal_model": signal_model,
+        "baseline_model": baseline_model,
+        "full_model": full_model,
+        "resid": ts.y - full_model,
+        "df_fit": float(df_fit)
+    }
 
 def local_snr_from_power(freqs: np.ndarray, power: np.ndarray, f_fit: float, T: float, ks: float) -> tuple[float, float]:
     noise = local_noise_floor(freqs, power, f_fit, T=T, kfit=KFIT, ks=ks, trim_top_frac=TRIM_TOP_FRAC)
     j = int(np.argmin(np.abs(freqs - f_fit)))
     p0 = float(power[j])
-    W = float(p0 / noise) if (np.isfinite(noise) and noise > 0) else np.nan
-    snr = float(np.sqrt(W)) if np.isfinite(W) and W > 0 else np.nan
-    return snr, W
-
-
-def make_local_frequency_grid(center: float, half_window: float, df: float,
-                              fmin: float = FMIN, fmax: float = FMAX,
-                              max_points: int = 1201) -> np.ndarray:
-    f_lo = max(float(fmin), float(center) - float(half_window))
-    f_hi = min(float(fmax), float(center) + float(half_window))
-    if not np.isfinite(df) or df <= 0:
-        raise ValueError("Local-grid spacing must be finite and positive.")
-    if f_hi <= f_lo:
-        return np.array([float(center)], dtype=float)
-    n = int(np.floor((f_hi - f_lo) / df)) + 1
-    n = max(n, 11)
-    if max_points is not None and n > int(max_points):
-        n = int(max_points)
-    return np.linspace(f_lo, f_hi, n, dtype=float)
-
-def local_noise_floor_from_local_periodogram(freqs: np.ndarray, power: np.ndarray, f_fit: float,
-                                             guard_half: float, side_half: float,
-                                             trim_top_frac: float = TRIM_TOP_FRAC,
-                                             min_points: int = 12) -> tuple[float, int]:
-    freqs = np.asarray(freqs, dtype=float)
-    power = np.asarray(power, dtype=float)
-    if freqs.size < 5 or power.size != freqs.size:
-        return np.nan, 0
-    expand = 1.0
-    n_used = 0
-    for _ in range(6):
-        outer = guard_half + expand * side_half
-        m = np.isfinite(power) & (np.abs(freqs - f_fit) >= guard_half) & (np.abs(freqs - f_fit) <= outer)
-        vals = power[m]
-        n_used = int(np.count_nonzero(np.isfinite(vals)))
-        noise = trimmed_median(vals, trim_top_frac=trim_top_frac)
-        if np.isfinite(noise) and (noise > 0) and (n_used >= min_points):
-            return float(noise), n_used
-        expand *= 1.5
-    return np.nan, n_used
-
-def joint_tess_local_snr_from_fit(ts: TimeSeries, f_fit: float, T_noise: float, ks: float,
-                                  trim_top_frac: float = TRIM_TOP_FRAC) -> tuple[float, float]:
-    T_noise = max(float(T_noise), 1e-8)
-    res = 1.0 / T_noise
-    guard_half = max(KFIT * (2.0 / T_noise), 2.0 * res)
-    side_half = max(float(ks) * res, 4.0 * res)
-    half_window = guard_half + side_half
-    df_local = max(res / 5.0, 1e-8)
-    freqs_local = make_local_frequency_grid(f_fit, half_window, df_local, max_points=1201)
-    power_local = lomb_scargle_power(ts, freqs_local)
-    if not np.isfinite(power_local).any():
-        return np.nan, np.nan
-    m_peak = np.isfinite(power_local) & (np.abs(freqs_local - f_fit) <= guard_half)
-    if np.any(m_peak):
-        p0 = float(np.nanmax(power_local[m_peak]))
-    else:
-        j = int(np.nanargmin(np.abs(freqs_local - f_fit)))
-        p0 = float(power_local[j])
-    noise, _ = local_noise_floor_from_local_periodogram(
-        freqs_local, power_local, f_fit=f_fit, guard_half=guard_half,
-        side_half=side_half, trim_top_frac=trim_top_frac
-    )
-    W = float(p0 / noise) if (np.isfinite(noise) and noise > 0) else np.nan
-    snr = float(np.sqrt(W)) if np.isfinite(W) and W > 0 else np.nan
-    return snr, W
-
-def joint_pol_local_snr_from_fit(ts: TimeSeries, f_fit: float, T_noise: float, ks: float,
-                                 baseline_matrix: np.ndarray,
-                                 trim_top_frac: float = TRIM_TOP_FRAC) -> tuple[float, float]:
-    T_noise = max(float(T_noise), 1e-8)
-    res = 1.0 / T_noise
-    # Slightly wider than the TESS version because the polarimetric window is nastier.
-    guard_half = max(KFIT * (2.0 / T_noise), 3.0 * res)
-    side_half = max(float(ks) * res, 6.0 * res)
-    half_window = guard_half + side_half
-    df_local = max(res / 5.0, 1e-8)
-    freqs_local = make_local_frequency_grid(f_fit, half_window, df_local, max_points=1601)
-    power_local = nuisance_periodogram(ts, freqs_local, baseline_matrix=baseline_matrix)
-    if not np.isfinite(power_local).any():
-        return np.nan, np.nan
-    m_peak = np.isfinite(power_local) & (np.abs(freqs_local - f_fit) <= guard_half)
-    if np.any(m_peak):
-        p0 = float(np.nanmax(power_local[m_peak]))
-    else:
-        j = int(np.nanargmin(np.abs(freqs_local - f_fit)))
-        p0 = float(power_local[j])
-    noise, _ = local_noise_floor_from_local_periodogram(
-        freqs_local, power_local, f_fit=f_fit, guard_half=guard_half,
-        side_half=side_half, trim_top_frac=trim_top_frac
-    )
     W = float(p0 / noise) if (np.isfinite(noise) and noise > 0) else np.nan
     snr = float(np.sqrt(W)) if np.isfinite(W) and W > 0 else np.nan
     return snr, W
@@ -1059,13 +1032,6 @@ def prewhiten(ts: TimeSeries, model: np.ndarray) -> TimeSeries:
         group_id=None if ts.group_id is None else ts.group_id.copy()
     )
 
-def phase_fold(t: np.ndarray, f: float, t_ref: float = 0.0) -> np.ndarray:
-    phase = ((t - t_ref) * f) % 1.0
-    return phase
-
-def _wrap_phase_radians(phi):
-    phi = np.asarray(phi, dtype=float)
-    return np.arctan2(np.sin(phi), np.cos(phi))
 
 def to_btjd_abs(ts: TimeSeries) -> np.ndarray:
     """Return an absolute BTJD-like time array for phase-reference calculations."""
@@ -1099,49 +1065,9 @@ def phase_zero_summary_text() -> str:
         return f"custom_btjd (shared BTJD = {float(PHASE_ZERO_BTJD):.6f})"
     return str(PHASE_ZERO_MODE)
 
-def _phase_shift_days(ts: TimeSeries) -> float:
-    mode = str(PHASE_ZERO_MODE).strip().lower()
-    if mode == "local_start":
-        return 0.0
-    btjd = to_btjd_abs(ts)
-    if btjd.size == 0:
-        return 0.0
-    return float(btjd[0] - _phase_reference_epoch_btjd(ts))
-
-def phase_fold_ts(ts: TimeSeries, f: float) -> np.ndarray:
-    mode = str(PHASE_ZERO_MODE).strip().lower()
-    if mode == "local_start":
-        return phase_fold(np.asarray(ts.t, dtype=float), f, t_ref=0.0)
-    return phase_fold(to_btjd_abs(ts), f, t_ref=_phase_reference_epoch_btjd(ts))
-
-def phase_model_on_grid(ph_grid: np.ndarray, f: float, beta_sc, ts: TimeSeries) -> np.ndarray:
-    s_coeff = float(beta_sc[0])
-    c_coeff = float(beta_sc[1])
-    amp, phase0 = sinusoid_coeffs_to_amp_phase(np.array([s_coeff, c_coeff], dtype=float))
-    phase_ref = _wrap_phase_radians(phase0 - 2.0 * np.pi * float(f) * _phase_shift_days(ts))
-    return amp * np.sin(2.0 * np.pi * np.asarray(ph_grid, dtype=float) + phase_ref)
-
-def apply_phase_reference_to_columns(df: pd.DataFrame, ts: TimeSeries, phase_freq_pairs) -> pd.DataFrame:
-    if df is None:
-        return df
-    out = df.copy()
-    delta = _phase_shift_days(ts)
-    if delta == 0.0:
-        return out
-    for phase_col, freq_col in phase_freq_pairs:
-        if (phase_col not in out.columns) or (freq_col not in out.columns):
-            continue
-        ph = pd.to_numeric(out[phase_col], errors="coerce").to_numpy(dtype=float)
-        ff = pd.to_numeric(out[freq_col], errors="coerce").to_numpy(dtype=float)
-        good = np.isfinite(ph) & np.isfinite(ff)
-        if not np.any(good):
-            continue
-        ph_new = ph.copy()
-        ph_new[good] = _wrap_phase_radians(ph[good] - 2.0 * np.pi * ff[good] * delta)
-        out[phase_col] = ph_new
-    return out
-
-
+def phase_fold(t: np.ndarray, f: float, t_ref: float = 0.0) -> np.ndarray:
+    phase = ((t - t_ref) * f) % 1.0
+    return phase
 
 def sort_modes_for_phasing(res: pd.DataFrame, how: str, nmax: int) -> pd.DataFrame:
     if res.empty:
@@ -1151,59 +1077,12 @@ def sort_modes_for_phasing(res: pd.DataFrame, how: str, nmax: int) -> pd.DataFra
     return res.sort_values(how, ascending=False).head(nmax).reset_index(drop=True)
 
 
-
-def set_robust_phase_ylim(ax, *arrays, central_pct: float = 98.0, pad_frac: float = 0.12):
-    """Set a robust y-range that ignores a small fraction of extreme outliers."""
-    vals = []
-    for arr in arrays:
-        if arr is None:
-            continue
-        a = np.asarray(arr, dtype=float).ravel()
-        a = a[np.isfinite(a)]
-        if a.size:
-            vals.append(a)
-    if not vals:
-        return
-    y = np.concatenate(vals)
-    if y.size == 0:
-        return
-
-    central_pct = float(central_pct)
-    central_pct = min(99.9, max(80.0, central_pct))
-    tail = 0.5 * (100.0 - central_pct)
-    lo = np.nanpercentile(y, tail)
-    hi = np.nanpercentile(y, 100.0 - tail)
-
-    if not np.isfinite(lo) or not np.isfinite(hi):
-        lo = np.nanmin(y)
-        hi = np.nanmax(y)
-
-    if not np.isfinite(lo) or not np.isfinite(hi):
-        return
-
-    if hi <= lo:
-        med = np.nanmedian(y)
-        span = np.nanpercentile(np.abs(y - med), 90.0)
-        if (not np.isfinite(span)) or span <= 0:
-            span = max(np.nanstd(y), 1e-6)
-        lo = med - span
-        hi = med + span
-
-    span = hi - lo
-    if (not np.isfinite(span)) or span <= 0:
-        span = max(np.nanstd(y), 1e-6)
-        if (not np.isfinite(span)) or span <= 0:
-            span = 1.0
-
-    pad = pad_frac * span
-    ax.set_ylim(lo - pad, hi + pad)
-
 def plot_phased_modes(mode_snapshots: list[dict], res: pd.DataFrame, outdir: Path, title_prefix: str,
                       final_tess_resid: TimeSeries | None = None,
                       final_pol_resid: TimeSeries | None = None,
                       n_phase_plots: int = 3, sort_by: str = "score_comb",
                       plot_style: str = "isolated_mode",
-                      show_plots_inline: bool = False, file_prefix: str = ""):
+                      show_plots_inline: bool = False):
     if res.empty or not mode_snapshots:
         return
     pick = sort_modes_for_phasing(res, sort_by, n_phase_plots)
@@ -1226,7 +1105,8 @@ def plot_phased_modes(mode_snapshots: list[dict], res: pd.DataFrame, outdir: Pat
         # TESS panel
         ax = axes[i, 0]
         ft = float(snap["fit_tess"]["best_f"])
-        phase_t = phase_fold_ts(snap["tess_prefit"], ft)
+        t_ref_t = _phase_reference_epoch_btjd(snap["tess_prefit"])
+        phase_t = phase_fold(to_btjd_abs(snap["tess_prefit"]), ft, t_ref=t_ref_t)
         if plot_style == "isolated_mode" and final_tess_resid is not None and len(final_tess_resid.y) == len(snap["fit_tess"]["signal_model"]):
             y_t = np.asarray(final_tess_resid.y, dtype=float) + np.asarray(snap["fit_tess"]["signal_model"], dtype=float)
             ylab_t = "TESS (isolated mode; median-subtracted)"
@@ -1234,12 +1114,14 @@ def plot_phased_modes(mode_snapshots: list[dict], res: pd.DataFrame, outdir: Pat
             y_t = np.asarray(snap["tess_prefit"].y, dtype=float)
             ylab_t = "TESS (prefit residual; median-subtracted)"
         y_t = y_t - np.nanmedian(y_t)
-        ax.scatter(phase_t, y_t, s=6, alpha=0.65, color=point_color)
-        ax.scatter(phase_t + 1.0, y_t, s=6, alpha=0.65, color=point_color)
-        y_model = phase_model_on_grid(ph_grid, ft, snap["fit_tess"]["beta"][:2], snap["tess_prefit"])
+        ax.scatter(phase_t, y_t, s=8, alpha=0.7, color=point_color)
+        ax.scatter(phase_t + 1.0, y_t, s=8, alpha=0.7, color=point_color)
+        y_model = (
+            snap["fit_tess"]["beta"][0] * np.sin(2.0 * np.pi * ph_grid) +
+            snap["fit_tess"]["beta"][1] * np.cos(2.0 * np.pi * ph_grid)
+        )
         y_model = y_model - np.nanmedian(y_model)
         ax.plot(ph_grid, y_model, lw=1.4, color=model_color)
-        set_robust_phase_ylim(ax, y_t, y_model, central_pct=98.0, pad_frac=0.15)
         ax.set_xlim(0.0, 2.0)
         ax.set_xlabel("Phase")
         ax.set_ylabel(ylab_t)
@@ -1248,7 +1130,8 @@ def plot_phased_modes(mode_snapshots: list[dict], res: pd.DataFrame, outdir: Pat
         # Polarimetry panel
         ax = axes[i, 1]
         fp = float(snap["fit_pol"]["best_f"])
-        phase_p = phase_fold_ts(snap["pol_prefit"], fp)
+        t_ref_p = _phase_reference_epoch_btjd(snap["pol_prefit"])
+        phase_p = phase_fold(to_btjd_abs(snap["pol_prefit"]), fp, t_ref=t_ref_p)
         if plot_style == "isolated_mode" and final_pol_resid is not None and len(final_pol_resid.y) == len(snap["fit_pol"]["signal_model"]):
             y_p = np.asarray(final_pol_resid.y, dtype=float) + np.asarray(snap["fit_pol"]["signal_model"], dtype=float)
             ylab_p = f"{snap['pol_prefit'].name} (isolated mode; median-subtracted)"
@@ -1256,12 +1139,14 @@ def plot_phased_modes(mode_snapshots: list[dict], res: pd.DataFrame, outdir: Pat
             y_p = np.asarray(snap["pol_prefit"].y - snap["fit_pol"]["baseline_model"], dtype=float)
             ylab_p = f"{snap['pol_prefit'].name} (prefit residual; median-subtracted)"
         y_p = y_p - np.nanmedian(y_p)
-        ax.scatter(phase_p, y_p, s=7, alpha=0.65, color=point_color)
-        ax.scatter(phase_p + 1.0, y_p, s=7, alpha=0.65, color=point_color)
-        y_model_p = phase_model_on_grid(ph_grid, fp, snap["fit_pol"]["beta"][:2], snap["pol_prefit"])
+        ax.scatter(phase_p, y_p, s=10, alpha=0.7, color=point_color)
+        ax.scatter(phase_p + 1.0, y_p, s=10, alpha=0.7, color=point_color)
+        y_model_p = (
+            snap["fit_pol"]["beta"][0] * np.sin(2.0 * np.pi * ph_grid) +
+            snap["fit_pol"]["beta"][1] * np.cos(2.0 * np.pi * ph_grid)
+        )
         y_model_p = y_model_p - np.nanmedian(y_model_p)
         ax.plot(ph_grid, y_model_p, lw=1.4, color=model_color)
-        set_robust_phase_ylim(ax, y_p, y_model_p, central_pct=98.0, pad_frac=0.15)
         ax.set_xlim(0.0, 2.0)
         ax.set_xlabel("Phase")
         ax.set_ylabel(ylab_p)
@@ -1270,22 +1155,21 @@ def plot_phased_modes(mode_snapshots: list[dict], res: pd.DataFrame, outdir: Pat
     style_note = "isolated-mode baseline" if plot_style == "isolated_mode" else "prefit-residual baseline"
     fig.suptitle(f"{title_prefix}: phased top modes ({style_note})", y=1.01, fontsize=13)
     fig.tight_layout()
-    fig.savefig(outdir / prefixed_output_name(file_prefix, "phased_top_modes.png"), dpi=180, bbox_inches="tight")
+    fig.savefig(outdir / "phased_top_modes.png", dpi=180, bbox_inches="tight")
     if show_plots_inline:
         plt.show()
     plt.close(fig)
 
 
 def run_joint_extraction_one(tess0: TimeSeries, pol0: TimeSeries, outdir: Path,
-                             pol_trend_cfg: NightTrendConfig, show_plots_inline: bool = False,
-                             file_prefix: str = "", display_name: str | None = None) -> pd.DataFrame:
+                             pol_trend_cfg: NightTrendConfig, show_plots_inline: bool = False) -> pd.DataFrame:
     outdir.mkdir(parents=True, exist_ok=True)
-    display_name = pol0.name if display_name is None else str(display_name)
 
     tess = TimeSeries(
         t=tess0.t.copy(), y=tess0.y.copy(),
         yerr=None if tess0.yerr is None else tess0.yerr.copy(),
-        name=tess0.name, t_abs=None if tess0.t_abs is None else tess0.t_abs.copy(), group_id=None
+        name=tess0.name, t_abs=None if tess0.t_abs is None else tess0.t_abs.copy(),
+        group_id=None if tess0.group_id is None else tess0.group_id.copy()
     )
     pol = TimeSeries(
         t=pol0.t.copy(), y=pol0.y.copy(),
@@ -1294,8 +1178,8 @@ def run_joint_extraction_one(tess0: TimeSeries, pol0: TimeSeries, outdir: Path,
         group_id=None if pol0.group_id is None else pol0.group_id.copy()
     )
 
-    w_te = estimate_dataset_weight(tess, mode=JOINT_WEIGHT_MODE, scale_free_basis=SCALE_FREE_WEIGHT_BASIS, manual_weight=MANUAL_W_TESS)
-    w_po = estimate_dataset_weight(pol, mode=JOINT_WEIGHT_MODE, scale_free_basis=SCALE_FREE_WEIGHT_BASIS, manual_weight=MANUAL_W_POL)
+    w_te = estimate_dataset_weight(tess, mode=JOINT_WEIGHT_MODE, scale_free_basis=SCALE_FREE_WEIGHT_BASIS)
+    w_po = estimate_dataset_weight(pol, mode=JOINT_WEIGHT_MODE, scale_free_basis=SCALE_FREE_WEIGHT_BASIS)
 
     Tseg_tess = compute_Tseg(tess, gap_days=1.0)
     Tseg_pol  = compute_Tseg(pol,  gap_days=1.0)
@@ -1374,8 +1258,10 @@ def run_joint_extraction_one(tess0: TimeSeries, pol0: TimeSeries, outdir: Path,
         fit_po = fit_frequency_with_design(pol, f0=f_n, T=T2, kfit=KFIT, fmin=FMIN, fmax=FMAX,
                                            baseline_matrix=B_po, n_steps=2001)
 
-        snr_te, W_te = joint_tess_local_snr_from_fit(tess, fit_te["best_f"], T_noise=T1, ks=KS_TESS)
-        snr_po, W_po = joint_pol_local_snr_from_fit(pol, fit_po["best_f"], T_noise=T2, ks=KS_POL, baseline_matrix=B_po)
+        P1_loc = lomb_scargle_power(tess, freqs_coarse)
+        P2_loc = nuisance_periodogram(pol, freqs_coarse, baseline_matrix=B_po)
+        snr_te, W_te = local_snr_from_power(freqs_coarse, P1_loc, fit_te["best_f"], T=T1, ks=KS_TESS)
+        snr_po, W_po = local_snr_from_power(freqs_coarse, P2_loc, fit_po["best_f"], T=T2, ks=KS_POL)
 
         if (np.isfinite(snr_te) and np.isfinite(snr_po)) and (snr_te < SNR_STOP) and (snr_po < SNR_STOP):
             print(f"[{pol.name} iter {n}] Both SNR < {SNR_STOP:.2f}; stopping.")
@@ -1389,16 +1275,12 @@ def run_joint_extraction_one(tess0: TimeSeries, pol0: TimeSeries, outdir: Path,
             "W_pol_at_pick": best["W2"],
             "f_tess": fit_te["best_f"],
             "amp_tess": fit_te["amp"],
-            "amp_tess_err": fit_te.get("amp_err", np.nan),
             "phase_tess": fit_te["phase"],
-            "phase_tess_err": fit_te.get("phase_err", np.nan),
             "snr_tess": snr_te,
             "W_tess": W_te,
             "f_pol": fit_po["best_f"],
             "amp_pol": fit_po["amp"],
-            "amp_pol_err": fit_po.get("amp_err", np.nan),
             "phase_pol": fit_po["phase"],
-            "phase_pol_err": fit_po.get("phase_err", np.nan),
             "snr_pol": snr_po,
             "W_pol": W_po,
             "n_pol_groups": int(np.unique(pol.group_id).size) if pol.group_id is not None else 0,
@@ -1413,7 +1295,7 @@ def run_joint_extraction_one(tess0: TimeSeries, pol0: TimeSeries, outdir: Path,
                 yerr=None if tess.yerr is None else tess.yerr.copy(),
                 name=tess.name,
                 t_abs=None if tess.t_abs is None else tess.t_abs.copy(),
-                group_id=None
+                group_id=None if tess.group_id is None else tess.group_id.copy()
             ),
             "pol_prefit": TimeSeries(
                 t=pol.t.copy(), y=pol.y.copy(),
@@ -1432,42 +1314,39 @@ def run_joint_extraction_one(tess0: TimeSeries, pol0: TimeSeries, outdir: Path,
         print(f"[{pol.name} iter {n}] f~{f_n:.6f} c/d | SNR tess={snr_te:.2f} pol={snr_po:.2f}")
 
     res = pd.DataFrame(rows)
-    res_out = apply_phase_reference_to_columns(res, pol0, [("phase_pol", "f_pol")])
-    res_out = apply_phase_reference_to_columns(res_out, tess0, [("phase_tess", "f_tess")])
-    res_out = add_period_columns(res_out, [("f_comb", "period_comb_d"), ("f_tess", "period_tess_d"), ("f_pol", "period_pol_d")])
-    res_out.to_csv(outdir / prefixed_output_name(file_prefix, "peaks_table.csv"), index=False)
+    res.to_csv(outdir / "peaks_table.csv", index=False)
 
     Pte_end = lomb_scargle_power(tess, freqs_coarse)
     Ppo_end = nuisance_periodogram(pol, freqs_coarse, baseline_matrix=make_pol_baseline_matrix(pol, pol_trend_cfg))
 
     # time-series plot (stacked panels: TESS and polarimetry separated; start/end overplotted)
-    C_TESS_START = "#7EC8FF"
-    C_TESS_END   = "#000000"
-    C_POL_START  = "#7EC8FF"
-    C_POL_END    = "#000000"
+    C_TESS_START = "#0072B2"
+    C_TESS_END   = "#56B4E9"
+    C_POL_START  = "#E69F00"
+    C_POL_END    = "#CC79A7"
 
     fig, axes = plt.subplots(nrows=2, ncols=1, figsize=(11, 7.5), sharex=True)
 
     ax = axes[0]
     tess0_plot = tess0.y - np.nanmedian(tess0.y)
     tess_plot  = tess.y  - np.nanmedian(tess.y)
-    ax.scatter(tess0.t, tess0_plot, s=5, alpha=0.50, label="tess start", color=C_TESS_START)
-    ax.scatter(tess.t, tess_plot, s=5, alpha=0.55, label="tess end (resid)", color=C_TESS_END)
+    ax.scatter(tess0.t, tess0_plot, s=8, alpha=0.55, label="tess start", color=C_TESS_START)
+    ax.scatter(tess.t, tess_plot, s=8, alpha=0.65, label="tess end (resid)", color=C_TESS_END)
     ax.set_ylabel("TESS value (median-subtracted)")
     ax.set_title("TESS time series")
     ax.legend(loc="best", fontsize=9)
 
     ax = axes[1]
-    ax.scatter(pol0.t, pol0.y, s=6, alpha=0.50, label=f"{display_name} start", color=C_POL_START)
-    ax.scatter(pol.t, pol.y, s=6, alpha=0.55, label=f"{display_name} end (resid)", color=C_POL_END)
+    ax.scatter(pol0.t, pol0.y, s=10, alpha=0.55, label=f"{pol0.name} start", color=C_POL_START)
+    ax.scatter(pol.t, pol.y, s=10, alpha=0.65, label=f"{pol0.name} end (resid)", color=C_POL_END)
     ax.set_xlabel("Time [days]")
-    ax.set_ylabel(f"{display_name} value")
-    ax.set_title(f"{display_name} time series")
+    ax.set_ylabel(f"{pol0.name} value")
+    ax.set_title(f"{pol0.name} time series")
     ax.legend(loc="best", fontsize=9)
 
-    fig.suptitle(f"Time series: TESS + {display_name} (Option C night offsets)", y=0.98)
+    fig.suptitle(f"Time series: TESS + {pol0.name} (Option C night offsets)", y=0.98)
     fig.tight_layout()
-    fig.savefig(outdir / prefixed_output_name(file_prefix, "timeseries_start_end.png"), dpi=180)
+    fig.savefig(outdir / "timeseries_start_end.png", dpi=180)
     if show_plots_inline:
         plt.show()
     plt.close(fig)
@@ -1510,16 +1389,16 @@ def run_joint_extraction_one(tess0: TimeSeries, pol0: TimeSeries, outdir: Path,
     ax.legend(loc="best", fontsize=9)
 
     ax = axes[1]
-    ax.plot(freqs_coarse, Ppo_s + off_po_s, lw=0.9, label=f"{display_name} start", color=C_POL_START, linestyle="-")
-    ax.plot(freqs_coarse, Ppo_e + off_po_e, lw=0.9, label=f"{display_name} end (offset)", color=C_POL_END, linestyle="--")
+    ax.plot(freqs_coarse, Ppo_s + off_po_s, lw=0.9, label=f"{pol0.name} start", color=C_POL_START, linestyle="-")
+    ax.plot(freqs_coarse, Ppo_e + off_po_e, lw=0.9, label=f"{pol0.name} end (offset)", color=C_POL_END, linestyle="--")
     if len(accepted) > 0:
         y_top_p = np.nanmax(Ppo_e + off_po_e) if np.isfinite(np.nanmax(Ppo_e + off_po_e)) else (off_po_e + 1.0)
         for i, f in enumerate(accepted, start=1):
             ax.axvline(f, lw=0.8, alpha=0.35, color="0.3")
             ax.text(f, y_top_p, str(i), rotation=90, va="top", ha="center", fontsize=8)
     ax.set_xlabel("Frequency [cycles/day]")
-    ax.set_ylabel(f"{display_name} norm. power + offset")
-    ax.set_title(f"{display_name} power spectra")
+    ax.set_ylabel(f"{pol0.name} norm. power + offset")
+    ax.set_title(f"{pol0.name} power spectra")
     ax.legend(loc="best", fontsize=9)
 
     if len(accepted) > 0:
@@ -1527,9 +1406,9 @@ def run_joint_extraction_one(tess0: TimeSeries, pol0: TimeSeries, outdir: Path,
         pad = 0.05 * fmax_plot
         axes[1].set_xlim(left=FMIN, right=fmax_plot + pad)
 
-    fig.suptitle(f"Power spectra (normalized): TESS + {display_name} (night-aware polarimetry)", y=0.98)
+    fig.suptitle(f"Power spectra (normalized): TESS + {pol0.name} (night-aware polarimetry)", y=0.98)
     fig.tight_layout()
-    fig.savefig(outdir / prefixed_output_name(file_prefix, "spectra_start_end.png"), dpi=180)
+    fig.savefig(outdir / "spectra_start_end.png", dpi=180)
     if show_plots_inline:
         plt.show()
     plt.close(fig)
@@ -1537,17 +1416,17 @@ def run_joint_extraction_one(tess0: TimeSeries, pol0: TimeSeries, outdir: Path,
     # windows
     fig = plt.figure(figsize=(11, 4))
     plt.plot(freqs_coarse, win_te, lw=0.9, label="tess window (norm)")
-    plt.plot(freqs_coarse, win_po, lw=0.9, label=f"{display_name} window (norm)")
+    plt.plot(freqs_coarse, win_po, lw=0.9, label=f"{pol0.name} window (norm)")
     plt.xlabel("Frequency [cycles/day]")
     plt.ylabel("Window power (norm)")
-    plt.title(f"Spectral windows: TESS + {display_name}")
+    plt.title(f"Spectral windows: TESS + {pol0.name}")
     plt.legend(loc="best", fontsize=9)
     if len(accepted) > 0:
         fmax_plot = max(accepted)
         pad = 0.05 * fmax_plot
         plt.xlim(left=FMIN, right=fmax_plot + pad)
     fig.tight_layout()
-    fig.savefig(outdir / prefixed_output_name(file_prefix, "spectral_windows.png"), dpi=180)
+    fig.savefig(outdir / "spectral_windows.png", dpi=180)
     if show_plots_inline:
         plt.show()
     plt.close(fig)
@@ -1559,120 +1438,72 @@ def run_joint_extraction_one(tess0: TimeSeries, pol0: TimeSeries, outdir: Path,
     OFF_POL  = 1e-3
     plt.plot(freqs_coarse, Pte_start + eps, lw=0.9, label="tess start", color=C_TESS_START, linestyle="-")
     plt.plot(freqs_coarse, (Pte_end * OFF_TESS) + eps, lw=0.9, label=f"tess end (×{OFF_TESS:g})", color=C_TESS_END, linestyle="--")
-    plt.plot(freqs_coarse, Ppo_start + eps, lw=0.9, label=f"{display_name} start", color=C_POL_START, linestyle="-")
-    plt.plot(freqs_coarse, (Ppo_end * OFF_POL) + eps, lw=0.9, label=f"{display_name} end (×{OFF_POL:g})", color=C_POL_END, linestyle="--")
+    plt.plot(freqs_coarse, Ppo_start + eps, lw=0.9, label=f"{pol0.name} start", color=C_POL_START, linestyle="-")
+    plt.plot(freqs_coarse, (Ppo_end * OFF_POL) + eps, lw=0.9, label=f"{pol0.name} end (×{OFF_POL:g})", color=C_POL_END, linestyle="--")
     if len(accepted) > 0:
         for i, f in enumerate(accepted, start=1):
             plt.axvline(f, lw=0.8, alpha=0.35, color="0.3")
     plt.yscale("log")
     plt.xlabel("Frequency [cycles/day]")
     plt.ylabel("Power (log scale)")
-    plt.title(f"Power spectra (log scale): TESS + {display_name}")
+    plt.title(f"Power spectra (log scale): TESS + {pol0.name}")
     plt.legend(loc="best", fontsize=9)
     if len(accepted) > 0:
         fmax_plot = max(accepted)
         pad = 0.05 * fmax_plot
         plt.xlim(left=FMIN, right=fmax_plot + pad)
     fig.tight_layout()
-    fig.savefig(outdir / prefixed_output_name(file_prefix, "spectra_start_end_log_offset.png"), dpi=180)
+    fig.savefig(outdir / "spectra_start_end_log_offset.png", dpi=180)
     if show_plots_inline:
         plt.show()
     plt.close(fig)
 
     plot_phased_modes(mode_snapshots, res, outdir=outdir,
-                      title_prefix=f"TESS + {display_name}",
+                      title_prefix=f"TESS + {pol0.name}",
                       final_tess_resid=tess, final_pol_resid=pol,
                       n_phase_plots=N_PHASE_PLOTS, sort_by=PHASE_SORT_BY,
                       plot_style=PHASE_PLOT_STYLE,
-                      show_plots_inline=show_plots_inline, file_prefix=file_prefix)
+                      show_plots_inline=show_plots_inline)
     return res
 
-def parse_args(argv=None):
-    p = argparse.ArgumentParser(
-        description="Run the joint TESS + polarimetry extraction.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    p.add_argument("--phase-zero-mode", choices=["local_start", "btjd_zero", "custom_btjd"],
-                   default=PHASE_ZERO_MODE,
-                   help="Phase-reference convention for reported phases and phased plots.")
-    p.add_argument("--phase-zero-btjd", type=float, default=PHASE_ZERO_BTJD,
-                   help="Custom BTJD phase zero when --phase-zero-mode=custom_btjd.")
-    p.add_argument("--summary-save-period", action="store_true", default=SUMMARY_SAVE_PERIOD_VERSION,
-                   help="Also save period-axis versions of the summary amplitude-spectrum plot.")
-    p.add_argument("--summary-save-log-amplitude", action="store_true", default=SUMMARY_SAVE_LOG_AMPLITUDE_VERSION,
-                   help="Also save log-amplitude versions of the summary amplitude-spectrum plot.")
-    return p.parse_args(argv)
+POL_TREND_CFG = NightTrendConfig(
+    use_offsets=USE_POL_NIGHT_OFFSETS,
+    use_slopes=USE_POL_NIGHT_SLOPES,
+    group_mode=POL_NIGHT_GROUP_MODE,
+    gap_days=POL_NIGHT_GAP_HOURS / 24.0
+)
 
+print("TESS_INPUT_MODE =", TESS_INPUT_MODE)
+print("TESS_WEIGHT_MODE =", TESS_WEIGHT_MODE, "| TESS_ERROR_FLOOR_FRAC =", TESS_ERROR_FLOOR_FRAC)
+if str(TESS_INPUT_MODE).lower() == "pipeline_dir":
+    print("TESS_PIPELINE_DIR =", TESS_PIPELINE_DIR, "| flux =", TESS_PIPELINE_FLUX, "| pattern =", TESS_PIPELINE_PATTERN)
+else:
+    print("TESS_CSV =", TESS_CSV)
 
-def main(argv=None):
-    global PHASE_ZERO_MODE, PHASE_ZERO_BTJD, SUMMARY_SAVE_PERIOD_VERSION, SUMMARY_SAVE_LOG_AMPLITUDE_VERSION
-    args = parse_args(argv)
-    PHASE_ZERO_MODE = args.phase_zero_mode
-    PHASE_ZERO_BTJD = args.phase_zero_btjd
-    SUMMARY_SAVE_PERIOD_VERSION = args.summary_save_period
-    SUMMARY_SAVE_LOG_AMPLITUDE_VERSION = args.summary_save_log_amplitude
+tess = load_tess_input()
+pol_dict = load_polarimetry_csv(POL_CSV, product=POL_PRODUCT, trend_cfg=POL_TREND_CFG)
 
-    POL_TREND_CFG = NightTrendConfig(
-        use_offsets=USE_POL_NIGHT_OFFSETS,
-        use_slopes=USE_POL_NIGHT_SLOPES,
-        group_mode=POL_NIGHT_GROUP_MODE,
-        gap_days=POL_NIGHT_GAP_HOURS / 24.0
-    )
+if DO_DETREND:
+    tess_dt = detrend_poly(tess, order=DETREND_POLY_ORDER)
+    pol_dt = {k: detrend_poly(v, order=DETREND_POLY_ORDER) for k, v in pol_dict.items()}
+else:
+    tess_dt = tess
+    pol_dt = pol_dict
 
-    print("TESS_INPUT_MODE =", TESS_INPUT_MODE)
-    if str(TESS_INPUT_MODE).lower() == "pipeline_dir":
-        print("TESS_PIPELINE_DIR =", TESS_PIPELINE_DIR, "| flux =", TESS_PIPELINE_FLUX, "| pattern =", TESS_PIPELINE_PATTERN)
-    else:
-        print("TESS_CSV =", TESS_CSV)
-    print("PHASE_ZERO =", phase_zero_summary_text())
+print("JOINT_WEIGHT_MODE =", JOINT_WEIGHT_MODE, "| SCALE_FREE_WEIGHT_BASIS =", SCALE_FREE_WEIGHT_BASIS)
+print("TOP_N_RAW_TESS_CANDIDATES =", TOP_N_RAW_TESS_CANDIDATES)
+print("TESS:", len(tess_dt.t), "Tfull=", compute_T_full(tess_dt), "weight=", estimate_dataset_weight(tess_dt, mode=JOINT_WEIGHT_MODE, scale_free_basis=SCALE_FREE_WEIGHT_BASIS))
+for k in ["q", "u", "p"]:
+    ts = pol_dt[k]
+    ngrp = int(np.unique(ts.group_id).size) if ts.group_id is not None else 0
+    print(ts.name, "N=", len(ts.t), "Tfull=", compute_T_full(ts), "weight=", estimate_dataset_weight(ts, mode=JOINT_WEIGHT_MODE, scale_free_basis=SCALE_FREE_WEIGHT_BASIS), "night groups=", ngrp)
 
-    tess = load_tess_input()
-    pol_dict = load_polarimetry_csv(POL_CSV, product=POL_PRODUCT, trend_cfg=POL_TREND_CFG)
+results = {}
+for k in ["q", "u", "p"]:
+    outdir = OUTROOT / k
+    print("\n=== RUN:", k, "->", outdir, "===")
+    results[k] = run_joint_extraction_one(tess_dt, pol_dt[k], outdir=outdir, pol_trend_cfg=POL_TREND_CFG,
+                                          show_plots_inline=SHOW_PLOTS_INLINE)
 
-    if DO_DETREND:
-        tess_dt = detrend_poly(tess, order=DETREND_POLY_ORDER)
-        pol_dt = {k: detrend_poly(v, order=DETREND_POLY_ORDER) for k, v in pol_dict.items()}
-    else:
-        tess_dt = tess
-        pol_dt = pol_dict
+results["q"].head()
 
-    star_label, star_safe = infer_star_labels_from_pol_path(POL_CSV)
-    print("STAR_LABEL =", star_label)
-    analysis_outroot = resolve_analysis_outroot(star_safe)
-    print("JOINT_WEIGHT_MODE =", JOINT_WEIGHT_MODE, "| SCALE_FREE_WEIGHT_BASIS =", SCALE_FREE_WEIGHT_BASIS, "| MANUAL_W_TESS =", MANUAL_W_TESS, "| MANUAL_W_POL =", MANUAL_W_POL)
-    print("TOP_N_RAW_TESS_CANDIDATES =", TOP_N_RAW_TESS_CANDIDATES)
-    print("TESS:", len(tess_dt.t), "Tfull=", compute_T_full(tess_dt), "weight=", estimate_dataset_weight(tess_dt, mode=JOINT_WEIGHT_MODE, scale_free_basis=SCALE_FREE_WEIGHT_BASIS, manual_weight=MANUAL_W_TESS))
-    for k in ["q", "u", "p"]:
-        ts = pol_dt[k]
-        ngrp = int(np.unique(ts.group_id).size) if ts.group_id is not None else 0
-        print(ts.name, "N=", len(ts.t), "Tfull=", compute_T_full(ts), "weight=", estimate_dataset_weight(ts, mode=JOINT_WEIGHT_MODE, scale_free_basis=SCALE_FREE_WEIGHT_BASIS, manual_weight=MANUAL_W_POL), "night groups=", ngrp)
-
-    results = {}
-    for k in ["q", "u", "p"]:
-        channel_prefix = f"{star_safe}_joint_{k}"
-        outdir = analysis_outroot / channel_prefix
-        display_name = f"{star_label} {k}"
-        print("\n=== RUN:", display_name, "->", outdir, "===")
-        results[k] = run_joint_extraction_one(tess_dt, pol_dt[k], outdir=outdir, pol_trend_cfg=POL_TREND_CFG,
-                                              show_plots_inline=SHOW_PLOTS_INLINE, file_prefix=channel_prefix, display_name=display_name)
-
-    summary_df = build_joint_summary_table(results, tess_dt)
-    if not summary_df.empty:
-        summary_prefix = f"{star_safe}_joint_summary"
-        csv_path = analysis_outroot / prefixed_output_name(summary_prefix, "frequency_table.csv")
-        xlsx_path = analysis_outroot / prefixed_output_name(summary_prefix, "frequency_table.xlsx")
-        save_summary_table(summary_df, csv_path, xlsx_path)
-        plot_joint_summary_amplitude_spectra(
-            summary_df, tess_dt, pol_dt, POL_TREND_CFG,
-            analysis_outroot / prefixed_output_name(summary_prefix, "amplitude_spectra.png"),
-            show_plots_inline=SHOW_PLOTS_INLINE,
-        )
-        results["summary"] = summary_df
-    if "q" in results:
-        print(results["q"].head())
-    return results
-
-
-
-if __name__ == "__main__":
-    main()
