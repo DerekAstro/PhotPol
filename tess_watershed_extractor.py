@@ -2,15 +2,18 @@
 """
 Watershed light-curve pipeline.
 
-Extract multi-target light curves from TESS TPFs or TESScut astrocut FITS files.
+Extract aperture light curves from TESS, Kepler, and K2 target-pixel files, including TESSCut astrocut FITS files.
+The optional engineering-PRF branch is TESS-only and is skipped with a warning for Kepler/K2.
 This version uses watershed segmentation for initial target regions and writes flat outputs directly into --output-root.
 """
 
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
+import hashlib
+import json
 from pathlib import Path
-import sys
 import re
 import pickle
 
@@ -33,25 +36,135 @@ import lightkurve as lk
 from skimage.segmentation import watershed
 
 try:
+    from tess_prf_photometry import (
+        SceneSource,
+        PRFPhotometryConfig,
+        assess_saturation,
+        extract_jitter_aware_prf,
+        save_prf_products,
+    )
+    _HAVE_PRF_MODULE = True
+except Exception as _prf_import_error:
+    SceneSource = PRFPhotometryConfig = None
+    extract_jitter_aware_prf = save_prf_products = assess_saturation = None
+    _HAVE_PRF_MODULE = False
+    _PRF_IMPORT_ERROR = _prf_import_error
+
+try:
     from astroquery.simbad import Simbad
 except Exception:
     Simbad = None
 
 try:
     from astroquery.gaia import Gaia
-except Exception as e:
-    raise ImportError("astroquery.gaia is required for the Gaia/Voronoi step.") from e
+except Exception:
+    # Gaia is optional for explicit single-target/no-Gaia workflows.  Keeping
+    # the import optional also lets users inspect --help without installing
+    # astroquery; a clear error is raised only if a Gaia query is requested.
+    Gaia = None
 
 
 APERTURE_FOM_MODE = "stddiff"
 SAVE_FIGURE_PICKLES = False
+DEFAULT_ORBITAL_TABLE = Path(__file__).resolve().with_name("tess_sector_orbfreq_midpoints.csv")
+
 
 # =============================================================================
-# Pure MATLAB-style saturated single-target extractor
+# User-supplied fixed aperture masks
 # =============================================================================
 
-def read_tpf_arrays_for_matlab_port(path: Path):
-    """Read basic arrays from a TESS TPF FITS file for the MATLAB-style extractor."""
+_MASK_TRUE_TOKENS = {"1", "y", "yes", "t", "true"}
+_MASK_FALSE_TOKENS = {"0", "n", "no", "f", "false"}
+
+
+def load_external_aperture_mask(
+    mask_path: str | Path,
+    expected_shape: tuple[int, int] | None = None,
+):
+    """Read a human-editable, row-major Boolean aperture mask.
+
+    The file contains one image row per nonblank text line. Values may be
+    separated by commas or whitespace, and ``#`` starts a comment. Accepted
+    true values are 1/Y/YES/T/TRUE; accepted false values are
+    0/N/NO/F/FALSE, case-insensitively.
+
+    No automatic transpose, flip, padding, or cropping is performed. This is
+    deliberate: silently changing an aperture orientation would produce a
+    plausible-looking but scientifically incorrect light curve. The first
+    data line maps to local image row 0 and the first token maps to column 0.
+    """
+    path = Path(mask_path).expanduser().resolve()
+    if not path.exists():
+        raise FileNotFoundError(f"External aperture mask not found: {path}")
+    if not path.is_file():
+        raise ValueError(f"External aperture mask is not a regular file: {path}")
+
+    rows: list[list[bool]] = []
+    row_line_numbers: list[int] = []
+    for line_number, raw_line in enumerate(path.read_text(encoding="utf-8-sig").splitlines(), start=1):
+        # Inline comments make it possible to annotate a hand-maintained mask
+        # without adding a sidecar file. Empty/comment-only lines are ignored.
+        data_text = raw_line.split("#", 1)[0].strip()
+        if not data_text:
+            continue
+        tokens = [token for token in re.split(r"[\s,]+", data_text) if token]
+        parsed_row: list[bool] = []
+        for token in tokens:
+            normalized = token.strip().lower()
+            if normalized in _MASK_TRUE_TOKENS:
+                parsed_row.append(True)
+            elif normalized in _MASK_FALSE_TOKENS:
+                parsed_row.append(False)
+            else:
+                allowed = "0/1, Y/N, YES/NO, T/F, or TRUE/FALSE"
+                raise ValueError(
+                    f"Invalid external-mask token {token!r} on line {line_number} "
+                    f"of {path.name}; expected {allowed}."
+                )
+        if parsed_row:
+            rows.append(parsed_row)
+            row_line_numbers.append(line_number)
+
+    if not rows:
+        raise ValueError(f"External aperture mask contains no data rows: {path}")
+
+    n_columns = len(rows[0])
+    for parsed_row, line_number in zip(rows, row_line_numbers):
+        if len(parsed_row) != n_columns:
+            raise ValueError(
+                f"External aperture mask is not rectangular: line {line_number} "
+                f"has {len(parsed_row)} columns, expected {n_columns}."
+            )
+
+    mask = np.asarray(rows, dtype=bool)
+    if expected_shape is not None and tuple(mask.shape) != tuple(expected_shape):
+        raise ValueError(
+            f"External aperture mask shape {tuple(mask.shape)} does not match "
+            f"the TPF image shape {tuple(expected_shape)}. Rows and columns are "
+            "not transposed automatically."
+        )
+    if not np.any(mask):
+        raise ValueError(f"External aperture mask selects zero pixels: {path}")
+
+    metadata = {
+        "schema_version": 1,
+        "source_path": str(path),
+        "source_name": path.name,
+        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        "shape_rows_columns": [int(mask.shape[0]), int(mask.shape[1])],
+        "selected_pixels": int(np.count_nonzero(mask)),
+        "orientation": "row-major; first data row is local image row 0; first token is local column 0",
+        "accepted_values": "1/0, Y/N, YES/NO, T/F, TRUE/FALSE (case-insensitive)",
+        "comments": "# begins an inline comment; blank and comment-only lines are ignored",
+    }
+    return mask, metadata
+
+# =============================================================================
+# Saturation-optimized single-target aperture extraction
+# =============================================================================
+
+def read_tpf_arrays_for_saturated_aperture(path: Path):
+    """Read cadence arrays needed by the saturation-optimized extractor."""
     with fits.open(path, memmap=True) as hdul:
         data = hdul[1].data
         names = set(data.names)
@@ -64,13 +177,6 @@ def read_tpf_arrays_for_matlab_port(path: Path):
         else:
             raise KeyError(f"No QUALITY/DQUALITY column found in {path.name}")
 
-        if "CADENCENO" in names:
-            cadence = np.array(data["CADENCENO"])
-        elif "CADENCE" in names:
-            cadence = np.array(data["CADENCE"])
-        else:
-            cadence = np.arange(len(time))
-
         flux = np.array(data["FLUX"], dtype=float)
         if flux.ndim != 3:
             raise ValueError(f"Expected FLUX to have ndim=3, got shape {flux.shape} in {path.name}")
@@ -78,21 +184,34 @@ def read_tpf_arrays_for_matlab_port(path: Path):
         _, nrow, ncol = flux.shape
         flux2d = flux.reshape(flux.shape[0], nrow * ncol)
 
-    return time, flux2d, quality, cadence, nrow, ncol
+    return time, flux2d, quality, nrow, ncol
 
 
-def matlab_style_extract_lightcurve_pure(
+def extract_saturation_optimized_aperture(
     path: Path,
     threshold: float = 3000.0,
     nback: int = 20,
-    use_legacy_geometry: bool = True,
+    filter_quality: bool = True,
     verbose: bool = True,
 ):
-    """Pure port of the older Polaris MATLAB-style extractor."""
-    time, flux, quality, cadence, nrow, ncol = read_tpf_arrays_for_matlab_port(path)
+    """Build a single-target aperture by minimizing high-frequency scatter.
+
+    Pixels above ``threshold`` seed the aperture.  Remaining positive pixels
+    are then tested one at a time, and the candidate with the lowest
+    first-difference figure of merit is appended.  The best intermediate
+    aperture is selected after the full growth sequence.  This unrestricted
+    image geometry works for arbitrary TPF and TESSCut stamp dimensions.
+    """
+    time, flux, quality, nrow, ncol = read_tpf_arrays_for_saturated_aperture(path)
     npix = nrow * ncol
 
-    keep = (quality == 0) & np.isfinite(time)
+    keep = np.isfinite(time)
+    if filter_quality:
+        quality_keep = quality == 0
+        if np.any(keep & quality_keep):
+            keep &= quality_keep
+        else:
+            print("  [WARN] No QUALITY==0 cadences; retaining finite-time cadences instead.")
     time = time[keep]
     flux = flux[keep, :]
 
@@ -133,22 +252,11 @@ def matlab_style_extract_lightcurve_pure(
         test_fom = np.full(npix, np.nan, dtype=float)
 
         for ii in range(npix):
-            ii1 = ii + 1
             if flag[ii] == 0 and np.isfinite(pixel_means[ii]) and pixel_means[ii] > 0:
-                if ii1 > 1:
-                    if use_legacy_geometry:
-                        cond1 = (ii1 % nrow) > 1
-                        cond2 = (ii1 % ncol) < 20
-                        cond3 = (ii1 != 19)
-                        geom_ok = cond1 and cond2 and cond3
-                    else:
-                        geom_ok = True
-
-                    if geom_ok:
-                        temp_flux = ts_flux[-1] + flux[:, ii]
-                        denom = np.nansum(temp_flux)
-                        if denom != 0 and np.isfinite(denom):
-                            test_fom[ii] = np.nansum(np.abs(np.diff(temp_flux))) / denom
+                temp_flux = ts_flux[-1] + flux[:, ii]
+                denom = np.nansum(temp_flux)
+                if denom != 0 and np.isfinite(denom):
+                    test_fom[ii] = np.nansum(np.abs(np.diff(temp_flux))) / denom
 
         if not np.isfinite(test_fom).any():
             break
@@ -210,16 +318,19 @@ def matlab_style_extract_lightcurve_pure(
         "best_fom": float(fom[best_idx]),
         "threshold": float(threshold),
         "nback": int(nback),
-        "legacy_geometry": bool(use_legacy_geometry),
+        "aperture_geometry": "unrestricted",
     }
 
     if verbose:
         print(
-            f"  Pure MATLAB extractor: shape={nrow}x{ncol}, cadences={len(time)}, "
+            f"  Saturation-optimized aperture: shape={nrow}x{ncol}, cadences={len(time)}, "
             f"best_pixels={best_idx + 1}, best_fom={fom[best_idx]:.6g}"
         )
 
-    out = pd.DataFrame({"time_btjd": time, "flux_detrended_rel": rel_flux})
+    # Mission-specific time naming belongs in ``main``, where the input has
+    # already been classified as TESS, Kepler, or K2. Keeping this internal
+    # table neutral avoids accidentally labeling native BKJD values as BTJD.
+    out = pd.DataFrame({"time_native": time, "flux_detrended_rel": rel_flux})
     return out, meta, mean_image.reshape(nrow, ncol), best_mask_2d, back, keep, crow, ccol
 
 
@@ -235,7 +346,7 @@ def save_figure_with_optional_pickle(fig, outpng: Path, **savefig_kwargs):
             print(f"  [WARN] Could not save pickled figure for {outpng.name}: {exc}")
 
 
-def save_aperture_plot_matlab(mean_image_2d, ap_mask_2d, outpng: Path, title: str):
+def save_aperture_plot(mean_image_2d, ap_mask_2d, outpng: Path, title: str):
     fig, ax = plt.subplots(figsize=(5, 5))
     im = ax.imshow(mean_image_2d, origin="lower", aspect="equal", cmap="gray", interpolation="nearest")
     yy, xx = np.where(ap_mask_2d)
@@ -250,10 +361,10 @@ def save_aperture_plot_matlab(mean_image_2d, ap_mask_2d, outpng: Path, title: st
     plt.close(fig)
 
 
-def save_lightcurve_plot(time_btjd, flux_rel, outpng: Path, title: str):
+def save_lightcurve_plot(time_values, flux_rel, outpng: Path, title: str, time_label: str = "Time [BTJD]"):
     fig, ax = plt.subplots(figsize=(8.0, 3.8))
-    ax.plot(np.asarray(time_btjd, float), np.asarray(flux_rel, float), ".", ms=2.5)
-    ax.set_xlabel("Time [BTJD]")
+    ax.plot(np.asarray(time_values, float), np.asarray(flux_rel, float), ".", ms=2.5)
+    ax.set_xlabel(str(time_label))
     ax.set_ylabel("Relative Flux")
     ax.set_title(title, fontsize=10)
     ax.grid(alpha=0.25)
@@ -337,16 +448,19 @@ def build_design_matrix(t, x, y, knot_spacing_days: float = 1.0, psf_sigma=None)
 
 
 # =============================================================================
-# Sector orbital-frequency table helpers (for MATLAB-style saturated-star mode)
+# Sector orbital-frequency helpers for saturated-target systematics correction
 # =============================================================================
 
 def load_sector_orbtable(csv_path: str | Path):
     """Load sector midpoint time + orbital frequency table.
 
-    Expected columns (as in tess_sector_orbfreq_midpoints.csv):
+    Preferred columns (as in the bundled table):
       - sector (int)
-      - mid_tjd  (BTJD-style day number in this workflow; despite the name)
-      - freq_cyc/day (float; orbits/day)
+      - mid_btjd (sector midpoint in BJD - 2457000 days)
+      - freq_cyc_per_day (positive orbital frequency in cycles/day)
+
+    The historical ``mid_tjd`` and ``freq_cyc/day`` headings remain accepted
+    so existing user tables continue to work.
 
     Returns a dict: sector -> (mid_btjd, freq_cyc_per_day)
     """
@@ -354,22 +468,51 @@ def load_sector_orbtable(csv_path: str | Path):
     if not p.exists():
         raise FileNotFoundError(f"Orbital-frequency table not found: {p}")
     df = pd.read_csv(p)
-    # Normalize column names a bit
+    # Strip surrounding whitespace while retaining the user's original labels
+    # for clear error messages.
     cols = {c.strip(): c for c in df.columns}
-    need = ["sector", "mid_tjd", "freq_cyc/day"]
-    missing = [c for c in need if c not in cols]
+    mid_key = "mid_btjd" if "mid_btjd" in cols else "mid_tjd" if "mid_tjd" in cols else None
+    freq_key = (
+        "freq_cyc_per_day"
+        if "freq_cyc_per_day" in cols
+        else "freq_cyc/day"
+        if "freq_cyc/day" in cols
+        else None
+    )
+    missing = []
+    if "sector" not in cols:
+        missing.append("sector")
+    if mid_key is None:
+        missing.append("mid_btjd (or legacy mid_tjd)")
+    if freq_key is None:
+        missing.append("freq_cyc_per_day (or legacy freq_cyc/day)")
     if missing:
         raise ValueError(f"Orbital-frequency table missing columns: {missing}. Found: {list(df.columns)}")
+
     out = {}
-    for _, r in df.iterrows():
+    invalid_rows = []
+    for row_index, r in df.iterrows():
         try:
             sec = int(r[cols["sector"]])
-        except Exception:
+            mid_btjd = float(r[cols[mid_key]])
+            freq = float(r[cols[freq_key]])
+        except Exception as exc:
+            invalid_rows.append(f"row {int(row_index) + 2}: {type(exc).__name__}")
             continue
-        mid_btjd = float(r[cols["mid_tjd"]])
-        freq = float(r[cols["freq_cyc/day"]])
-        if np.isfinite(mid_btjd) and np.isfinite(freq):
-            out[sec] = (mid_btjd, freq)
+        if sec < 1 or not np.isfinite(mid_btjd) or not np.isfinite(freq) or freq <= 0:
+            invalid_rows.append(
+                f"row {int(row_index) + 2}: sector={sec}, mid_btjd={mid_btjd}, frequency={freq}"
+            )
+            continue
+        if sec in out:
+            raise ValueError(f"Orbital-frequency table contains duplicate sector {sec}: {p}")
+        out[sec] = (mid_btjd, freq)
+
+    if invalid_rows:
+        preview = "; ".join(invalid_rows[:5])
+        if len(invalid_rows) > 5:
+            preview += f"; plus {len(invalid_rows) - 5} more"
+        raise ValueError(f"Orbital-frequency table contains invalid rows ({preview}): {p}")
     if not out:
         raise ValueError(f"Orbital-frequency table loaded but no valid rows found: {p}")
     return out
@@ -582,6 +725,12 @@ def pixel_radius_from_seed(seed_pix, iy: int, ix: int):
 # =============================================================================
 
 def gaia_brightest_sources_near(tpf, radius_arcmin: float = 6.0):
+    if Gaia is None:
+        raise ImportError(
+            "Gaia target discovery requires astroquery. Install astroquery, "
+            "or use --no-gaia for a single-target image-based extraction."
+        )
+
     ra0 = dec0 = None
     for k in ("RA_OBJ", "RA", "ra"):
         if hasattr(tpf, "meta") and k in tpf.meta:
@@ -659,6 +808,31 @@ def sources_inside_stamp(tpf, gaia_tab, cadence_idx: int):
         )
 
     return gaia_in, coords_grid
+
+
+def coordinate_grid_for_flux(tpf, cadence_idx: int, flux: np.ndarray, mean_img: np.ndarray):
+    """Return a SkyCoord pixel grid, cropping it and the images consistently."""
+    coords_grid = tpf.get_coordinates(cadence=cadence_idx)
+    if not isinstance(coords_grid, SkyCoord):
+        ra_grid, dec_grid = coords_grid
+        coords_grid = SkyCoord(
+            ra=np.asarray(ra_grid, float) * u.deg,
+            dec=np.asarray(dec_grid, float) * u.deg,
+        )
+
+    ny_flux, nx_flux = flux.shape[1], flux.shape[2]
+    ny_cg, nx_cg = coords_grid.shape
+    if (ny_cg, nx_cg) != (ny_flux, nx_flux):
+        ny0 = min(ny_cg, ny_flux)
+        nx0 = min(nx_cg, nx_flux)
+        print(
+            f"  [WARN] Shape mismatch coords_grid={coords_grid.shape} vs "
+            f"flux={(ny_flux, nx_flux)}; cropping to {(ny0, nx0)}"
+        )
+        coords_grid = coords_grid[:ny0, :nx0]
+        flux = flux[:, :ny0, :nx0]
+        mean_img = mean_img[:ny0, :nx0]
+    return coords_grid, flux, mean_img
 
 
 def nearest_pixel_to_coord(coords_grid: SkyCoord, target_coord: SkyCoord):
@@ -1067,8 +1241,12 @@ def grow_aperture_bright_core_preseed(
 
 def find_tpfs(search_dir: Path, recursive: bool = False):
     pats = [
+        # TESS SPOC/TESS-SPOC target-pixel products and TESSCut/Astrocut files.
         "*tp.fits", "*tpf.fits", "*tp.fits.gz", "*tpf.fits.gz",
         "*_astrocut.fits", "*_astrocut.fits.gz",
+        # Kepler and K2 long-/short-cadence target-pixel products.
+        "*_lpd-targ.fits", "*_spd-targ.fits",
+        "*_lpd-targ.fits.gz", "*_spd-targ.fits.gz",
     ]
     out = []
     if recursive:
@@ -1078,6 +1256,195 @@ def find_tpfs(search_dir: Path, recursive: bool = False):
         for pat in pats:
             out.extend(search_dir.glob(pat))
     return sorted({p.resolve() for p in out})
+
+
+def _first_tpf_metadata_value(tpf, keys):
+    """Return the first non-empty value from Lightkurve metadata/FITS headers."""
+    if tpf is None:
+        return None
+    meta = getattr(tpf, "meta", None)
+    if meta is not None:
+        for key in keys:
+            try:
+                if key in meta and meta[key] not in (None, ""):
+                    return meta[key]
+            except Exception:
+                pass
+    try:
+        hdu = getattr(tpf, "hdu", None)
+        if hdu is not None:
+            for item in hdu[:3]:
+                hdr = getattr(item, "header", None)
+                if hdr is None:
+                    continue
+                for key in keys:
+                    val = hdr.get(key)
+                    if val not in (None, ""):
+                        return val
+    except Exception:
+        pass
+    return None
+
+
+def _first_fits_header_value(path: Path, keys):
+    try:
+        with fits.open(path, memmap=True) as hdul:
+            for hdu in hdul[:3]:
+                for key in keys:
+                    val = hdu.header.get(key)
+                    if val not in (None, ""):
+                        return val
+    except Exception:
+        pass
+    return None
+
+
+def infer_mission(tpf_path: Path, tpf=None) -> str:
+    """Infer TESS, KEPLER, or K2 from metadata, class, and filename."""
+    raw = _first_tpf_metadata_value(tpf, ("MISSION", "TELESCOP", "OBSERVAT"))
+    if raw is None:
+        raw = _first_fits_header_value(tpf_path, ("MISSION", "TELESCOP", "OBSERVAT"))
+    text = str(raw or "").strip().upper()
+    name = tpf_path.name.lower()
+    cls = type(tpf).__name__.lower() if tpf is not None else ""
+
+    # K2 uses KeplerTargetPixelFile, so campaign/filename checks must precede
+    # the generic Kepler class/name check.
+    campaign = _first_tpf_metadata_value(tpf, ("CAMPAIGN",))
+    if campaign is None:
+        campaign = _first_fits_header_value(tpf_path, ("CAMPAIGN",))
+    if "K2" in text or name.startswith("ktwo") or campaign not in (None, ""):
+        return "K2"
+    if "TESS" in text or "tess" in cls or name.startswith("tess") or "astrocut" in name:
+        return "TESS"
+    if "KEPLER" in text or "kepler" in cls or name.startswith("kplr"):
+        return "KEPLER"
+    return "UNKNOWN"
+
+
+def is_tesscut_product(tpf_path: Path, tpf=None) -> bool:
+    """Identify TESSCut/Astrocut stamps, which do not have a SPOC target."""
+    if "astrocut" in tpf_path.name.lower():
+        return True
+    raw = _first_tpf_metadata_value(tpf, ("CREATOR", "PROCNAME", "ORIGIN"))
+    if raw is None:
+        raw = _first_fits_header_value(tpf_path, ("CREATOR", "PROCNAME", "ORIGIN"))
+    text = str(raw or "").lower()
+    return "astrocut" in text or "tesscut" in text
+
+
+def prf_saturation_tessmag(tpf_path: Path, tpf=None):
+    """Return a reliable target TESS magnitude, or None for targetless cutouts."""
+    if is_tesscut_product(tpf_path, tpf):
+        return None
+    value = _first_tpf_metadata_value(tpf, ("TESSMAG", "TMAG"))
+    if value is None:
+        value = _first_fits_header_value(tpf_path, ("TESSMAG", "TMAG"))
+    try:
+        value = float(value)
+        return value if np.isfinite(value) else None
+    except Exception:
+        return None
+
+
+def tpf_flux_unit(tpf):
+    """Return the Lightkurve flux-cube unit when available."""
+    try:
+        unit = getattr(getattr(tpf, "flux", None), "unit", None)
+        return str(unit) if unit is not None and str(unit).strip() else None
+    except Exception:
+        return None
+
+
+def infer_native_time_system(tpf_path: Path, tpf=None, mission: str | None = None) -> str:
+    """Return the native numeric time convention used by the loaded TPF."""
+    try:
+        fmt = str(getattr(getattr(tpf, "time", None), "format", "")).strip().upper()
+        if fmt in {"BTJD", "BKJD", "JD", "MJD"}:
+            return fmt
+    except Exception:
+        pass
+    bjdref = _first_tpf_metadata_value(tpf, ("BJDREFI",))
+    if bjdref is None:
+        bjdref = _first_fits_header_value(tpf_path, ("BJDREFI",))
+    try:
+        bjdref = int(round(float(bjdref)))
+        if bjdref == 2457000:
+            return "BTJD"
+        if bjdref == 2454833:
+            return "BKJD"
+    except Exception:
+        pass
+    mission = str(mission or infer_mission(tpf_path, tpf)).upper()
+    if mission == "TESS":
+        return "BTJD"
+    if mission in {"KEPLER", "K2"}:
+        return "BKJD"
+    return "JD"
+
+
+def infer_observation_tag(tpf_path: Path, tpf=None) -> str:
+    """Return s#### for TESS, q## for Kepler, or c## for K2."""
+    mission = infer_mission(tpf_path, tpf)
+    if mission == "TESS":
+        sec = infer_sector_from_tpf(tpf_path, tpf)
+        if sec is not None:
+            return f"s{int(sec):04d}"
+        m = re.search(r"s(\d{4})", tpf_path.name.lower())
+        return m.group(0) if m else "tess_no_sector"
+
+    if mission == "KEPLER":
+        q = _first_tpf_metadata_value(tpf, ("QUARTER",))
+        if q is None:
+            q = _first_fits_header_value(tpf_path, ("QUARTER",))
+        try:
+            return f"q{int(q):02d}"
+        except Exception:
+            return "kepler_no_quarter"
+
+    if mission == "K2":
+        c = _first_tpf_metadata_value(tpf, ("CAMPAIGN",))
+        if c is None:
+            c = _first_fits_header_value(tpf_path, ("CAMPAIGN",))
+        try:
+            return f"c{int(c):02d}"
+        except Exception:
+            m = re.search(r"[-_]c(\d{1,3})", tpf_path.name.lower())
+            return f"c{int(m.group(1)):02d}" if m else "k2_no_campaign"
+
+    return "unknown_observation"
+
+
+def make_lightcurve_dataframe(time, flux, mission: str, time_system: str, flux_name: str):
+    """Create a mission-aware, backward-compatible light-curve table.
+
+    Kepler/K2 retain native BKJD and also include an exact BTJD conversion so
+    the existing TESS-oriented detrender can continue to consume the files.
+    """
+    t = np.asarray(time, float)
+    f = np.asarray(flux, float)
+    mission = str(mission or "UNKNOWN").upper()
+    system = str(time_system or "JD").upper()
+    data = {}
+    if system == "BKJD":
+        data["time_bkjd"] = t
+        data["time_btjd"] = t - 2167.0  # (BJD-2454833) -> (BJD-2457000)
+    elif system == "BTJD":
+        data["time_btjd"] = t
+    elif system == "MJD":
+        data["time_mjd"] = t
+        data["time_btjd"] = t - 56999.5
+    else:
+        data["time_jd"] = t
+        data["time_btjd"] = t - 2457000.0
+    data[flux_name] = f
+    data["mission"] = np.full(len(t), mission, dtype=object)
+    data["time_system"] = np.full(len(t), system, dtype=object)
+    return pd.DataFrame(data)
+
+
+def mission_time_axis_label(time_system: str) -> str:
+    return f"Time [{str(time_system or 'JD').upper()}]"
 
 
 def sanitize_token(text: str) -> str:
@@ -1105,7 +1472,7 @@ def normalize_simbad_main_id(name: str) -> str:
 
     This intentionally prefers the cleaned SIMBAD MAIN_ID itself (for example
     ``* alf UMi`` -> ``alf_UMi``) rather than searching for a more colloquial
-    alias such as ``Polaris`` or ``Lodestar``. That keeps filenames consistent
+    alias such as a familiar stellar name. That keeps filenames consistent
     across stars: e.g. ``alf_UMi``, ``alf_Lyr``, ``alf_Cyg``.
     """
     n = str(name).strip()
@@ -1188,26 +1555,168 @@ def resolve_target_label(target_coord: SkyCoord, gaia_source_id: str | None = No
     return fallback
 
 
+def build_gaia_prf_scene(
+    tpf,
+    gaia_tab,
+    *,
+    target_source_id: str,
+    target_label: str,
+    target_gmag: float,
+    target_row: float,
+    target_column: float,
+    shape: tuple[int, int],
+    margin_pixels: float = 6.0,
+    max_delta_mag: float = 8.0,
+    max_sources: int = 20,
+    duplicate_distance_pixels: float = 0.05,
+):
+    """Build a target-first Gaia source list for constrained PRF fitting.
+
+    Sources just outside the stamp are retained when their centers lie within
+    ``margin_pixels`` of an edge.  Neighbor labels deliberately use stable Gaia
+    identifiers rather than making one SIMBAD query per contaminant.
+    """
+    ny, nx = map(int, shape)
+    margin = max(0.0, float(margin_pixels))
+    dmag = max(0.0, float(max_delta_mag))
+    max_sources = max(1, int(max_sources))
+    duplicate_distance = max(0.0, float(duplicate_distance_pixels))
+    target_source_id = str(target_source_id)
+    candidates = []
+    for row in gaia_tab:
+        try:
+            sid = str(row["source_id"])
+            mag = float(row["phot_g_mean_mag"])
+            coord = SkyCoord(float(row["ra"]) * u.deg, float(row["dec"]) * u.deg)
+            xpix, ypix = tpf.wcs.world_to_pixel(coord)
+            xpix, ypix = float(xpix), float(ypix)
+        except Exception:
+            continue
+        if not (np.isfinite(xpix) and np.isfinite(ypix) and np.isfinite(mag)):
+            continue
+        is_target = sid == target_source_id
+        in_extended = (
+            -margin <= xpix <= (nx - 1 + margin)
+            and -margin <= ypix <= (ny - 1 + margin)
+        )
+        if not in_extended:
+            continue
+        if not is_target and np.isfinite(target_gmag) and mag > float(target_gmag) + dmag:
+            continue
+        label = target_label if is_target else sanitize_token(f"GaiaDR3_{sid}")
+        candidates.append({
+            "row": ypix, "column": xpix, "label": label,
+            "source_id": sid, "magnitude": mag,
+            "role": "target" if is_target else "neighbor",
+            "is_target": is_target,
+        })
+
+    if not any(c["is_target"] for c in candidates):
+        candidates.insert(0, {
+            "row": float(target_row), "column": float(target_column),
+            "label": target_label, "source_id": target_source_id,
+            "magnitude": float(target_gmag), "role": "target", "is_target": True,
+        })
+    candidates.sort(key=lambda c: (not c["is_target"], c["magnitude"]))
+
+    # Remove effectively duplicate catalog entries, always preserving the target
+    # and otherwise the brighter source.
+    deduped = []
+    for candidate in candidates:
+        duplicate = None
+        for j, kept in enumerate(deduped):
+            distance = np.hypot(candidate["row"] - kept["row"], candidate["column"] - kept["column"])
+            if distance < duplicate_distance:
+                duplicate = j
+                break
+        if duplicate is None:
+            deduped.append(candidate)
+        elif candidate["is_target"] and not deduped[duplicate]["is_target"]:
+            deduped[duplicate] = candidate
+    deduped.sort(key=lambda c: (not c["is_target"], c["magnitude"]))
+    deduped = deduped[:max_sources]
+
+    # Guarantee target-first ordering after the source cap.
+    target_candidates = [c for c in deduped if c["is_target"]]
+    neighbors = [c for c in deduped if not c["is_target"]]
+    if target_candidates:
+        ordered = [target_candidates[0]] + neighbors[:max_sources - 1]
+    else:
+        ordered = [{
+            "row": float(target_row), "column": float(target_column),
+            "label": target_label, "source_id": target_source_id,
+            "magnitude": float(target_gmag), "role": "target", "is_target": True,
+        }] + neighbors[:max_sources - 1]
+    return [
+        SceneSource(
+            float(c["row"]), float(c["column"]), str(c["label"]),
+            str(c["source_id"]), float(c["magnitude"]), str(c["role"]),
+        )
+        for c in ordered
+    ]
+
+
 def infer_sector_tag(tpf_path: Path, tpf=None) -> str:
-    sec = infer_sector_from_tpf(tpf_path, tpf)
-    if sec is None:
-        m = re.search(r"(s\d{4})", tpf_path.name.lower())
-        if m:
-            return m.group(1)
-        return "nosector"
-    return f"s{int(sec):04d}"
+    # Historical function name retained because many output-building call sites
+    # use ``sector_tag``.  It now returns a mission-aware observation tag.
+    return infer_observation_tag(tpf_path, tpf)
 
 
 def build_output_stem(sector_tag: str, source_label: str, target_idx: int, method_tag: str) -> str:
     return f"{sanitize_token(sector_tag)}_{sanitize_token(source_label)}_target{int(target_idx)}_{sanitize_token(method_tag)}"
 
 
+
+
+def build_prf_scene_output_label(source, *, is_primary: bool) -> str:
+    """Filename label for a written PRF scene-source light curve.
+
+    The selected primary keeps the established human-readable filename.  Other
+    scene sources include both a resolved label, when available, and the Gaia
+    DR3 identifier so output names remain unambiguous and reproducible.
+    """
+    label = sanitize_token(getattr(source, "label", "") or "unknown_source")
+    source_id = str(getattr(source, "source_id", "") or "").strip()
+    if is_primary or not source_id:
+        return label
+    gaia_label = sanitize_token(f"GaiaDR3_{source_id}")
+    if label.lower() == gaia_label.lower() or label.lower().startswith("gaiadr3_"):
+        return gaia_label
+    return sanitize_token(f"{label}_{gaia_label}")
+
+
+def resolve_prf_scene_output_names(tpf, prf_result, source_indices):
+    """Resolve human-readable names only for scene sources being written.
+
+    SIMBAD failures are harmless: the stable Gaia identifier remains the label.
+    This is intentionally deferred until after output-eligibility pruning so an
+    all-source run does not issue catalog queries for sources that will be skipped.
+    """
+    scene_rows = prf_result.metadata.get("reference_scene", {}).get("sources", [])
+    positions = prf_result.metadata.get("source_positions", [])
+    for j in source_indices:
+        j = int(j)
+        if j <= 0 or j >= len(prf_result.sources):
+            continue
+        source = prf_result.sources[j]
+        try:
+            coord = tpf.wcs.pixel_to_world(float(source.column), float(source.row))
+            resolved = resolve_target_label(coord, source.source_id)
+        except Exception:
+            resolved = source.label
+        if resolved:
+            source.label = sanitize_token(resolved)
+        if j < len(scene_rows):
+            scene_rows[j]["label"] = source.label
+        if j < len(positions):
+            positions[j]["label"] = source.label
+
 def fast_object_label_from_fits(tpf_path: Path) -> str:
     try:
         with fits.open(tpf_path, memmap=True) as hdul:
             for hdu in hdul[:2]:
                 hdr = hdu.header
-                for key in ("OBJECT", "TARGNAME", "TARGET", "TICID"):
+                for key in ("OBJECT", "TARGNAME", "TARGET", "TICID", "KEPLERID", "EPICID", "EPIC"):
                     val = hdr.get(key)
                     if val is None:
                         continue
@@ -1219,11 +1728,17 @@ def fast_object_label_from_fits(tpf_path: Path) -> str:
     m = re.search(r"-(\d{16})-", tpf_path.name)
     if m:
         return sanitize_token(f"TIC{m.group(1).lstrip('0')}")
+    m = re.search(r"kplr(\d{9})", tpf_path.name.lower())
+    if m:
+        return sanitize_token(f"KIC_{int(m.group(1))}")
+    m = re.search(r"ktwo(\d{9})", tpf_path.name.lower())
+    if m:
+        return sanitize_token(f"EPIC_{int(m.group(1))}")
     return sanitize_token("unknown_target")
 
 
-def fast_fullstamp_pure_sum_from_fits(tpf_path: Path, no_quality0: bool = False, block_cadences: int = 256):
-    """Memory-safe pure-sum extraction for the full stamp using FITS memmap blocks."""
+def fast_full_region_sum_from_fits(tpf_path: Path, no_quality0: bool = False, block_cadences: int = 256):
+    """Memory-safe full-stamp summation using FITS memmap blocks."""
     with fits.open(tpf_path, memmap=True) as hdul:
         data = hdul[1].data
         names = set(data.names)
@@ -1375,7 +1890,49 @@ def infer_header_target_coord(tpf):
         return None
 
 
-def infer_single_target_label(tpf, mean_image_2d=None, gaia_radius_arcmin: float = 12.0):
+def prioritize_tesscut_center_source(gaia_in, tpf, image_shape):
+    """Place the Gaia source nearest the requested TESSCut centre first.
+
+    TESSCut stamps are sky cutouts rather than target-specific SPOC products.
+    Their brightest in-stamp source can be far from the requested coordinate,
+    especially for large cutouts.  Remaining sources retain the Gaia query's
+    brightness order so multi-target behavior stays deterministic.
+    """
+    if gaia_in is None or len(gaia_in) < 2:
+        return gaia_in, None
+
+    center_coord = infer_header_target_coord(tpf)
+    if center_coord is None:
+        try:
+            ny, nx = map(int, image_shape)
+            center_coord = tpf.wcs.pixel_to_world((nx - 1) / 2.0, (ny - 1) / 2.0)
+        except Exception:
+            center_coord = None
+    if center_coord is None:
+        return gaia_in, None
+
+    try:
+        coords = SkyCoord(
+            ra=np.asarray(gaia_in["ra"], float) * u.deg,
+            dec=np.asarray(gaia_in["dec"], float) * u.deg,
+        )
+        separations = np.asarray(center_coord.separation(coords).arcsec, float)
+        finite = np.isfinite(separations)
+        if not np.any(finite):
+            return gaia_in, None
+        nearest = int(np.nanargmin(np.where(finite, separations, np.nan)))
+        order = [nearest] + [i for i in range(len(gaia_in)) if i != nearest]
+        return gaia_in[np.asarray(order, dtype=int)], float(separations[nearest])
+    except Exception:
+        return gaia_in, None
+
+
+def infer_single_target_label(
+    tpf,
+    mean_image_2d=None,
+    gaia_radius_arcmin: float = 12.0,
+    allow_catalog: bool = True,
+):
     """Infer a human-friendly label for a single-target or saturated-target run.
 
     Preference order:
@@ -1387,6 +1944,10 @@ def infer_single_target_label(tpf, mean_image_2d=None, gaia_radius_arcmin: float
       6) unknown_target
 
     Returns (label, gaia_source_id_or_none, gaia_g_mag_or_nan).
+
+    ``allow_catalog=False`` honors an explicit no-Gaia/offline workflow by
+    skipping SIMBAD and Gaia network lookups while retaining local FITS
+    metadata choices.
     """
     # First choice: useful human-friendly metadata if present.
     # Reject purely catalog-like values here so that SIMBAD/common-name
@@ -1408,55 +1969,60 @@ def infer_single_target_label(tpf, mean_image_2d=None, gaia_radius_arcmin: float
     # Second choice: resolve the intended target coordinate from header metadata.
     # This is the right thing for saturated single-target files, where the
     # brightest pixel can be displaced from the stellar photocenter.
-    try:
-        tc_hdr = infer_header_target_coord(tpf)
-        if tc_hdr is not None:
-            label = resolve_target_label(tc_hdr, None)
-            if label != "unknown_target":
-                return label, None, np.nan
-    except Exception:
-        pass
+    if allow_catalog:
+        try:
+            tc_hdr = infer_header_target_coord(tpf)
+            if tc_hdr is not None:
+                label = resolve_target_label(tc_hdr, None)
+                if label != "unknown_target":
+                    return label, None, np.nan
+        except Exception:
+            pass
 
     # Third choice: resolve the brightest pixel position directly through SIMBAD.
     # This is only a fallback when there is no useful target coordinate in the
     # header or that lookup fails.
-    try:
-        if mean_image_2d is None:
-            mean_image_2d = np.nanmean(np.asarray(tpf.flux, float), axis=0)
-        if np.isfinite(mean_image_2d).any():
-            iy, ix = np.unravel_index(int(np.nanargmax(mean_image_2d)), mean_image_2d.shape)
-            tc = tpf.wcs.pixel_to_world(float(ix), float(iy))
-            label = resolve_target_label(tc, None)
-            if label != "unknown_target":
-                return label, None, np.nan
-    except Exception:
-        pass
+    if allow_catalog:
+        try:
+            if mean_image_2d is None:
+                mean_image_2d = np.nanmean(np.asarray(tpf.flux, float), axis=0)
+            if np.isfinite(mean_image_2d).any():
+                iy, ix = np.unravel_index(int(np.nanargmax(mean_image_2d)), mean_image_2d.shape)
+                tc = tpf.wcs.pixel_to_world(float(ix), float(iy))
+                label = resolve_target_label(tc, None)
+                if label != "unknown_target":
+                    return label, None, np.nan
+        except Exception:
+            pass
 
     # Fourth choice: TIC-like metadata if present. This is preferred to a raw
     # Gaia DR3 id in single-target saturated workflows because it usually
     # reflects the intended target for the cutout.
-    for key in ("TICID", "TARGETID"):
+    for key, prefix in (("TICID", "TIC"), ("TARGETID", "TIC"),
+                        ("KEPLERID", "KIC"), ("KEPLER_ID", "KIC"),
+                        ("EPICID", "EPIC"), ("EPIC", "EPIC")):
         try:
             if hasattr(tpf, "meta") and key in tpf.meta and tpf.meta[key] not in (None, ""):
-                return sanitize_token(f"TIC_{tpf.meta[key]}"), None, np.nan
+                return sanitize_token(f"{prefix}_{tpf.meta[key]}"), None, np.nan
         except Exception:
             pass
 
     # Fifth choice: brightest Gaia source actually inside the stamp.
-    try:
-        gaia_tab = gaia_brightest_sources_near(tpf, radius_arcmin=max(float(gaia_radius_arcmin), 6.0))
-        gaia_in, _ = sources_inside_stamp(tpf, gaia_tab, cadence_idx=0)
-        if len(gaia_in) > 0:
-            row = gaia_in[0]
-            tc = SkyCoord(float(row["ra"]) * u.deg, float(row["dec"]) * u.deg)
-            sid = str(row["source_id"])
-            try:
-                gmag = float(row["phot_g_mean_mag"])
-            except Exception:
-                gmag = np.nan
-            return resolve_target_label(tc, sid), sid, gmag
-    except Exception:
-        pass
+    if allow_catalog:
+        try:
+            gaia_tab = gaia_brightest_sources_near(tpf, radius_arcmin=max(float(gaia_radius_arcmin), 6.0))
+            gaia_in, _ = sources_inside_stamp(tpf, gaia_tab, cadence_idx=0)
+            if len(gaia_in) > 0:
+                row = gaia_in[0]
+                tc = SkyCoord(float(row["ra"]) * u.deg, float(row["dec"]) * u.deg)
+                sid = str(row["source_id"])
+                try:
+                    gmag = float(row["phot_g_mean_mag"])
+                except Exception:
+                    gmag = np.nan
+                return resolve_target_label(tc, sid), sid, gmag
+        except Exception:
+            pass
 
     return "unknown_target", None, np.nan
 
@@ -1467,7 +2033,7 @@ def infer_single_target_label(tpf, mean_image_2d=None, gaia_radius_arcmin: float
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(
-        description="Extract multi-target light curves from TPFs (Voronoi-then-grow).",
+        description="Extract multi-target aperture light curves from TESS, Kepler, K2, and TESSCut TPFs (Voronoi-then-grow).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
@@ -1496,19 +2062,6 @@ def parse_args(argv=None):
         help="Output root directory.",
     )
     p.add_argument(
-        "--products-subdir",
-        type=str,
-        default="products",
-        help="Deprecated; outputs are now written directly into --output-root in a flat structure.",
-    )
-    p.add_argument(
-        "--lightcurves-subdir",
-        type=str,
-        default="lightcurves_raw",
-        help="Deprecated; light-curve files are now written directly into --output-root in a flat structure.",
-    )
-
-    p.add_argument(
         "--method",
         choices=["jump", "core", "both"],
         default="jump",
@@ -1519,7 +2072,8 @@ def parse_args(argv=None):
         "--n-targets",
         type=int,
         default=2,
-        help="Max number of Gaia targets to extract per stamp (brightest in-stamp).",
+        help=("Max number of Gaia targets to extract per stamp. TESSCut target 1 is "
+              "nearest the requested cutout centre; otherwise brightness order is used."),
     )
     p.add_argument(
         "--gaia-radius-arcmin",
@@ -1581,11 +2135,84 @@ def parse_args(argv=None):
         action="store_true",
         help="Do not save aperture overlay PNGs.",
     )
+
+    # Optional jitter-aware PRF photometry. This is an additional extraction
+    # product; it never replaces the selected aperture product.
+    p.add_argument(
+        "--prf-photometry", action="store_true",
+        help="Also extract cadence-dependent, jitter-aware TESS PRF photometry. Kepler/K2 inputs are skipped with a warning.",
+    )
+    p.add_argument(
+        "--prf-backend", choices=["auto", "lkprf", "tess_prf", "gaussian"], default="auto",
+        help="PRF backend. Auto prefers the official lkprf/TESS_PRF engineering models.",
+    )
+    p.add_argument(
+        "--prf-motion-source", choices=["auto", "poscorr", "ensemble", "target", "fixed"], default="auto",
+        help="Motion source. Auto uses varying POS_CORR, then ensemble centroid, target centroid, and fixed position; constant placeholders are rejected.",
+    )
+    p.add_argument(
+        "--prf-scene-mode", choices=["single", "gaia"], default="single",
+        help="Single-source PRF extraction or a target-first Gaia scene with fixed fitted neighbors.",
+    )
+    p.add_argument(
+        "--prf-neighbor-treatment", choices=["fixed"], default="fixed",
+        help="Cadence treatment for Gaia neighbors. Fixed holds non-active sources at their reference-scene fluxes.",
+    )
+    p.add_argument(
+        "--prf-source-output", choices=["primary", "all"], default="primary",
+        help=("Which Gaia-scene light curves to write. Primary (default) writes only the selected target. "
+              "All extracts each usable retained scene source separately while holding all other sources fixed."),
+    )
+    p.add_argument("--prf-neighbor-dmag", type=float, default=8.0,
+                   help="Maximum Gaia G magnitude difference for initial scene neighbors.")
+    p.add_argument("--prf-neighbor-margin", type=float, default=6.0,
+                   help="Include Gaia sources this many pixels outside the stamp edge.")
+    p.add_argument("--prf-max-scene-sources", type=int, default=20,
+                   help="Maximum target-plus-neighbor sources in the initial Gaia PRF scene.")
+    p.add_argument("--prf-min-neighbor-fraction", type=float, default=1e-4,
+                   help="Drop fitted neighbors contributing less than this fraction of target flux inside the stamp.")
+    p.add_argument(
+        "--prf-background", choices=["none", "constant", "plane"], default="plane",
+        help="Per-cadence background terms fitted simultaneously with the PRF flux; plane is the recommended default.",
+    )
+    p.add_argument("--prf-min-weight", type=float, default=1e-5,
+                   help="Minimum relative PRF weight used to define the fitting region.")
+    p.add_argument("--prf-fit-radius", type=float, default=6.0,
+                   help="Radius in pixels included around each modeled PRF source.")
+    p.add_argument("--prf-shift-quantization", type=float, default=0.01,
+                   help="Requested regular-grid spacing for precomputed shifted PRFs; cadence PRFs are bilinearly interpolated and each axis is capped at 21 nodes.")
+    p.add_argument("--prf-max-shift", type=float, default=2.0,
+                   help="Maximum absolute cadence motion retained after robust cleaning [pixel].")
+    p.add_argument("--prf-no-diagnostics", action="store_true",
+                   help="Do not write the PRF diagnostic PNG (motion NPZ and metadata are still written).")
+    p.add_argument("--prf-no-gaussian-fallback", action="store_true",
+                   help="Fail PRF extraction instead of using a Gaussian if official PRF packages are unavailable.")
     
     p.add_argument(
-    "--pure-sum",
-    action="store_true",
-    help="Extract LC by pure summation of all aperture pixels (no weighting / metric)."
+        "--full-region-sum",
+        dest="full_region_sum",
+        action="store_true",
+        help="Sum every pixel in the allowed target region without aperture optimization.",
+    )
+    # One-release command-line compatibility for saved scripts.  The alias is
+    # deliberately hidden so new users see only descriptive terminology.
+    p.add_argument(
+        "--pure-sum",
+        dest="full_region_sum",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help=argparse.SUPPRESS,
+    )
+
+    p.add_argument(
+        "--external-mask-file",
+        type=str,
+        default="",
+        help=(
+            "Fixed single-target aperture mask in a text file. Use one image row per line "
+            "with comma- or whitespace-separated 1/0 or Y/N values. The mask must exactly "
+            "match the TPF row/column shape and overrides --method."
+        ),
     )
 
     p.add_argument(
@@ -1595,55 +2222,172 @@ def parse_args(argv=None):
         help="Figure of merit used during jump/core aperture growth.",
     )
 
-    # MATLAB-style saturated-star mode (optional)
+    # Saturated-target workflows.  The first augments standard aperture
+    # extraction; the second is a separate, single-target extraction approach.
+    p.add_argument(
+        "--saturated-systematics-correction",
+        dest="saturated_systematics_correction",
+        action="store_true",
+        help="Apply the saturated-target background, orbital-phase, and split-sector systematics correction.",
+    )
     p.add_argument(
         "--matlab-sat-mode",
+        dest="saturated_systematics_correction",
         action="store_true",
-        help="Enable MATLAB-style saturated-star extraction/detrending (only meaningful for n-targets=1 and heavily saturated targets).",
+        default=argparse.SUPPRESS,
+        help=argparse.SUPPRESS,
     )
     p.add_argument(
         "--orbtable",
         type=str,
-        default="",
-        help="Path to tess_sector_orbfreq_midpoints.csv providing per-sector orbital frequency and mid-sector time (BTJD-style). Required if --matlab-sat-mode is set.",
+        default=str(DEFAULT_ORBITAL_TABLE),
+        help=(
+            "Sector orbital-frequency/midpoint CSV used by saturated-target systematics correction. "
+            "The bundled tess_sector_orbfreq_midpoints.csv is used by default."
+        ),
     )
     p.add_argument("--sat-thresh", type=float, default=1e5, help="Mean-image threshold to consider a pixel saturated (counts).")
     p.add_argument("--sat-min-npix", type=int, default=20, help="Minimum number of pixels above --sat-thresh to treat target as heavily saturated.")
     p.add_argument("--back-nfaint", type=int, default=20, help="Number of faintest pixels to use for per-cadence background estimate.")
     p.add_argument("--phase-bin", type=float, default=0.01, help="Phase bin width for orbital-phase template subtraction.")
     p.add_argument(
-        "--matlab-pure-single-sat",
+        "--saturation-optimized-aperture",
+        dest="saturation_optimized_aperture",
         action="store_true",
-        help="For a single heavily saturated source, bypass Gaia/jump/core entirely and run the pure MATLAB-style Polaris extractor with no extra detrending.",
+        help="For one heavily saturated source, bypass Gaia and jump/core growth and use scatter-optimized aperture growth.",
+    )
+    p.add_argument(
+        "--matlab-pure-single-sat",
+        dest="saturation_optimized_aperture",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help=argparse.SUPPRESS,
+    )
+    p.add_argument(
+        "--saturated-aperture-threshold",
+        dest="saturated_aperture_threshold",
+        type=float,
+        default=3000.0,
+        help="Initial mean-image threshold for the saturation-optimized aperture seed.",
     )
     p.add_argument(
         "--matlab-ap-thresh",
+        dest="saturated_aperture_threshold",
         type=float,
-        default=3000.0,
-        help="Initial mean-image threshold for the pure MATLAB-style saturated-source aperture seed.",
-    )
-    p.add_argument(
-        "--matlab-no-legacy-geometry",
-        action="store_true",
-        help="Disable the preserved legacy MATLAB geometry restrictions in pure MATLAB-style saturated-source mode.",
+        default=argparse.SUPPRESS,
+        help=argparse.SUPPRESS,
     )
 
     return p.parse_args(argv)
 
 
+def validate_args(args) -> None:
+    """Fail early for option combinations that would otherwise fail mid-run."""
+    if int(args.n_targets) < 1:
+        raise ValueError("--n-targets must be at least 1.")
+    if args.saturation_optimized_aperture and int(args.n_targets) != 1:
+        raise ValueError("--saturation-optimized-aperture requires --n-targets=1.")
+    if args.saturation_optimized_aperture:
+        incompatible = []
+        if args.full_region_sum:
+            incompatible.append("--full-region-sum")
+        if getattr(args, "gaia_region_sum", False):
+            incompatible.append("--gaia-region-sum")
+        if getattr(args, "external_mask_file", ""):
+            incompatible.append("--external-mask-file")
+        if args.saturated_systematics_correction:
+            incompatible.append("--saturated-systematics-correction")
+        if args.prf_photometry:
+            incompatible.append("--prf-photometry")
+        if incompatible:
+            raise ValueError(
+                "--saturation-optimized-aperture is a separate extraction path "
+                "and cannot be combined with " + ", ".join(incompatible) + "."
+            )
+    if args.saturated_systematics_correction and int(args.n_targets) != 1:
+        raise ValueError("--saturated-systematics-correction requires --n-targets=1.")
+    if getattr(args, "external_mask_file", "") and int(args.n_targets) != 1:
+        raise ValueError("--external-mask-file requires --n-targets=1.")
+    if getattr(args, "external_mask_file", "") and args.full_region_sum:
+        raise ValueError("--external-mask-file cannot be combined with --full-region-sum.")
+    if args.no_gaia and int(args.n_targets) != 1:
+        raise ValueError("--no-gaia requires --n-targets=1.")
+    if not (0.0 <= float(args.amp_q_lo) < float(args.amp_q_hi) <= 100.0):
+        raise ValueError("Aperture amplitude percentiles must satisfy 0 <= low < high <= 100.")
+    if int(args.min_pixels) < 1 or int(args.max_components) < 1:
+        raise ValueError("Aperture sizes and component counts must be positive.")
+    if int(args.sat_min_npix) < 1 or int(args.back_nfaint) < 1:
+        raise ValueError("Saturation/background pixel counts must be positive.")
+    if not (0.0 < float(args.phase_bin) <= 1.0):
+        raise ValueError("--phase-bin must be in the interval (0, 1].")
+    if float(args.prf_fit_radius) <= 0 or float(args.prf_max_shift) <= 0:
+        raise ValueError("PRF fit radius and maximum shift must be positive.")
+
+
+def write_run_configuration(
+    output_root: Path,
+    args,
+    tpf_paths: list[Path],
+    external_mask_metadata: dict | None = None,
+) -> Path:
+    """Write the fully resolved extraction options beside the data products."""
+    created = datetime.now(timezone.utc)
+    settings = {}
+    for key, value in vars(args).items():
+        if isinstance(value, float) and not np.isfinite(value):
+            value = str(value)
+        settings[key] = value
+    payload = {
+        "schema_version": 1,
+        "created_utc": created.isoformat(),
+        "extractor": Path(__file__).name,
+        "settings": settings,
+        "input_files": [str(path) for path in tpf_paths],
+    }
+    if external_mask_metadata is not None:
+        # The checksum and explicit orientation make a hand-edited aperture
+        # reproducible even if its source file is later renamed or changed.
+        payload["external_aperture_mask"] = external_mask_metadata
+    stamp = created.strftime("%Y%m%dT%H%M%S_%fZ")
+    path = output_root / f"extraction_run_config_{stamp}.json"
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return path
+
+
 def main(argv=None):
     global APERTURE_FOM_MODE
     args = parse_args(argv)
+    validate_args(args)
     APERTURE_FOM_MODE = str(getattr(args, "aperture_fom", "stddiff")).strip().lower()
+
+    # Parse a fixed external aperture once. Shape validation is repeated for
+    # each input TPF so directory runs fail clearly if stamp dimensions differ.
+    external_aperture_mask = None
+    external_mask_metadata = None
+    if getattr(args, "external_mask_file", ""):
+        external_aperture_mask, external_mask_metadata = load_external_aperture_mask(
+            args.external_mask_file
+        )
+        args.external_mask_file = external_mask_metadata["source_path"]
+        print(
+            "External aperture mask loaded: "
+            f"{external_mask_metadata['source_path']} "
+            f"shape={tuple(external_aperture_mask.shape)} "
+            f"Npix={external_mask_metadata['selected_pixels']}"
+        )
 
     # Optional: load sector orbital-frequency table once
     sector_orb = None
-    if getattr(args, "matlab_sat_mode", False) and (not getattr(args, "matlab_pure_single_sat", False)):
+    if args.saturated_systematics_correction and not args.saturation_optimized_aperture:
         if not args.orbtable:
-            raise ValueError("--matlab-sat-mode requires --orbtable path to tess_sector_orbfreq_midpoints.csv unless --matlab-pure-single-sat is used")
+            raise ValueError(
+                "--saturated-systematics-correction requires --orbtable "
+                "unless --saturation-optimized-aperture is used"
+            )
+        args.orbtable = str(Path(args.orbtable).expanduser().resolve())
         sector_orb = load_sector_orbtable(args.orbtable)
 
-    output_root = Path(args.output_root)
+    output_root = Path(args.output_root).expanduser().resolve()
     output_root.mkdir(parents=True, exist_ok=True)
     # Flat output structure: all products go directly into --output-root.
     outdir = output_root
@@ -1662,11 +2406,27 @@ def main(argv=None):
     if not tpf_paths:
         raise FileNotFoundError("No TPF files found.")
 
+    args.output_root = str(output_root)
+    config_path = write_run_configuration(
+        output_root,
+        args,
+        tpf_paths,
+        external_mask_metadata=external_mask_metadata,
+    )
+    print(f"Resolved extraction settings: {config_path}")
+
     print(f"TPFs to process: {len(tpf_paths)}")
     for i, p in enumerate(tpf_paths, 1):
         print(f"  [{i}] {p}")
 
-    methods_to_run = ["pure_sum"] if bool(getattr(args, "pure_sum", False)) else ([args.method] if args.method in ("jump", "core") else ["jump", "core"])
+    if external_aperture_mask is not None:
+        # A fixed mask is itself the aperture-selection method. Running both
+        # jump and core would only duplicate the same summed light curve.
+        methods_to_run = ["external_aperture"]
+    elif args.full_region_sum:
+        methods_to_run = ["full_region_sum"]
+    else:
+        methods_to_run = [args.method] if args.method in ("jump", "core") else ["jump", "core"]
 
     for tpf_path in tpf_paths:
         print("\n" + "#" * 80)
@@ -1674,166 +2434,205 @@ def main(argv=None):
 
         outdir = output_root
 
-        # Special fast path for pure-sum runs: avoid loading the full flux cube through Lightkurve.
-        if bool(getattr(args, "pure_sum", False)):
+        # Fast full-region path: avoid loading the full flux cube through Lightkurve.
+        # When PRF photometry is requested we use the normal path because the PRF
+        # branch needs WCS/metadata and cadence-level motion information.
+        if (
+            args.full_region_sum
+            and not args.prf_photometry
+            and not args.saturated_systematics_correction
+            and not args.saturation_optimized_aperture
+        ):
+            mission = infer_mission(tpf_path, None)
+            time_system = infer_native_time_system(tpf_path, None, mission)
             sector_tag = infer_sector_tag(tpf_path, None)
             source_label = fast_object_label_from_fits(tpf_path)
-            t_g, lc_raw, mean_img, ap_mask, crow, ccol, seed = fast_fullstamp_pure_sum_from_fits(
+            t_g, lc_raw, mean_img, ap_mask, crow, ccol, seed = fast_full_region_sum_from_fits(
                 tpf_path,
                 no_quality0=bool(args.no_quality0),
             )
-            yy, xx = np.indices(mean_img.shape)
             print("  Gaia skipped/unavailable: using pixel-defined single target")
             print(f"    [1] seed={seed}  (brightest pixel in mean image)")
 
             med = np.nanmedian(lc_raw)
             lc_xy = lc_raw / med if np.isfinite(med) and med != 0 else lc_raw
-            output_stem = build_output_stem(sector_tag, source_label, 1, "pure_sum")
-            pd.DataFrame({"time_btjd": t_g, "flux_detrended_rel": lc_xy}).to_csv(
-                outdir / f"preferred_lc_{output_stem}.csv", index=False
-            )
+            output_stem = build_output_stem(sector_tag, source_label, 1, "full_region_sum")
+            make_lightcurve_dataframe(
+                t_g, lc_xy, mission, time_system, "flux_detrended_rel"
+            ).to_csv(outdir / f"preferred_lc_{output_stem}.csv", index=False)
             save_lightcurve_plot(
                 t_g, lc_xy,
                 outdir / f"preferred_lc_{output_stem}.png",
-                f"{tpf_path.stem} — {source_label} / target1 (pure_sum)",
+                f"{tpf_path.stem} — {source_label} / target1 (full_region_sum)",
+                time_label=mission_time_axis_label(time_system),
             )
             np.save(outdir / f"aperture_mask_{output_stem}.npy", ap_mask.astype(bool))
             np.save(outdir / f"centroid_row_{output_stem}.npy", np.asarray(crow, float))
             np.save(outdir / f"centroid_col_{output_stem}.npy", np.asarray(ccol, float))
             if not args.no_aperture_plots:
-                save_aperture_plot_matlab(
+                save_aperture_plot(
                     mean_img,
                     ap_mask.astype(bool),
                     outdir / f"aperture_{output_stem}.png",
-                    f"{tpf_path.stem} — {source_label} / target1 (pure_sum)\nGaia G=NA",
+                    f"{tpf_path.stem} — {source_label} / target1 (full_region_sum)\nGaia G=NA",
                 )
-            print(f"  Wrote target1 (pure_sum): preferred_lc_{output_stem}.csv  Npix={int(np.count_nonzero(ap_mask))}")
+            print(f"  Wrote target1 (full_region_sum): preferred_lc_{output_stem}.csv  Npix={int(np.count_nonzero(ap_mask))}")
             continue
 
         tpf = lk.read(str(tpf_path))
-        # Sector inference (used by MATLAB saturated-star mode)
+        mission = infer_mission(tpf_path, tpf)
+        tesscut_product = is_tesscut_product(tpf_path, tpf)
+        time_system = infer_native_time_system(tpf_path, tpf, mission)
+        print(f"  Mission: {mission}; native time: {time_system}; observation: {infer_observation_tag(tpf_path, tpf)}")
+        if getattr(args, "prf_photometry", False) and mission in {"KEPLER", "K2"}:
+            print(
+                f"  [WARN] {mission} target-pixel data detected: the PRF module is TESS-only "
+                "and will be skipped. Aperture extraction will continue normally."
+            )
+        # Sector inference is needed by the optional orbital-phase correction.
         sector_num = infer_sector_from_tpf(tpf_path, tpf)
-        if getattr(args, "matlab_sat_mode", False) and (sector_num is None):
-            print("  [WARN] MATLAB-sat-mode enabled but could not infer SECTOR from metadata/filename; will fall back to standard pipeline.")
+        if args.saturated_systematics_correction and sector_num is None:
+            print(
+                "  [WARN] Saturated-target systematics correction requested, but "
+                "SECTOR could not be inferred; using the standard correction."
+            )
 
 
         # Cadence selection
+        native_time = np.asarray(tpf.time.value, float)
+        finite_time = np.isfinite(native_time)
         if args.no_quality0:
-            keep_idx = np.arange(len(tpf.time))
+            keep_idx = np.flatnonzero(finite_time)
         else:
             try:
                 qual = np.asarray(tpf.quality, int)
-                keep_idx = np.where(qual == 0)[0]
+                keep_idx = np.flatnonzero((qual == 0) & finite_time)
                 if keep_idx.size == 0:
-                    keep_idx = np.arange(len(tpf.time))
+                    print("  [WARN] No finite QUALITY==0 cadences; retaining finite-time cadences instead.")
+                    keep_idx = np.flatnonzero(finite_time)
             except Exception:
-                keep_idx = np.arange(len(tpf.time))
+                keep_idx = np.flatnonzero(finite_time)
+
+        if keep_idx.size == 0:
+            print("  [WARN] No finite cadences; skipping this file.")
+            continue
 
         mid = int(keep_idx[len(keep_idx) // 2]) if len(keep_idx) else 0
 
         flux = np.asarray(tpf.flux, float)[keep_idx, :, :]
-        time = np.asarray(tpf.time.value, float)[keep_idx]
+        time = native_time[keep_idx]
         mean_img = np.nanmean(flux, axis=0)
 
-        # Pure MATLAB-style saturated single-target branch (Option A)
-        if getattr(args, "matlab_pure_single_sat", False):
+        # This approach is intentionally separate from Gaia and jump/core
+        # extraction because it grows a single aperture over the whole stamp.
+        if args.saturation_optimized_aperture:
             if int(args.n_targets) != 1:
-                raise ValueError("--matlab-pure-single-sat requires --n-targets=1.")
+                raise ValueError("--saturation-optimized-aperture requires --n-targets=1.")
             sat_ok, sat_npix = is_heavily_saturated(mean_img, thresh=args.sat_thresh, min_npix=args.sat_min_npix)
             if sat_ok:
-                print(f"  Using pure MATLAB-style saturated-source extractor (npix_above_thresh={sat_npix})")
-                lc_df, meta, mean_image_2d, ap_mask_2d, back_series, keep_mask, crow, ccol = matlab_style_extract_lightcurve_pure(
+                print(f"  Using saturation-optimized aperture extraction (npix_above_thresh={sat_npix})")
+                lc_df, meta, mean_image_2d, ap_mask_2d, back_series, keep_mask, crow, ccol = extract_saturation_optimized_aperture(
                     tpf_path,
-                    threshold=args.matlab_ap_thresh,
+                    threshold=args.saturated_aperture_threshold,
                     nback=args.back_nfaint,
-                    use_legacy_geometry=(not args.matlab_no_legacy_geometry),
+                    filter_quality=(not args.no_quality0),
                     verbose=True,
                 )
                 sector_tag = infer_sector_tag(tpf_path, tpf)
                 target_label, target_gaia_id, target_gaia_g = infer_single_target_label(
-                    tpf, mean_image_2d=mean_image_2d, gaia_radius_arcmin=max(float(args.gaia_radius_arcmin), 12.0)
+                    tpf,
+                    mean_image_2d=mean_image_2d,
+                    gaia_radius_arcmin=max(float(args.gaia_radius_arcmin), 12.0),
+                    allow_catalog=(not args.no_gaia),
                 )
-                output_stem = build_output_stem(sector_tag, target_label, 1, "matlab_pure")
-                raw_csv_path = outdir / f"{output_stem}.csv"
-                # Save only labeled versions for the pure MATLAB single-target branch,
-                # and remove stale unlabeled files from older runs if they exist.
-                for stale_name in ("keep_idx.npy", "mean_image.npy"):
-                    stale_path = outdir / stale_name
-                    if stale_path.exists():
-                        try:
-                            stale_path.unlink()
-                        except Exception:
-                            pass
-                np.save(outdir / f"keep_idx_{output_stem}.npy", keep_idx)
-                np.save(outdir / f"mean_image_{output_stem}.npy", mean_img)
-                lc_df.rename(columns={"flux_detrended_rel": "flux_rel"}, inplace=True)
+                output_stem = build_output_stem(sector_tag, target_label, 1, "saturated_aperture")
+                raw_csv_path = outdir / f"preferred_lc_{output_stem}.csv"
+                # Every product is labeled; never remove unrelated products
+                # that may already exist in a user-selected output directory.
+                np.save(outdir / f"keep_idx_{output_stem}.npy", np.flatnonzero(keep_mask))
+                np.save(outdir / f"mean_image_{output_stem}.npy", np.asarray(mean_image_2d, float))
+
+                # Apply the common mission-aware time schema. Kepler/K2 retain
+                # native BKJD and gain the exact compatible BTJD conversion;
+                # TESS retains its native BTJD values directly.
+                native_sat_time = lc_df["time_native"].to_numpy(float)
+                lc_df = make_lightcurve_dataframe(
+                    native_sat_time,
+                    lc_df["flux_detrended_rel"].to_numpy(float),
+                    mission,
+                    time_system,
+                    "flux_rel",
+                )
                 lc_df["target_label"] = target_label
                 lc_df["target_index"] = 1
-                lc_df["method"] = "matlab_pure"
+                lc_df["method"] = "saturated_aperture"
                 lc_df["sector"] = sector_tag
                 lc_df["tpf_name"] = tpf_path.name
                 lc_df["gaia_source_id"] = target_gaia_id if target_gaia_id is not None else ""
                 lc_df["gaia_g_mag"] = target_gaia_g
                 lc_df.to_csv(raw_csv_path, index=False)
                 save_lightcurve_plot(
-                    lc_df["time_btjd"].to_numpy(float),
+                    native_sat_time,
                     lc_df["flux_rel"].to_numpy(float),
                     outdir / f"preferred_lc_{output_stem}.png",
-                    f"{tpf_path.stem} — {target_label} / target1 (matlab_pure)",
+                    f"{tpf_path.stem} — {target_label} / target1 (saturated_aperture)",
+                    time_label=mission_time_axis_label(time_system),
                 )
-                pd.DataFrame([meta]).to_csv(outdir / f"matlab_aperture_meta_{output_stem}.csv", index=False)
+                pd.DataFrame([meta]).to_csv(outdir / f"saturated_aperture_meta_{output_stem}.csv", index=False)
                 np.save(outdir / f"aperture_mask_{output_stem}.npy", np.asarray(ap_mask_2d, bool))
                 np.save(outdir / f"background_{output_stem}.npy", np.asarray(back_series, float))
                 np.save(outdir / f"keep_mask_{output_stem}.npy", np.asarray(keep_mask, bool))
                 np.save(outdir / f"centroid_row_{output_stem}.npy", np.asarray(crow, float))
                 np.save(outdir / f"centroid_col_{output_stem}.npy", np.asarray(ccol, float))
                 if not args.no_aperture_plots:
-                    save_aperture_plot_matlab(
+                    save_aperture_plot(
                         mean_image_2d,
                         ap_mask_2d,
                         outdir / f"aperture_{output_stem}.png",
-                        f"{tpf_path.stem} — {target_label} / target1 (matlab_pure)",
+                        f"{tpf_path.stem} — {target_label} / target1 (saturated_aperture)",
                     )
                 print(
-                    f"  Wrote {target_label} / target1 (matlab_pure): {raw_csv_path.name}"
+                    f"  Wrote {target_label} / target1 (saturated_aperture): {raw_csv_path.name}"
                     f"  Npix={int(np.count_nonzero(ap_mask_2d))}"
                 )
+                if getattr(args, "prf_photometry", False):
+                    print("  [WARN] PRF photometry skipped for saturation-optimized aperture extraction.")
                 continue
             else:
-                print(f"  [INFO] --matlab-pure-single-sat requested but saturation gate failed (npix_above_thresh={sat_npix}); using standard pipeline.")
-
-        # Save unlabeled generic versions only for the standard / multi-target path.
-        np.save(outdir / "keep_idx.npy", keep_idx)
-        np.save(outdir / "mean_image.npy", mean_img)
+                print(
+                    "  [INFO] --saturation-optimized-aperture requested but the "
+                    f"saturation gate failed (npix_above_thresh={sat_npix}); using the standard pipeline."
+                )
 
         # Target definition / Gaia usage
-        use_gaia = not (args.no_gaia or args.pure_sum or args.matlab_sat_mode)
+        use_gaia = not (
+            args.no_gaia
+            or args.full_region_sum
+            or args.saturated_systematics_correction
+            or external_aperture_mask is not None
+        )
 
-        if args.no_gaia and int(args.n_targets) != 1:
-            raise ValueError("--no-gaia is only supported when --n-targets=1 (otherwise target identification is ambiguous).")
+        coords_grid = None
+        if use_gaia:
+            # Gaia seed placement needs a sky coordinate at every pixel.  An
+            # explicit no-Gaia run does not, so it remains usable for files
+            # with incomplete or invalid WCS metadata.
+            try:
+                coords_grid, flux, mean_img = coordinate_grid_for_flux(
+                    tpf, mid, flux, mean_img
+                )
+            except Exception as exc:
+                if args.gaia_fallback and int(args.n_targets) == 1:
+                    print(
+                        f"  [WARN] WCS coordinate grid failed ({type(exc).__name__}: {exc}). "
+                        "Falling back to no-Gaia single-target mode."
+                    )
+                    use_gaia = False
+                    coords_grid = None
+                else:
+                    raise
 
-        # Always build the coordinate grid (needed for seed placement / Voronoi when Gaia is available)
-        coords_grid = tpf.get_coordinates(cadence=mid)
-        if not isinstance(coords_grid, SkyCoord):
-            ra_grid, dec_grid = coords_grid
-            coords_grid = SkyCoord(
-                ra=np.asarray(ra_grid, float) * u.deg,
-                dec=np.asarray(dec_grid, float) * u.deg,
-            )
-
-        # --- Fix possible shape mismatch coords_grid vs flux ---
-        ny_flux, nx_flux = flux.shape[1], flux.shape[2]
-        ny_cg, nx_cg = coords_grid.shape
-        if (ny_cg, nx_cg) != (ny_flux, nx_flux):
-            ny0 = min(ny_cg, ny_flux)
-            nx0 = min(nx_cg, nx_flux)
-            print(
-                f"  [WARN] Shape mismatch coords_grid={coords_grid.shape} vs flux={(ny_flux, nx_flux)}; cropping to {(ny0, nx0)}"
-            )
-            coords_grid = coords_grid[:ny0, :nx0]
-            flux = flux[:, :ny0, :nx0]
-            mean_img = mean_img[:ny0, :nx0]
-
+        gaia_tab = None
         gaia_use = None
         sid = None
         gmag = None
@@ -1861,6 +2660,18 @@ def main(argv=None):
                 print("  No Gaia sources inside stamp; skipping.")
                 continue
 
+            center_separation_arcsec = None
+            if tesscut_product:
+                gaia_in, center_separation_arcsec = prioritize_tesscut_center_source(
+                    gaia_in, tpf, mean_img.shape
+                )
+                if center_separation_arcsec is not None:
+                    print(
+                        "  TESSCut target policy: target 1 is the Gaia source nearest "
+                        f"the requested cutout centre ({center_separation_arcsec:.1f} arcsec); "
+                        "remaining targets retain brightness order."
+                    )
+
             print("  Gaia sources inside stamp after pixel filter:")
             for i, row in enumerate(gaia_in[:10], start=1):
                 tc = SkyCoord(float(row["ra"]) * u.deg, float(row["dec"]) * u.deg)
@@ -1880,10 +2691,33 @@ def main(argv=None):
             gmag = [float(m) for m in gaia_use["phot_g_mean_mag"]]
             sid = [str(s) for s in gaia_use["source_id"]]
             source_labels = [resolve_target_label(tc, gs) for tc, gs in zip(target_coords, sid)]
-            if n_use == 1 and (getattr(args, "matlab_sat_mode", False) or getattr(args, "no_gaia", False) or getattr(args, "matlab_pure_single_sat", False)):
+
+            # For a genuine single-target TPF, prefer the stable human-readable
+            # OBJECT/TARGNAME label recorded in the file when the selected Gaia
+            # source matches the intended target coordinate.  This avoids
+            # network-dependent filename changes: a transient SIMBAD failure
+            # should not turn, for example, L_98-59_b into GaiaDR3_<source_id>.
+            # Do not apply this blindly to multi-target stamps, where the TPF
+            # header name may refer to a different source than target k.
+            if n_use == 1:
                 try:
-                    single_label, _, _ = infer_single_target_label(tpf, mean_img, gaia_radius_arcmin=float(args.gaia_radius_arcmin))
-                    if single_label:
+                    single_label, _, _ = infer_single_target_label(
+                        tpf,
+                        mean_img,
+                        gaia_radius_arcmin=float(args.gaia_radius_arcmin),
+                    )
+                    header_coord = infer_header_target_coord(tpf)
+                    selected_matches_header = False
+                    if header_coord is not None and target_coords and target_coords[0] is not None:
+                        sep_arcsec = float(header_coord.separation(target_coords[0]).arcsec)
+                        selected_matches_header = np.isfinite(sep_arcsec) and sep_arcsec <= 45.0
+
+                    force_single_label = bool(
+                        args.saturated_systematics_correction
+                        or getattr(args, "no_gaia", False)
+                        or args.saturation_optimized_aperture
+                    )
+                    if single_label and (selected_matches_header or force_single_label):
                         source_labels[0] = single_label
                 except Exception:
                     pass
@@ -1891,7 +2725,10 @@ def main(argv=None):
             seeds = [nearest_pixel_to_coord(coords_grid, tc) for tc in target_coords]
             owner = watershed_owner_map(mean_img, seeds)
 
-            print("  Targets (brightest Gaia sources in stamp):")
+            if tesscut_product:
+                print("  Targets (TESSCut centre target first; remaining Gaia sources by brightness):")
+            else:
+                print("  Targets (brightest Gaia sources in stamp):")
             for k in range(n_use):
                 label_txt = source_labels[k] if source_labels is not None else f"target{k+1}"
                 print(f"    [{k+1}] label={label_txt}  source_id={sid[k]}  G={gmag[k]:.3f}  seed={seeds[k]}")
@@ -1905,38 +2742,264 @@ def main(argv=None):
             ny, nx = mean_img.shape
             seed = (flat_idx // nx, flat_idx % nx)
 
-            target_coords = [coords_grid[seed[0], seed[1]]]
+            target_coords = [None]
             seeds = [seed]
             owner = np.zeros(mean_img.shape, dtype=int)
             sid = ["pixel_seed"]
             gmag = [np.nan]
             try:
-                single_label, _, _ = infer_single_target_label(tpf, mean_img, gaia_radius_arcmin=float(args.gaia_radius_arcmin))
+                single_label, _, _ = infer_single_target_label(
+                    tpf,
+                    mean_img,
+                    gaia_radius_arcmin=float(args.gaia_radius_arcmin),
+                    allow_catalog=(not args.no_gaia),
+                )
                 source_labels = [single_label if single_label else sanitize_token("unknown_target")]
             except Exception:
                 source_labels = [sanitize_token("unknown_target")]
 
-            print("  Gaia skipped/unavailable: using pixel-defined single target")
+            if external_aperture_mask is not None:
+                print("  External aperture defines a fixed pixel-selected single target")
+            else:
+                print("  Gaia skipped/unavailable: using pixel-defined single target")
             print(f"    [1] seed={seed}  (brightest pixel in mean image)")
 
         yy, xx = np.indices(mean_img.shape)
+
+        # -----------------------------------------------------------------
+        # Optional additional jitter-aware PRF extraction.
+        # -----------------------------------------------------------------
+        if getattr(args, "prf_photometry", False) and mission == "TESS":
+            if not _HAVE_PRF_MODULE:
+                print(f"  [WARN] PRF photometry unavailable: {_PRF_IMPORT_ERROR}")
+            else:
+                tessmag = prf_saturation_tessmag(tpf_path, tpf)
+                flux_unit = tpf_flux_unit(tpf)
+                try:
+                    prf_flux_err = np.asarray(tpf.flux_err, float)[keep_idx, :, :]
+                    if prf_flux_err.shape != flux.shape:
+                        prf_flux_err = prf_flux_err[:, : flux.shape[1], : flux.shape[2]]
+                    if prf_flux_err.shape != flux.shape:
+                        prf_flux_err = None
+                except Exception:
+                    prf_flux_err = None
+
+                for prf_k in range(n_use):
+                    source_label = source_labels[prf_k] if source_labels is not None else f"target{prf_k+1}"
+                    # Prefer the subpixel WCS position for Gaia-defined targets;
+                    # fall back to the image seed if WCS conversion is unavailable.
+                    prf_row, prf_col = map(float, seeds[prf_k])
+                    try:
+                        if target_coords is not None and target_coords[prf_k] is not None:
+                            xpix, ypix = tpf.wcs.world_to_pixel(target_coords[prf_k])
+                            if (np.isfinite(xpix) and np.isfinite(ypix) and
+                                    -float(args.prf_neighbor_margin) <= xpix <= mean_img.shape[1] - 1 + float(args.prf_neighbor_margin) and
+                                    -float(args.prf_neighbor_margin) <= ypix <= mean_img.shape[0] - 1 + float(args.prf_neighbor_margin)):
+                                prf_row, prf_col = float(ypix), float(xpix)
+                    except Exception:
+                        pass
+
+                    sat_info = assess_saturation(
+                        mean_img,
+                        tessmag=tessmag,
+                        absolute_threshold=float(args.sat_thresh),
+                        source_row=prf_row,
+                        source_column=prf_col,
+                        local_radius=max(8.0, float(args.prf_fit_radius)),
+                        flux_unit=flux_unit,
+                        product_type="TESSCUT" if tesscut_product else "TPF",
+                    )
+                    if sat_info.get("saturated", False):
+                        print(
+                            f"  [WARN] PRF photometry skipped for target {prf_k+1}: "
+                            "saturation/bleeding is not represented by the engineering PRF. "
+                            + "; ".join(sat_info.get("reasons", []))
+                        )
+                        continue
+
+                    requested_scene = str(args.prf_scene_mode).strip().lower()
+                    scene_sources = [SceneSource(
+                        prf_row, prf_col, source_label,
+                        sid[prf_k] if sid is not None else None,
+                        gmag[prf_k] if gmag is not None else None,
+                        "target",
+                    )]
+                    actual_scene = "single"
+                    if requested_scene == "gaia":
+                        if use_gaia and gaia_tab is not None and sid is not None:
+                            scene_sources = build_gaia_prf_scene(
+                                tpf, gaia_tab,
+                                target_source_id=sid[prf_k], target_label=source_label,
+                                target_gmag=gmag[prf_k], target_row=prf_row,
+                                target_column=prf_col, shape=mean_img.shape,
+                                margin_pixels=float(args.prf_neighbor_margin),
+                                max_delta_mag=float(args.prf_neighbor_dmag),
+                                max_sources=int(args.prf_max_scene_sources),
+                            )
+                            actual_scene = "gaia" if len(scene_sources) > 1 else "single"
+                            print(
+                                f"  [PRF] Target {prf_k+1} Gaia scene: "
+                                f"{len(scene_sources)} candidate source(s), including target."
+                            )
+                            for scene_j, src in enumerate(scene_sources[:10]):
+                                role = "target" if scene_j == 0 else "neighbor"
+                                magtxt = f"{src.magnitude:.3f}" if src.magnitude is not None and np.isfinite(src.magnitude) else "nan"
+                                print(
+                                    f"  [PRF]   [{scene_j+1}] {role} {src.label} "
+                                    f"G={magtxt} row={src.row:.2f} col={src.column:.2f}"
+                                )
+                        else:
+                            print("  [WARN] Gaia PRF scene requested but Gaia data are unavailable; using single-source mode.")
+
+                    try:
+                        prf_cfg = PRFPhotometryConfig(
+                            backend=args.prf_backend,
+                            motion_source=args.prf_motion_source,
+                            background=args.prf_background,
+                            saturation_absolute_threshold=float(args.sat_thresh),
+                            min_prf_weight=float(args.prf_min_weight),
+                            fit_radius=float(args.prf_fit_radius),
+                            shift_quantization=float(args.prf_shift_quantization),
+                            max_abs_shift=float(args.prf_max_shift),
+                            allow_gaussian_fallback=(not args.prf_no_gaussian_fallback),
+                            scene_mode=actual_scene,
+                            neighbor_treatment=str(args.prf_neighbor_treatment),
+                            source_output_mode=str(args.prf_source_output),
+                            neighbor_min_contribution_fraction=float(args.prf_min_neighbor_fraction),
+                            save_diagnostics=(not args.prf_no_diagnostics),
+                        )
+                        prf_result = extract_jitter_aware_prf(
+                            time, flux, scene_sources,
+                            config=prf_cfg,
+                            tpf_obj=tpf,
+                            tpf_path=tpf_path,
+                            cadence_indices=keep_idx,
+                            flux_err_cube=prf_flux_err,
+                        )
+                        output_indices = list(map(
+                            int, prf_result.metadata.get("extracted_source_indices", [0])
+                        ))
+                        if not output_indices:
+                            output_indices = [0]
+                        resolve_prf_scene_output_names(tpf, prf_result, output_indices)
+
+                        for msg in prf_result.metadata.get("backend_messages", []):
+                            print(f"  [PRF] {msg}")
+                        scene_info = prf_result.metadata.get("reference_scene", {})
+                        written_csvs = []
+                        for scene_index in output_indices:
+                            source = prf_result.sources[scene_index]
+                            is_primary_output = scene_index == 0
+                            if is_primary_output:
+                                prf_output_stem = "preferred_lc_" + build_output_stem(
+                                    sector_tag, source_label, prf_k + 1, "prf"
+                                )
+                            else:
+                                file_label = build_prf_scene_output_label(source, is_primary=False)
+                                prf_output_stem = (
+                                    f"preferred_lc_{sanitize_token(sector_tag)}_"
+                                    f"{file_label}_parenttarget{prf_k + 1}_"
+                                    f"scene{scene_index + 1}_prf"
+                                )
+
+                            paths_written = save_prf_products(
+                                prf_result, mean_img, outdir, prf_output_stem,
+                                source_index=scene_index,
+                                extra_columns={
+                                    "target_label": source.label,
+                                    "target_index": prf_k + 1,
+                                    "scene_source_index": scene_index,
+                                    "scene_source_role": "primary" if is_primary_output else "neighbor",
+                                    "method": "prf",
+                                    "sector": sector_tag,
+                                    "tpf_name": tpf_path.name,
+                                    "gaia_source_id": source.source_id or "",
+                                    "gaia_g_mag": source.magnitude if source.magnitude is not None else np.nan,
+                                },
+                                extra_metadata={
+                                    "tpf_path": str(tpf_path),
+                                    "watershed_extractor": True,
+                                    "single_source_fit": len(prf_result.sources) == 1,
+                                    "requested_prf_scene_mode": requested_scene,
+                                    "actual_prf_scene_mode": prf_result.metadata.get("scene_mode", actual_scene),
+                                    "requested_prf_source_output": str(args.prf_source_output),
+                                    "scene_source_index": int(scene_index),
+                                    "scene_source_role": "primary" if is_primary_output else "neighbor",
+                                    "parent_primary_label": source_label,
+                                    "parent_primary_index": int(prf_k + 1),
+                                },
+                                save_diagnostics=(not args.prf_no_diagnostics),
+                            )
+                            written_csvs.append(paths_written["csv"].name)
+                            coupling_all = prf_result.metadata.get("motion_coupling", [])
+                            coupling = coupling_all[scene_index] if scene_index < len(coupling_all) else {}
+                            quality_ok = coupling.get("quality_pass", True) and scene_info.get("scene_quality_pass", True)
+                            quality = "PASS" if quality_ok else "FLAGGED"
+                            print(
+                                f"  PRF scene source {scene_index + 1}: label={source.label}, "
+                                f"backend={prf_result.backend}, motion={prf_result.motion_source}, "
+                                f"scene={prf_result.metadata.get('scene_mode','single')}, "
+                                f"sources={len(prf_result.sources)}, quality={quality}, "
+                                f"wrote={paths_written['csv'].name}"
+                            )
+                            if not quality_ok:
+                                reasons = (
+                                    coupling.get("quality_reasons", [])
+                                    + scene_info.get("scene_quality_reasons", [])
+                                )
+                                print(
+                                    "  [WARN] PRF light curve retained for diagnostics but should be "
+                                    "treated cautiously: " + "; ".join(reasons)
+                                )
+
+                        skipped = prf_result.metadata.get("skipped_output_sources", [])
+                        for item in skipped:
+                            print(
+                                f"  [PRF] Skipped scene source {int(item.get('scene_index', -1)) + 1} "
+                                f"({item.get('label', 'unknown')}): {item.get('reason', 'not usable')}"
+                            )
+                        if len(written_csvs) > 1:
+                            print(f"  [PRF] Wrote {len(written_csvs)} constrained scene-source light curves.")
+                    except Exception as exc:
+                        print(
+                            f"  [WARN] PRF target{prf_k+1} failed "
+                            f"({type(exc).__name__}: {exc}); continuing with aperture extraction."
+                        )
 
         # Per-target processing
         for k in range(n_use):
             tag = f"target{k+1}"
             source_label = source_labels[k] if source_labels is not None else sanitize_token(tag)
             allowed = (owner == k)
-            if not np.any(allowed):
+            if external_aperture_mask is None and not np.any(allowed):
                 print(f"  [WARN] {tag}: empty watershed region; skipping.")
                 continue
 
             for meth in methods_to_run:
                 crow = ccol = None
-                if meth == "pure_sum":
+                active_external_metadata = None
+                if meth == "external_aperture":
+                    # Validate against the actual post-read image shape. The
+                    # selected pixels deliberately ignore the watershed owner
+                    # map: the user's text matrix is the complete aperture.
+                    if tuple(external_aperture_mask.shape) != tuple(mean_img.shape):
+                        raise ValueError(
+                            f"External aperture mask shape {tuple(external_aperture_mask.shape)} "
+                            f"does not match the TPF image shape {tuple(mean_img.shape)} for "
+                            f"{tpf_path.name}. Rows and columns are not transposed automatically."
+                        )
+                    ap_mask = external_aperture_mask.copy()
+                    active_external_metadata = dict(external_mask_metadata)
+                    t_g = time
+                    lc_raw, crow, ccol = masked_sum_and_centroid_blockwise(
+                        flux, ap_mask, yy, xx
+                    )
+                    meth_tag = "external_aperture"
+                elif meth == "full_region_sum":
                     ap_mask = allowed.copy()
                     t_g = time
                     lc_raw, crow, ccol = masked_sum_and_centroid_blockwise(flux, ap_mask, yy, xx)
-                    meth_tag = "pure_sum"
+                    meth_tag = "full_region_sum"
                 elif meth == "jump":
                     t_g, lc_raw, ap_mask, *_ = grow_aperture_multi_component_in_region(
                         flux,
@@ -1984,45 +3047,58 @@ def main(argv=None):
                 psf_sig = None
                 if args.psf_proxy:
                     psf_sig = psf_width_sigma(flux, ap, crow, ccol)
-                # -----------------------------------------------------------------
-                # Optional MATLAB-style saturated-star mode (only for single-target, heavy saturation)
-                # -----------------------------------------------------------------
-                use_matlab = bool(getattr(args, "matlab_sat_mode", False)) and (sector_orb is not None) and (n_use == 1)
-                if use_matlab:
+                # Saturated-target correction is gated on both morphology and
+                # a valid sector entry so an unsuitable request falls back to
+                # the standard correction without discarding the extraction.
+                use_saturated_correction = bool(
+                    args.saturated_systematics_correction
+                    and sector_orb is not None
+                    and n_use == 1
+                )
+                if use_saturated_correction:
                     sat_ok, sat_npix = is_heavily_saturated(mean_img, thresh=args.sat_thresh, min_npix=args.sat_min_npix)
                     if not sat_ok:
-                        print(f"  [INFO] MATLAB-sat-mode requested but saturation gate failed (npix_above_thresh={sat_npix}); using standard pipeline.")
-                        use_matlab = False
-                if use_matlab:
+                        print(
+                            "  [INFO] Saturated-target correction requested but the "
+                            f"saturation gate failed (npix_above_thresh={sat_npix}); using the standard correction."
+                        )
+                        use_saturated_correction = False
+                if use_saturated_correction:
                     if sector_num not in sector_orb:
-                        print(f"  [WARN] MATLAB-sat-mode: sector {sector_num} not found in orbtable; using standard pipeline.")
-                        use_matlab = False
+                        print(
+                            f"  [WARN] Sector {sector_num} is absent from the orbital table; "
+                            "using the standard correction."
+                        )
+                        use_saturated_correction = False
 
                 # Build per-cadence background from faint pixels (if needed)
                 back = None
-                if use_matlab:
+                orbital_phase = None
+                orbital_trend = None
+                background_scale = None
+                if use_saturated_correction:
                     back = estimate_background_faint_pixels(flux, n_faint=args.back_nfaint)
                     # Optimize background scaling and subtract
-                    k_back = optimize_background_scale(lc_raw, back)
-                    lc_raw2 = lc_raw - k_back * back
+                    background_scale = optimize_background_scale(lc_raw, back)
+                    lc_raw2 = lc_raw - background_scale * back
                     med2 = np.nanmedian(lc_raw2)
                     lc_rel2 = lc_raw2 / med2 if np.isfinite(med2) and med2 != 0 else lc_raw2
                     # Orbit-phase template detrend
                     mid_btjd, freq_cpd = sector_orb[sector_num]
-                    lc_rel2_det, phase, trend = phase_template_detrend(lc_rel2, t_g, freq_cpd, phase_bin=args.phase_bin)
+                    lc_rel2_det, orbital_phase, orbital_trend = phase_template_detrend(
+                        lc_rel2, t_g, freq_cpd, phase_bin=args.phase_bin
+                    )
                     lc_work = lc_rel2_det
-
-                    # Save diagnostics later once the informative output stem is defined below.
                 else:
                     lc_work = lc_rel
 
                 # -----------------------------------------------------------------
                 # Decorrelation (standard or split-at-mid-sector with background term)
                 # -----------------------------------------------------------------
-                if getattr(args, "pure_sum", False):
+                if args.full_region_sum:
                     lc_xy = lc_work.copy()
                 else:
-                    if use_matlab:
+                    if use_saturated_correction:
                         mid_btjd, freq_cpd = sector_orb[sector_num]
                         # Split at mid-sector (downlink break proxy)
                         m1 = t_g < mid_btjd
@@ -2063,20 +3139,52 @@ def main(argv=None):
                             lc_xy = lc_work.copy()
 
 
-                 # Write outputs (flat structure, labeled by sector/source/target/method)
+                # Write outputs (flat structure, labeled by sector/source/target/method).
                 output_stem = build_output_stem(sector_tag, source_label, k + 1, meth_tag)
-                pd.DataFrame({"time_btjd": t_g, "flux_detrended_rel": lc_xy}).to_csv(
-                    outdir / f"preferred_lc_{output_stem}.csv", index=False
+                output_df = make_lightcurve_dataframe(
+                    t_g, lc_xy, mission, time_system, "flux_detrended_rel"
                 )
+                output_df["saturated_systematics_correction"] = bool(use_saturated_correction)
+                if active_external_metadata is not None:
+                    # Repeated identity columns keep the CSV self-describing;
+                    # full provenance, orientation, and checksum are also
+                    # written once in the companion JSON below.
+                    output_df["aperture_definition"] = "external_text_mask"
+                    output_df["external_mask_file"] = active_external_metadata["source_name"]
+                    output_df["external_mask_sha256"] = active_external_metadata["sha256"]
+                if use_saturated_correction:
+                    output_df["background"] = np.asarray(back, float)
+                    output_df["background_scale"] = float(background_scale)
+                    output_df["orbital_phase"] = np.asarray(orbital_phase, float)
+                    if orbital_trend is not None:
+                        output_df["orbital_phase_trend"] = np.asarray(orbital_trend, float)
+                    np.save(outdir / f"background_{output_stem}.npy", np.asarray(back, float))
+                output_df.to_csv(outdir / f"preferred_lc_{output_stem}.csv", index=False)
                 save_lightcurve_plot(
                     t_g,
                     lc_xy,
                     outdir / f"preferred_lc_{output_stem}.png",
                     f"{tpf_path.stem} — {source_label} / target{k+1} ({meth_tag})",
+                    time_label=mission_time_axis_label(time_system),
                 )
                 np.save(outdir / f"aperture_mask_{output_stem}.npy", ap_mask.astype(bool))
                 np.save(outdir / f"centroid_row_{output_stem}.npy", np.asarray(crow, float))
                 np.save(outdir / f"centroid_col_{output_stem}.npy", np.asarray(ccol, float))
+                if active_external_metadata is not None:
+                    product_metadata = dict(active_external_metadata)
+                    product_metadata.update({
+                        "tpf_path": str(tpf_path),
+                        "output_stem": output_stem,
+                        "target_label": source_label,
+                        "target_index": int(k + 1),
+                        "method": meth_tag,
+                        "tpf_shape_rows_columns": [int(mean_img.shape[0]), int(mean_img.shape[1])],
+                    })
+                    metadata_path = outdir / f"external_aperture_meta_{output_stem}.json"
+                    metadata_path.write_text(
+                        json.dumps(product_metadata, indent=2, sort_keys=True) + "\n",
+                        encoding="utf-8",
+                    )
 
                 # Aperture image
                 if not args.no_aperture_plots:
@@ -2087,11 +3195,19 @@ def main(argv=None):
                             gtxt = f"Gaia G={float(gmag[k]):.2f}"
                     except Exception:
                         pass
-                    save_aperture_plot_matlab(
+                    save_aperture_plot(
                         mean_img,
                         ap_mask.astype(bool),
                         outdir / f"aperture_{output_stem}.png",
-                        f"{tpf_path.stem} — {source_label} / target{k+1} ({meth_tag})\n{gtxt}",
+                        (
+                            f"{tpf_path.stem} — {source_label} / target{k+1} ({meth_tag})\n"
+                            + (
+                                f"External mask: {active_external_metadata['source_name']}; "
+                                f"Npix={active_external_metadata['selected_pixels']}"
+                                if active_external_metadata is not None
+                                else gtxt
+                            )
+                        ),
                     )
 
                 print(
@@ -2108,25 +3224,3 @@ if __name__ == "__main__":
         raise SystemExit(main())
     except KeyboardInterrupt:
         raise SystemExit(130)
-    # MATLAB-style saturated-star mode (optional)
-    p.add_argument(
-        "--matlab-sat-mode",
-        action="store_true",
-        help="Enable MATLAB-style saturated-star detrending (uses sector orbital frequency + mid-sector split + faint-pixel background).",
-    )
-    p.add_argument(
-        "--orbtable",
-        type=str,
-        default="",
-        help="CSV table with columns sector, mid_tjd (BTJD), freq_cyc/day (orbits/day). Required if --matlab-sat-mode.",
-    )
-    p.add_argument("--sat-thresh", type=float, default=1.0e5,
-                   help="Mean-image threshold for considering pixels saturated (used only for gating --matlab-sat-mode).")
-    p.add_argument("--sat-min-npix", type=int, default=20,
-                   help="Minimum number of pixels above --sat-thresh to treat target as heavily saturated (gating for --matlab-sat-mode).")
-    p.add_argument("--back-nfaint", type=int, default=20,
-                   help="Number of faintest pixels to average per cadence for background estimate (MATLAB mode).")
-    p.add_argument("--phase-bin", type=float, default=0.01,
-                   help="Phase bin width for orbit-phase template detrending (MATLAB mode).")
-
-

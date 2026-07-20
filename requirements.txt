@@ -1,0 +1,9 @@
+numpy
+pandas
+scipy
+matplotlib
+astropy
+lightkurve
+scikit-image
+astroquery
+Pillow

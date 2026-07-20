@@ -2,7 +2,7 @@
 """
 tess_simple_extractor.py
 
-Robust light-curve extractor for TESS Target Pixel Files (TPFs) with:
+Robust aperture light-curve extractor for TESS, Kepler, and K2 Target Pixel Files (TPFs) with:
   • image-based seeding (no Gaia/WCS needed for seeds)
   • three extraction modes:
       - fullstamp : sum all pixels in the stamp
@@ -17,10 +17,10 @@ Robust light-curve extractor for TESS Target Pixel Files (TPFs) with:
   • outputs are MEDIAN-SCALED (relative flux; median ≈ 1)
 
 Outputs (per input TPF):
-  - <stem>_preferred_lc_target{k}_{mode}.csv  (time_btjd, flux_medscaled, npix)
+  - <stem>_preferred_lc_target{k}_{mode}.csv  (mission-aware time, flux_medscaled, npix)
 
 Notes:
-  - TIME saved as BTJD (native TIME column).
+  - TIME is saved in its native BTJD or BKJD convention; Kepler/K2 files also include a BTJD conversion for downstream compatibility.
   - Flux comes from FLUX (e-/s) and is then median-scaled.
 
 Example:
@@ -28,8 +28,9 @@ Example:
 """
 
 import argparse
+from datetime import datetime, timezone
 import glob
-import os
+import json
 from pathlib import Path
 
 import numpy as np
@@ -41,6 +42,21 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from astropy.io import fits
+
+try:
+    from tess_prf_photometry import (
+        SceneSource,
+        PRFPhotometryConfig,
+        assess_saturation,
+        extract_jitter_aware_prf,
+        save_prf_products,
+    )
+    _HAVE_PRF_MODULE = True
+except Exception as _prf_import_error:
+    SceneSource = PRFPhotometryConfig = None
+    extract_jitter_aware_prf = save_prf_products = assess_saturation = None
+    _HAVE_PRF_MODULE = False
+    _PRF_IMPORT_ERROR = _prf_import_error
 
 
 # ----------------------------
@@ -91,7 +107,7 @@ def find_peak_seeds(mean_img: np.ndarray,
                     n_peaks: int,
                     min_sep: int = 6,
                     edge: int = 1) -> list[tuple[int, int]]:
-    """Find up to n_peaks local maxima in the mean image (pure numpy).
+    """Find up to n_peaks local maxima in the mean image (NumPy only).
 
     Returns list of (iy, ix) seeds.
     """
@@ -130,6 +146,41 @@ def find_peak_seeds(mean_img: np.ndarray,
             break
 
     return seeds
+
+
+def select_peak_seeds(mean_img: np.ndarray, n_peaks: int, min_sep: int = 6,
+                      edge: int = 1, prefer_center_first: bool = False) -> list[tuple[int, int]]:
+    """Select peak seeds, placing the nearest central peak first for TESSCut."""
+    if not prefer_center_first:
+        return find_peak_seeds(mean_img, n_peaks=n_peaks, min_sep=min_sep, edge=edge)
+    n_candidates = max(int(n_peaks), 32)
+    candidates = find_peak_seeds(
+        mean_img, n_peaks=n_candidates, min_sep=min_sep, edge=edge
+    )
+    if not candidates:
+        return []
+    ny, nx = np.asarray(mean_img).shape
+    center_row, center_column = (ny - 1) / 2.0, (nx - 1) / 2.0
+    nearest = min(
+        range(len(candidates)),
+        key=lambda i: (candidates[i][0] - center_row) ** 2 + (candidates[i][1] - center_column) ** 2,
+    )
+    ordered = [candidates[nearest]] + [seed for i, seed in enumerate(candidates) if i != nearest]
+    return ordered[:max(1, int(n_peaks))]
+
+
+def target_local_image(mean_img: np.ndarray, seed: tuple[int, int] | None,
+                       radius: int = 8) -> np.ndarray:
+    """Return a target-centred image used by simple-extractor auto decisions."""
+    img = np.asarray(mean_img, float)
+    if seed is None:
+        return img
+    row, column = map(int, seed)
+    radius = max(3, int(radius))
+    return img[
+        max(0, row - radius):min(img.shape[0], row + radius + 1),
+        max(0, column - radius):min(img.shape[1], column + radius + 1),
+    ]
 
 
 def circular_aperture_mask(ny: int, nx: int, center: tuple[int, int], radius: float) -> np.ndarray:
@@ -219,22 +270,115 @@ def region_grow_aperture(mean_img: np.ndarray,
 # ----------------------------
 
 def load_tpf_cube(path: str):
-    """Load TIME, FLUX cube, and QUALITY from a TESS TPF FITS."""
+    """Load TIME, FLUX, optional FLUX_ERR, QUALITY, and headers from a TESS TPF."""
     with fits.open(path, memmap=True) as hdul:
         data = hdul[1].data
-        hdr = hdul[1].header
+        hdr0 = hdul[0].header
+        hdr1 = hdul[1].header
+        names = set(data.columns.names)
         time = np.array(data["TIME"], dtype=float)
         flux = np.array(data["FLUX"], dtype=float)  # (nt, ny, nx)
-        quality = np.array(data["QUALITY"], dtype=int) if ("QUALITY" in data.columns.names) else None
-    return time, flux, quality, hdr
+        flux_err = np.array(data["FLUX_ERR"], dtype=float) if "FLUX_ERR" in names else None
+        quality = np.array(data["QUALITY"], dtype=int) if "QUALITY" in names else None
+        try:
+            flux_unit = hdul[1].columns["FLUX"].unit
+        except Exception:
+            flux_unit = None
+    return time, flux, flux_err, quality, hdr0, hdr1, flux_unit
 
 
 
-def median_scale(flux_1d: np.ndarray) -> np.ndarray:
-    med = float(np.nanmedian(flux_1d))
-    if not np.isfinite(med) or med == 0.0:
-        return flux_1d * np.nan
-    return flux_1d / med
+def infer_mission(path: str | Path, hdr0=None, hdr1=None) -> str:
+    """Infer TESS, KEPLER, or K2 from FITS metadata and filename."""
+    values = []
+    for hdr in (hdr1, hdr0):
+        if hdr is None:
+            continue
+        for key in ("MISSION", "TELESCOP", "OBSERVAT"):
+            try:
+                val = hdr.get(key)
+                if val not in (None, ""):
+                    values.append(str(val))
+            except Exception:
+                pass
+    text = " ".join(values).upper()
+    name = Path(path).name.lower()
+    campaign = None
+    for hdr in (hdr1, hdr0):
+        try:
+            val = hdr.get("CAMPAIGN") if hdr is not None else None
+            if val not in (None, ""):
+                campaign = val
+                break
+        except Exception:
+            pass
+    if "K2" in text or name.startswith("ktwo") or campaign not in (None, ""):
+        return "K2"
+    if "TESS" in text or name.startswith("tess") or "astrocut" in name:
+        return "TESS"
+    if "KEPLER" in text or name.startswith("kplr"):
+        return "KEPLER"
+    return "UNKNOWN"
+
+
+def is_tesscut_product(path: str | Path, hdr0=None, hdr1=None) -> bool:
+    """Identify TESSCut/Astrocut stamps, which lack a unique SPOC target."""
+    if "astrocut" in Path(path).name.lower():
+        return True
+    for hdr in (hdr1, hdr0):
+        if hdr is None:
+            continue
+        text = " ".join(str(hdr.get(key, "")) for key in ("CREATOR", "PROCNAME", "ORIGIN")).lower()
+        if "astrocut" in text or "tesscut" in text:
+            return True
+    return False
+
+
+def infer_time_system(hdr0=None, hdr1=None, mission: str = "UNKNOWN") -> str:
+    for hdr in (hdr1, hdr0):
+        try:
+            ref = hdr.get("BJDREFI") if hdr is not None else None
+            if ref is None:
+                continue
+            ref = int(round(float(ref)))
+            if ref == 2457000:
+                return "BTJD"
+            if ref == 2454833:
+                return "BKJD"
+        except Exception:
+            pass
+    return "BTJD" if str(mission).upper() == "TESS" else ("BKJD" if str(mission).upper() in {"KEPLER", "K2"} else "JD")
+
+
+def discover_tpf_paths(input_value: str, recursive: bool = False) -> list[str]:
+    """Resolve a path, glob, or directory containing TESS/Kepler/K2 TPFs."""
+    candidate = Path(input_value).expanduser()
+    if candidate.is_dir():
+        patterns = (
+            "*tp.fits", "*tpf.fits", "*tp.fits.gz", "*tpf.fits.gz",
+            "*_astrocut.fits", "*_astrocut.fits.gz",
+            "*_lpd-targ.fits", "*_spd-targ.fits",
+            "*_lpd-targ.fits.gz", "*_spd-targ.fits.gz",
+        )
+        found = []
+        for pat in patterns:
+            found.extend(candidate.rglob(pat) if recursive else candidate.glob(pat))
+        return sorted({str(x.resolve()) for x in found})
+    paths = sorted(glob.glob(str(candidate), recursive=bool(recursive)))
+    if not paths and candidate.exists():
+        paths = [str(candidate)]
+    return paths
+
+
+def target_pixel_stem(path: str | Path) -> str:
+    """Strip FITS and optional compression suffixes from a product name."""
+    name = Path(path).name
+    lower = name.lower()
+    for suffix in (".fits.gz", ".fit.gz", ".fits", ".fit"):
+        if lower.endswith(suffix):
+            return name[:-len(suffix)]
+    return Path(name).stem
+
 
 def segment_indices_by_gaps(time, gap_days=0.5):
     """Return list of index arrays, split where time gaps exceed gap_days."""
@@ -259,16 +403,34 @@ def median_scale_by_segment(time, flux_1d, gap_days=0.5):
     return f
 
 
-def save_lc_csv(out_path: Path, time: np.ndarray, flux_medscaled: np.ndarray, npix: int):
-    arr = np.column_stack([time, flux_medscaled, np.full_like(time, npix, dtype=float)])
-    header = "time_btjd,flux_medscaled,npix"
-    np.savetxt(out_path, arr, delimiter=",", header=header, comments="")
+def save_lc_csv(out_path: Path, time: np.ndarray, flux_medscaled: np.ndarray, npix: int,
+                mission: str = "TESS", time_system: str = "BTJD"):
+    import pandas as pd
+    t = np.asarray(time, float)
+    data = {}
+    system = str(time_system).upper()
+    if system == "BKJD":
+        data["time_bkjd"] = t
+        data["time_btjd"] = t - 2167.0
+    elif system == "BTJD":
+        data["time_btjd"] = t
+    elif system == "MJD":
+        data["time_mjd"] = t
+        data["time_btjd"] = t - 56999.5
+    else:
+        data["time_jd"] = t
+        data["time_btjd"] = t - 2457000.0
+    data["flux_medscaled"] = np.asarray(flux_medscaled, float)
+    data["npix"] = np.full(len(t), int(npix), dtype=int)
+    data["mission"] = np.full(len(t), str(mission).upper(), dtype=object)
+    data["time_system"] = np.full(len(t), system, dtype=object)
+    pd.DataFrame(data).to_csv(out_path, index=False)
 
 
-def quicklook_plot(out_png: Path, time: np.ndarray, flux_medscaled: np.ndarray, title: str):
+def quicklook_plot(out_png: Path, time: np.ndarray, flux_medscaled: np.ndarray, title: str, time_system: str = "BTJD"):
     plt.figure(figsize=(10, 3))
     plt.plot(time, flux_medscaled, ".", ms=2)
-    plt.xlabel("Time [BTJD]")
+    plt.xlabel(f"Time [{str(time_system).upper()}]")
     plt.ylabel("Relative flux (median=1)")
     plt.title(title)
     plt.tight_layout()
@@ -294,7 +456,7 @@ def mask_plot(out_png: Path, mean_img: np.ndarray, masks: list[np.ndarray], seed
 #  Mode selection
 # ----------------------------
 
-def choose_mode(args, mean_img: np.ndarray) -> str:
+def choose_mode(args, mean_img: np.ndarray, target_seed: tuple[int, int] | None = None) -> str:
     """Return one of: 'fullstamp', 'fixedap', 'apgrow'."""
     if args.aperture_mode != "auto":
         return args.aperture_mode
@@ -303,7 +465,8 @@ def choose_mode(args, mean_img: np.ndarray) -> str:
         return "apgrow"
 
     # n_targets == 1: decide based on saturation
-    sat = is_saturated(mean_img,
+    decision_img = target_local_image(mean_img, target_seed)
+    sat = is_saturated(decision_img,
                        top_frac=args.sat_top_frac,
                        flat_frac_of_max=args.sat_flat_frac_of_max,
                        min_flat_pixels=args.sat_min_flat_pixels)
@@ -311,21 +474,38 @@ def choose_mode(args, mean_img: np.ndarray) -> str:
         return "apgrow"
 
     # Saturated single target: choose fullstamp vs fixedap
-    vb = very_bright_fraction(mean_img, frac_of_peak=args.fullstamp_bright_frac_of_peak)
+    vb = very_bright_fraction(decision_img, frac_of_peak=args.fullstamp_bright_frac_of_peak)
     # If bleed dominates a big chunk of the stamp, fullstamp is usually safest.
     if vb >= args.fullstamp_if_bright_frac_ge:
         return "fullstamp"
     return "fixedap"
 
 
+def write_run_configuration(outdir: Path, args, paths: list[str]) -> Path:
+    """Record resolved simple-extractor settings and discovered inputs."""
+    created = datetime.now(timezone.utc)
+    payload = {
+        "schema_version": 1,
+        "created_utc": created.isoformat(),
+        "extractor": Path(__file__).name,
+        "settings": vars(args).copy(),
+        "input_files": list(paths),
+    }
+    stamp = created.strftime("%Y%m%dT%H%M%S_%fZ")
+    path = outdir / f"extraction_run_config_{stamp}.json"
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return path
+
+
 # ----------------------------
 #  Main
 # ----------------------------
 
-def main():
+def main(argv=None):
+    """Parse command-line options and extract every matched target-pixel file."""
     ap = argparse.ArgumentParser()
     ap.add_argument("--input", required=True,
-                    help="TPF path or glob pattern (e.g. '/dir/*_tp.fits').")
+                    help="TPF path, glob pattern, or directory containing TESS/Kepler/K2 target-pixel files.")
     ap.add_argument("--outdir", default="lc_out", help="Output directory.")
     ap.add_argument("--gap-days", type=float, default=0.5,
                     help="Gap threshold (days) for segment-wise median scaling.")
@@ -333,9 +513,43 @@ def main():
                     help="Disable filtering to QUALITY==0 cadences.")
     ap.add_argument("--save-plots", action="store_true",
                     help="Save quicklook PNGs (light curves and aperture overlays).")
+    ap.add_argument("--recursive", action="store_true",
+                    help="Enable recursive ** glob expansion when --input contains **.")
+
+    # Optional jitter-aware PRF photometry.  This writes an additional PRF
+    # product and never replaces the selected aperture product.
+    ap.add_argument("--prf-photometry", action="store_true",
+                    help="Also extract a cadence-dependent, jitter-aware PRF-weighted light curve.")
+    ap.add_argument("--prf-backend", choices=["auto", "lkprf", "tess_prf", "gaussian"], default="auto",
+                    help="PRF backend. Auto prefers official lkprf/TESS_PRF engineering models.")
+    ap.add_argument("--prf-motion-source", choices=["auto", "poscorr", "ensemble", "target", "fixed"], default="auto",
+                    help="Motion source. Auto uses varying POS_CORR, then ensemble centroid, target centroid, and fixed position; constant placeholders are rejected.")
+    ap.add_argument("--prf-scene-mode", choices=["single", "gaia"], default="single",
+                    help="PRF scene mode. The simple extractor has no Gaia catalog and therefore falls back to single-source mode for 'gaia'.")
+    ap.add_argument("--prf-neighbor-treatment", choices=["fixed"], default="fixed")
+    ap.add_argument("--prf-source-output", choices=["primary", "all"], default="primary",
+                    help="Accepted for GUI compatibility. The simple extractor has no Gaia scene, so only the primary source is written.")
+    ap.add_argument("--prf-neighbor-dmag", type=float, default=8.0)
+    ap.add_argument("--prf-neighbor-margin", type=float, default=6.0)
+    ap.add_argument("--prf-max-scene-sources", type=int, default=20)
+    ap.add_argument("--prf-min-neighbor-fraction", type=float, default=1e-4)
+    ap.add_argument("--prf-background", choices=["none", "constant", "plane"], default="plane",
+                    help="Per-cadence background terms fitted with the PRF source flux.")
+    ap.add_argument("--prf-min-weight", type=float, default=1e-5,
+                    help="Minimum relative PRF weight used when defining the fitting region.")
+    ap.add_argument("--prf-fit-radius", type=float, default=6.0,
+                    help="Radius in pixels included around each PRF source in the scene fit.")
+    ap.add_argument("--prf-shift-quantization", type=float, default=0.01,
+                    help="Requested regular-grid spacing for precomputed shifted PRFs; cadence PRFs are bilinearly interpolated and each axis is capped at 21 nodes.")
+    ap.add_argument("--prf-max-shift", type=float, default=2.0,
+                    help="Maximum absolute cadence shift in pixels after robust cleaning.")
+    ap.add_argument("--prf-no-diagnostics", action="store_true",
+                    help="Do not write the PRF diagnostic PNG (motion data and metadata are still saved).")
+    ap.add_argument("--prf-no-gaussian-fallback", action="store_true",
+                    help="Fail PRF extraction rather than use a Gaussian if official PRF packages are unavailable.")
 
     ap.add_argument("--n-targets", type=int, default=1,
-                    help="Number of targets to extract (image peaks).")
+                    help="Number of targets to extract. TESSCut places the detected peak nearest the cutout centre first.")
 
     ap.add_argument("--aperture-mode", choices=["auto", "fullstamp", "fixedap", "apgrow"],
                     default="auto",
@@ -372,39 +586,165 @@ def main():
     ap.add_argument("--fullstamp-if-bright-frac-ge", type=float, default=0.25,
                     help="Auto-switch (saturated single): if very-bright fraction >= this, use fullstamp else fixedap.")
 
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
+    if int(args.n_targets) < 1:
+        ap.error("--n-targets must be at least 1")
 
-    paths = sorted(glob.glob(args.input))
-    if len(paths) == 0 and os.path.exists(args.input):
-        paths = [args.input]
+    paths = discover_tpf_paths(args.input, recursive=bool(args.recursive))
     if len(paths) == 0:
-        raise SystemExit(f"No files matched: {args.input}")
+        raise SystemExit(f"No target-pixel files matched: {args.input}")
 
-    outdir = Path(args.outdir)
+    outdir = Path(args.outdir).expanduser().resolve()
     outdir.mkdir(parents=True, exist_ok=True)
+    args.outdir = str(outdir)
+    config_path = write_run_configuration(outdir, args, paths)
+    print(f"Resolved extraction settings: {config_path}")
 
     for path in paths:
-        base = Path(path).stem
+        base = target_pixel_stem(path)
         print(f"TPF: {path}")
 
-        time, flux, quality, _hdr = load_tpf_cube(path)
+        time, flux, flux_err, quality, _hdr0, _hdr1, flux_unit = load_tpf_cube(path)
+        mission = infer_mission(path, _hdr0, _hdr1)
+        tesscut_product = is_tesscut_product(path, _hdr0, _hdr1)
+        time_system = infer_time_system(_hdr0, _hdr1, mission)
+        print(f"  Mission: {mission}; native time: {time_system}")
+        if args.prf_photometry and mission in {"KEPLER", "K2"}:
+            print(
+                f"  [WARN] {mission} target-pixel data detected: the PRF module is TESS-only "
+                "and will be skipped. Aperture extraction will continue normally."
+            )
         good = np.isfinite(time)
         if (quality is not None) and (not args.no_quality0):
             good &= (quality == 0)
+            if not np.any(good) and np.any(np.isfinite(time)):
+                print("  [WARN] No QUALITY==0 cadences; retaining finite-time cadences instead.")
+                good = np.isfinite(time)
+        if not np.any(good):
+            print("  [WARN] No finite cadences; skipping this file.")
+            continue
+        cadence_indices = np.flatnonzero(good)
         if not np.all(good):
             dropped = int(np.size(good) - np.sum(good))
             print(f"  [INFO] Dropping {dropped} cadences (non-finite time and/or QUALITY!=0)")
             time = time[good]
             flux = flux[good, :, :]
+            if flux_err is not None:
+                flux_err = flux_err[good, :, :]
 
 
         mean_img = np.nanmean(flux, axis=0)
         ny, nx = mean_img.shape
+        target_seeds = select_peak_seeds(
+            mean_img,
+            n_peaks=max(1, int(args.n_targets)),
+            min_sep=max(1, int(args.min_sep)),
+            edge=max(0, int(args.edge)),
+            prefer_center_first=tesscut_product,
+        )
+        if not target_seeds:
+            target_seeds = [(ny // 2, nx // 2)]
+        if tesscut_product:
+            print(
+                "  TESSCut target policy: target 1 is the detected peak nearest "
+                f"the requested cutout centre (seed={target_seeds[0]})."
+            )
 
-        mode = choose_mode(args, mean_img)
-        vb = very_bright_fraction(mean_img, frac_of_peak=args.fullstamp_bright_frac_of_peak)
+        # Optional additional jitter-aware PRF extraction.  It is intentionally
+        # independent of the aperture mode selected below.
+        if args.prf_photometry and mission == "TESS":
+            if not _HAVE_PRF_MODULE:
+                print(f"  [WARN] PRF photometry unavailable: {_PRF_IMPORT_ERROR}")
+            else:
+                tessmag = None
+                if not tesscut_product:
+                    for hdr in (_hdr1, _hdr0):
+                        try:
+                            value = hdr.get("TESSMAG")
+                            if value is not None:
+                                tessmag = float(value)
+                                break
+                        except Exception:
+                            pass
+                if str(args.prf_scene_mode).strip().lower() != "single":
+                    print("  [WARN] Gaia multi-source PRF mode requires tess_watershed_extractor.py; the simple extractor will use single-source PRF fits.")
+                if str(args.prf_source_output).strip().lower() != "primary":
+                    print("  [WARN] All-scene-source PRF output requires the watershed extractor; the simple extractor will write only primary-source light curves.")
+                prf_seeds = target_seeds
+                for prf_k, (prf_row, prf_col) in enumerate(prf_seeds, start=1):
+                    sat_info = assess_saturation(
+                        mean_img,
+                        tessmag=tessmag,
+                        source_row=float(prf_row),
+                        source_column=float(prf_col),
+                        local_radius=max(8.0, float(args.prf_fit_radius)),
+                        flux_unit=str(flux_unit) if flux_unit is not None else None,
+                        product_type="TESSCUT" if tesscut_product else "TPF",
+                    )
+                    if sat_info.get("saturated", False):
+                        print(
+                            f"  [WARN] PRF photometry skipped for target {prf_k}: "
+                            "the source appears saturated or bleed-dominated. "
+                            + "; ".join(sat_info.get("reasons", []))
+                        )
+                        continue
+                    try:
+                        prf_cfg = PRFPhotometryConfig(
+                            backend=args.prf_backend,
+                            motion_source=args.prf_motion_source,
+                            background=args.prf_background,
+                            min_prf_weight=float(args.prf_min_weight),
+                            fit_radius=float(args.prf_fit_radius),
+                            shift_quantization=float(args.prf_shift_quantization),
+                            max_abs_shift=float(args.prf_max_shift),
+                            allow_gaussian_fallback=(not args.prf_no_gaussian_fallback),
+                            scene_mode="single",
+                            neighbor_treatment=str(args.prf_neighbor_treatment),
+                            source_output_mode="primary",
+                            neighbor_min_contribution_fraction=float(args.prf_min_neighbor_fraction),
+                            save_diagnostics=(not args.prf_no_diagnostics),
+                            gap_days_for_scaling=float(args.gap_days),
+                        )
+                        prf_result = extract_jitter_aware_prf(
+                            time, flux,
+                            [SceneSource(float(prf_row), float(prf_col), f"target{prf_k}")],
+                            config=prf_cfg,
+                            tpf_path=path,
+                            cadence_indices=cadence_indices,
+                            flux_err_cube=flux_err,
+                        )
+                        prf_stem = f"{base}_preferred_lc_target{prf_k}_prf"
+                        paths_written = save_prf_products(
+                            prf_result, mean_img, outdir, prf_stem,
+                            source_index=0,
+                            extra_columns={"target_index": prf_k, "method": "prf"},
+                            extra_metadata={"tpf_path": str(path), "simple_extractor": True, "mission": mission},
+                            save_diagnostics=(not args.prf_no_diagnostics),
+                        )
+                        for msg in prf_result.metadata.get("backend_messages", []):
+                            print(f"  [PRF] {msg}")
+                        coupling = prf_result.metadata.get("motion_coupling", [{}])[0]
+                        quality = "PASS" if coupling.get("quality_pass", True) else "FLAGGED"
+                        print(
+                            f"  PRF target{prf_k}: backend={prf_result.backend}, "
+                            f"motion={prf_result.motion_source}, quality={quality}, "
+                            f"wrote={paths_written['csv'].name}"
+                        )
+                        if not coupling.get("quality_pass", True):
+                            print(
+                                "  [WARN] PRF extraction retained for diagnostics but aperture "
+                                "photometry remains preferred: "
+                                + "; ".join(coupling.get("quality_reasons", []))
+                            )
+                    except Exception as exc:
+                        print(f"  [WARN] PRF target{prf_k} failed ({type(exc).__name__}: {exc}); continuing with aperture extraction.")
+
+        primary_seed = target_seeds[0]
+        mode = choose_mode(args, mean_img, target_seed=primary_seed)
+        decision_img = target_local_image(mean_img, primary_seed)
+        vb = very_bright_fraction(decision_img, frac_of_peak=args.fullstamp_bright_frac_of_peak)
         if args.aperture_mode == "auto":
-            sat_flag = is_saturated(mean_img,
+            sat_flag = is_saturated(decision_img,
                                     top_frac=args.sat_top_frac,
                                     flat_frac_of_max=args.sat_flat_frac_of_max,
                                     min_flat_pixels=args.sat_min_flat_pixels)
@@ -415,18 +755,17 @@ def main():
             lc = median_scale_by_segment(time, lc_raw, gap_days=args.gap_days)
             npix = int(np.isfinite(mean_img).sum())
             out_csv = outdir / f"{base}_preferred_lc_target1_fullstamp.csv"
-            save_lc_csv(out_csv, time, lc, npix=npix)
+            save_lc_csv(out_csv, time, lc, npix=npix, mission=mission, time_system=time_system)
             if args.save_plots:
                 out_png = outdir / f"{base}_target1_fullstamp.png"
-                quicklook_plot(out_png, time, lc, f"{base} : full-stamp")
+                quicklook_plot(out_png, time, lc, f"{base} : full-stamp", time_system=time_system)
             continue
 
         if mode == "fixedap":
             if args.fixed_center == "center":
                 seed = (ny // 2, nx // 2)
             else:
-                seeds = find_peak_seeds(mean_img, n_peaks=1, min_sep=1, edge=args.fixed_edge)
-                seed = seeds[0] if len(seeds) else (ny // 2, nx // 2)
+                seed = primary_seed
 
             mask = circular_aperture_mask(ny, nx, seed, radius=args.fixed_radius)
             npix = int(mask.sum())
@@ -435,7 +774,7 @@ def main():
 
             tag = f"fixedapR{args.fixed_radius:g}"
             out_csv = outdir / f"{base}_preferred_lc_target1_{tag}.csv"
-            save_lc_csv(out_csv, time, lc, npix=npix)
+            save_lc_csv(out_csv, time, lc, npix=npix, mission=mission, time_system=time_system)
 
             print(f"  Fixed aperture: center={seed}  radius={args.fixed_radius:g}  npix={npix}")
 
@@ -443,20 +782,20 @@ def main():
                 out_png = outdir / f"{base}_aperture_{tag}.png"
                 mask_plot(out_png, mean_img, [mask], [seed], f"{base} : {tag}")
                 out_png_lc = outdir / f"{base}_target1_{tag}.png"
-                quicklook_plot(out_png_lc, time, lc, f"{base} : {tag} (seed={seed})")
+                quicklook_plot(out_png_lc, time, lc, f"{base} : {tag} (seed={seed})", time_system=time_system)
             continue
 
         # mode == "apgrow"
-        seeds = find_peak_seeds(mean_img, n_peaks=args.n_targets, min_sep=args.min_sep, edge=args.edge)
+        seeds = target_seeds
         if len(seeds) == 0:
             print("  [WARN] No peaks found; falling back to full-stamp")
             lc_raw = np.nansum(flux, axis=(1, 2))
             lc = median_scale_by_segment(time, lc_raw, gap_days=args.gap_days)
             out_csv = outdir / f"{base}_preferred_lc_target1_fullstamp_fallback.csv"
-            save_lc_csv(out_csv, time, lc, npix=int(np.isfinite(mean_img).sum()))
+            save_lc_csv(out_csv, time, lc, npix=int(np.isfinite(mean_img).sum()), mission=mission, time_system=time_system)
             if args.save_plots:
                 out_png = outdir / f"{base}_target1_fullstamp_fallback.png"
-                quicklook_plot(out_png, time, lc, f"{base} : full-stamp fallback")
+                quicklook_plot(out_png, time, lc, f"{base} : full-stamp fallback", time_system=time_system)
             continue
 
         owner = voronoi_owner_map_pixels(ny, nx, seeds)
@@ -486,12 +825,17 @@ def main():
             lc = median_scale_by_segment(time, lc_raw, gap_days=args.gap_days)
 
             out_csv = outdir / f"{base}_preferred_lc_target{k+1}_apgrow.csv"
-            save_lc_csv(out_csv, time, lc, npix=npix)
+            save_lc_csv(out_csv, time, lc, npix=npix, mission=mission, time_system=time_system)
 
             if args.save_plots:
                 out_png = outdir / f"{base}_target{k+1}_apgrow.png"
-                quicklook_plot(out_png, time, lc, f"{base} : target{k+1} apgrow (seed={seed})")
+                quicklook_plot(out_png, time, lc, f"{base} : target{k+1} apgrow (seed={seed})", time_system=time_system)
+
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        raise SystemExit(130)

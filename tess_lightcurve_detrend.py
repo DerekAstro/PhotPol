@@ -1,12 +1,21 @@
 #!/usr/bin/env python3
-"""Standalone detrending for light curves produced by tess_voronoi_lc_pipeline.py."""
+"""Standalone detrending for light curves produced by this extraction package.
+
+The detrender accepts aperture and PRF CSV products, discovers their companion
+centroid/background metadata, and can optionally add PCHIP variability
+protection, orbital-phase templates, and TESS quaternion regressors.
+"""
 
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
+import json
+import os
 from pathlib import Path
 import re
 import pickle
+import sys
 import gzip
 import lzma
 import urllib.error
@@ -28,6 +37,7 @@ import matplotlib.pyplot as plt
 from scipy.interpolate import PchipInterpolator
 
 SAVE_FIGURE_PICKLES = False
+DEFAULT_ORBITAL_TABLE = Path(__file__).resolve().with_name("tess_sector_orbfreq_midpoints.csv")
 
 
 def robust_wls(X, y, n_iter: int = 8, huber_k: float = 1.5):
@@ -85,6 +95,113 @@ def find_matching_file(diag_root: Path, prefix: str, stem: str):
     return None
 
 
+
+def _normalized_column_lookup(columns):
+    """Map punctuation/case-insensitive column names to their original names."""
+    return {
+        re.sub(r"[^a-z0-9]+", "", str(col).strip().lower()): col
+        for col in columns
+    }
+
+
+def _first_numeric_csv_column(df: pd.DataFrame, candidates):
+    """Return the first usable numeric CSV column among candidate aliases."""
+    lookup = _normalized_column_lookup(df.columns)
+    for candidate in candidates:
+        key = re.sub(r"[^a-z0-9]+", "", str(candidate).strip().lower())
+        col = lookup.get(key)
+        if col is None:
+            continue
+        values = pd.to_numeric(df[col], errors="coerce").to_numpy(float)
+        if np.isfinite(values).any():
+            return col, values
+    return None, None
+
+
+def load_position_regressors(
+    df: pd.DataFrame,
+    diag_root: Path,
+    stem_core: str,
+    require: bool = True,
+):
+    """
+    Load the two detector-position regressors used for XY decorrelation.
+
+    Priority is deliberately backward compatible:
+      1. companion centroid_row_*.npy / centroid_col_*.npy files;
+      2. absolute centroid columns stored directly in the light-curve CSV;
+      3. PRF-motion columns stored directly in a PRF light-curve CSV;
+      4. POS_CORR-style row/column shifts stored in the CSV.
+
+    Relative shifts are valid here because build_design_matrix() median-centers
+    both regressors before fitting.
+    """
+    crow_file = find_matching_file(diag_root, "centroid_row", stem_core)
+    ccol_file = find_matching_file(diag_root, "centroid_col", stem_core)
+    if crow_file is not None and ccol_file is not None:
+        return (
+            np.asarray(np.load(crow_file), float),
+            np.asarray(np.load(ccol_file), float),
+            f"external_npy:{crow_file.name},{ccol_file.name}",
+        )
+
+    if (crow_file is None) != (ccol_file is None):
+        missing = "centroid_row" if crow_file is None else "centroid_col"
+        print(
+            f"  [WARN] Found only one external centroid diagnostic for {stem_core}; "
+            f"the {missing} companion is missing. Trying columns in the CSV instead."
+        )
+
+    pairs = [
+        # Standard extractor/detrender column names.
+        (("centroid_row", "centroid_y", "row_centroid", "y_centroid"),
+         ("centroid_col", "centroid_column", "centroid_x", "col_centroid", "column_centroid", "x_centroid"),
+         "csv_centroid"),
+        # Jitter-aware PRF products.
+        (("motion_row", "prf_motion_row", "row_shift", "delta_row", "dy"),
+         ("motion_column", "motion_col", "prf_motion_column", "column_shift", "col_shift", "delta_column", "delta_col", "dx"),
+         "csv_prf_motion"),
+        # TPF/SPOC-style local motion columns, when retained in an input CSV.
+        (("pos_corr2", "poscorr2", "position_correction_row"),
+         ("pos_corr1", "poscorr1", "position_correction_column"),
+         "csv_pos_corr"),
+    ]
+
+    for row_aliases, col_aliases, source in pairs:
+        row_col, row_values = _first_numeric_csv_column(df, row_aliases)
+        col_col, col_values = _first_numeric_csv_column(df, col_aliases)
+        if row_values is not None and col_values is not None:
+            return row_values, col_values, f"{source}:{row_col},{col_col}"
+
+    if require:
+        raise FileNotFoundError(
+            f"Could not find position regressors for {stem_core}. Searched for "
+            f"centroid_row/centroid_col diagnostic NPY files under {diag_root}, "
+            "then for centroid, motion_row/motion_column, and POS_CORR columns "
+            "inside the light-curve CSV. Use --skip-xybg-decorrelation only if "
+            "position-based decorrelation is intentionally not wanted."
+        )
+    return None, None, "unavailable_not_required"
+
+
+def load_background_regressor(df: pd.DataFrame, diag_root: Path, stem_core: str):
+    """Load background from the legacy NPY diagnostic or an inline CSV column."""
+    bg_file = find_matching_file(diag_root, "background", stem_core)
+    if bg_file is not None:
+        return np.asarray(np.load(bg_file), float), f"external_npy:{bg_file.name}"
+
+    col, values = _first_numeric_csv_column(
+        df,
+        (
+            "background", "background_prf", "background_flux", "sky_background",
+            "background_level", "bkg", "bg",
+        ),
+    )
+    if values is not None:
+        return values, f"csv:{col}"
+    return None, "unavailable"
+
+
 def rms_ppm(x):
     x = np.asarray(x, float)
     return 1e6 * np.nanstd(x - np.nanmedian(x))
@@ -102,7 +219,7 @@ def normalize_lc_stem(stem: str):
 def parse_stem_metadata(stem: str):
     """
     Parse stems like:
-      s0019_sig_Sco_target1_matlab_pure
+      s0019_sig_Sco_target1_saturated_aperture
     Returns dict with sector, source, target, method.
     """
     m = re.match(r'^(s\d{4})_(.+)_(target\d+)_(.+)$', stem)
@@ -131,25 +248,57 @@ def combined_output_stem(stem: str):
 
 
 def load_sector_orbtable(csv_path: str | Path):
+    """Load a validated sector midpoint/orbital-frequency table.
+
+    Preferred headings are ``sector``, ``mid_btjd``, and
+    ``freq_cyc_per_day``. Historical ``mid_tjd`` and ``freq_cyc/day``
+    headings remain accepted for existing user files.
+    """
     p = Path(csv_path).expanduser()
     if not p.exists():
         raise FileNotFoundError(f"Orbital-frequency table not found: {p}")
     df = pd.read_csv(p)
     cols = {c.strip(): c for c in df.columns}
-    need = ["sector", "mid_tjd", "freq_cyc/day"]
-    missing = [c for c in need if c not in cols]
+    mid_key = "mid_btjd" if "mid_btjd" in cols else "mid_tjd" if "mid_tjd" in cols else None
+    freq_key = (
+        "freq_cyc_per_day"
+        if "freq_cyc_per_day" in cols
+        else "freq_cyc/day"
+        if "freq_cyc/day" in cols
+        else None
+    )
+    missing = []
+    if "sector" not in cols:
+        missing.append("sector")
+    if mid_key is None:
+        missing.append("mid_btjd (or legacy mid_tjd)")
+    if freq_key is None:
+        missing.append("freq_cyc_per_day (or legacy freq_cyc/day)")
     if missing:
         raise ValueError(f"Orbital-frequency table missing columns: {missing}. Found: {list(df.columns)}")
     out = {}
-    for _, r in df.iterrows():
+    invalid_rows = []
+    for row_index, r in df.iterrows():
         try:
             sec = int(r[cols["sector"]])
-            mid_btjd = float(r[cols["mid_tjd"]])
-            freq = float(r[cols["freq_cyc/day"]])
-        except Exception:
+            mid_btjd = float(r[cols[mid_key]])
+            freq = float(r[cols[freq_key]])
+        except Exception as exc:
+            invalid_rows.append(f"row {int(row_index) + 2}: {type(exc).__name__}")
             continue
-        if np.isfinite(mid_btjd) and np.isfinite(freq):
-            out[sec] = (mid_btjd, freq)
+        if sec < 1 or not np.isfinite(mid_btjd) or not np.isfinite(freq) or freq <= 0:
+            invalid_rows.append(
+                f"row {int(row_index) + 2}: sector={sec}, mid_btjd={mid_btjd}, frequency={freq}"
+            )
+            continue
+        if sec in out:
+            raise ValueError(f"Orbital-frequency table contains duplicate sector {sec}: {p}")
+        out[sec] = (mid_btjd, freq)
+    if invalid_rows:
+        preview = "; ".join(invalid_rows[:5])
+        if len(invalid_rows) > 5:
+            preview += f"; plus {len(invalid_rows) - 5} more"
+        raise ValueError(f"Orbital-frequency table contains invalid rows ({preview}): {p}")
     if not out:
         raise ValueError(f"No valid rows found in orbital-frequency table: {p}")
     return out
@@ -310,7 +459,22 @@ _QUAT_FILE_SUFFIXES = (
 
 TESSVECTORS_BASE_URL = "https://heasarc.gsfc.nasa.gov/docs/tess/data/TESSVectors/Vectors"
 MAST_TESS_ENGINEERING_URL = "https://archive.stsci.edu/missions/tess/engineering/"
-DEFAULT_TESSVECTORS_CACHE = "~/.cache/photpol/tessvectors"
+
+
+def default_tessvectors_cache() -> str:
+    """Return the conventional per-user cache directory for this platform."""
+    if os.name == "nt":
+        local_appdata = os.environ.get("LOCALAPPDATA")
+        base = Path(local_appdata) if local_appdata else Path.home() / "AppData" / "Local"
+    elif sys.platform == "darwin":
+        base = Path.home() / "Library" / "Caches"
+    else:
+        xdg_cache = os.environ.get("XDG_CACHE_HOME")
+        base = Path(xdg_cache) if xdg_cache else Path.home() / ".cache"
+    return str(base / "photpol" / "tessvectors")
+
+
+DEFAULT_TESSVECTORS_CACHE = default_tessvectors_cache()
 
 
 def _tessvectors_cadence_info(cadence_seconds: float | None) -> tuple[str, str]:
@@ -805,6 +969,123 @@ def _find_referenced_file(reference: str, search_roots: list[Path]) -> Path | No
     return None
 
 
+def _camera_from_metadata_mapping(mapping) -> int | None:
+    """Recursively find a valid TESS camera number in JSON-like metadata."""
+    if isinstance(mapping, dict):
+        # Prefer explicit camera keys at the current level before descending.
+        for key, value in mapping.items():
+            if _norm_name(key) in {"camera", "cam", "cameranumber", "cameranum"}:
+                try:
+                    camera = int(value)
+                except Exception:
+                    continue
+                if camera in (1, 2, 3, 4):
+                    return camera
+        for value in mapping.values():
+            camera = _camera_from_metadata_mapping(value)
+            if camera is not None:
+                return camera
+    elif isinstance(mapping, (list, tuple)):
+        for value in mapping:
+            camera = _camera_from_metadata_mapping(value)
+            if camera is not None:
+                return camera
+    return None
+
+
+def _tpf_references_from_metadata_mapping(mapping) -> list[str]:
+    """Recursively collect likely original-TPF references from JSON metadata."""
+    refs: list[str] = []
+    if isinstance(mapping, dict):
+        for key, value in mapping.items():
+            norm = _norm_name(key)
+            if norm in {
+                "tpfpath", "tpffile", "tpffilename", "tpfname",
+                "sourcefile", "inputfile", "file",
+            }:
+                if isinstance(value, (str, Path)):
+                    ref = str(value).strip()
+                    if ref and ref.lower() not in {"nan", "none"}:
+                        refs.append(ref)
+            refs.extend(_tpf_references_from_metadata_mapping(value))
+    elif isinstance(mapping, (list, tuple)):
+        for value in mapping:
+            refs.extend(_tpf_references_from_metadata_mapping(value))
+    return list(dict.fromkeys(refs))
+
+
+def _candidate_prf_metadata_jsons(csv_path: Path, stem: str, diag_root: Path) -> list[Path]:
+    """Return plausible PRF metadata JSON files for this target/sector.
+
+    The selected light curve need not itself be the PRF product.  When a jump,
+    core, full-region-sum, or other aperture light curve was produced in the same run,
+    its sibling PRF metadata contains the same TPF camera and detector metadata.
+    Match siblings by sector + source label + target number while deliberately
+    ignoring the extraction-method suffix.
+    """
+    csv_path = Path(csv_path)
+    diag_root = Path(diag_root)
+    candidates = [
+        csv_path.with_name(f"{csv_path.stem}_prf_meta.json"),
+        csv_path.with_name(f"{csv_path.stem}_meta.json"),
+        csv_path.with_name(f"{stem}_prf_meta.json"),
+        csv_path.with_name(f"preferred_lc_{stem}_prf_meta.json"),
+    ]
+
+    patterns = [
+        f"*{csv_path.stem}*prf*meta*.json",
+        f"*{stem}*prf*meta*.json",
+    ]
+
+    parsed = parse_stem_metadata(stem)
+    if parsed is not None:
+        sibling_base = f'{parsed["sector"]}_{parsed["source"]}_{parsed["target"]}'
+        # Current writer: preferred_lc_<base>_prf.csv ->
+        #                 preferred_lc_<base>_prf_prf_meta.json
+        candidates.extend([
+            csv_path.with_name(f"preferred_lc_{sibling_base}_prf_prf_meta.json"),
+            csv_path.with_name(f"preferred_lc_{sibling_base}_prf_meta.json"),
+            csv_path.with_name(f"{sibling_base}_prf_prf_meta.json"),
+            csv_path.with_name(f"{sibling_base}_prf_meta.json"),
+        ])
+        patterns.extend([
+            f"*{sibling_base}_prf*meta*.json",
+            f"*{sibling_base}*prf*meta*.json",
+        ])
+
+    # Current PRF outputs end in ``_prf.csv`` and the writer appends
+    # ``_prf_meta.json``, yielding ``..._prf_prf_meta.json``.  Search both the
+    # CSV directory and the diagnostics tree to support flat and nested output.
+    search_roots = []
+    for root in (csv_path.parent, diag_root):
+        try:
+            root = Path(root).expanduser().resolve()
+        except Exception:
+            continue
+        if root not in search_roots:
+            search_roots.append(root)
+
+    for root in search_roots:
+        for pattern in patterns:
+            try:
+                candidates.extend(root.rglob(pattern))
+            except Exception:
+                pass
+
+    out = []
+    seen = set()
+    for candidate in candidates:
+        try:
+            candidate = Path(candidate).expanduser().resolve()
+        except Exception:
+            continue
+        if candidate in seen or not candidate.exists() or not candidate.is_file():
+            continue
+        seen.add(candidate)
+        out.append(candidate)
+    return out
+
+
 def infer_camera_from_companion_products(
     lc_df: pd.DataFrame,
     stem: str,
@@ -816,9 +1097,11 @@ def infer_camera_from_companion_products(
     Infer the TESS camera from extractor products.
 
     The preferred route is:
-      1. camera column in the light-curve or aperture-metadata CSV;
-      2. original TPF path/name recorded by the extractor;
-      3. CAMERA keyword in the located TPF FITS header.
+      1. camera column in the light-curve CSV;
+      2. companion PRF metadata JSON;
+      3. camera column in companion aperture-metadata CSVs;
+      4. original TPF path/name recorded by any of those products;
+      5. CAMERA keyword in the located TPF FITS header.
     """
     camera = infer_camera_from_lightcurve(lc_df, stem)
     if camera is not None:
@@ -841,7 +1124,24 @@ def infer_camera_from_companion_products(
 
     refs = _candidate_tpf_references_from_dataframe(lc_df)
 
+    # PRF light curves keep detector metadata and the original TPF path in a
+    # companion JSON rather than repeating those values on every CSV row.
+    for meta_path in _candidate_prf_metadata_jsons(csv_path, stem, diag_root):
+        try:
+            metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            print(f"  [WARN] Could not read PRF metadata {meta_path.name}: {exc}")
+            continue
+
+        camera = _camera_from_metadata_mapping(metadata)
+        if camera is not None:
+            print(f"  Inferred TESS camera {camera} from PRF metadata: {meta_path.name}")
+            return camera
+        refs.extend(_tpf_references_from_metadata_mapping(metadata))
+
     metadata_patterns = [
+        f"saturated_aperture_meta_{stem}.csv",
+        # Backward-compatible discovery for products from older releases.
         f"matlab_aperture_meta_{stem}.csv",
         f"*aperture_meta*{stem}*.csv",
     ]
@@ -1431,15 +1731,15 @@ def save_combined_plot(df_all: pd.DataFrame, outpng: Path, title: str):
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(
-        description="Detrend raw light curves produced by tess_voronoi_lc_pipeline.py.",
+        description="Detrend aperture or PRF light curves produced by the extraction package.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--lightcurve-dir", type=str, default="LC_products_multi",
                    help="Directory containing raw light-curve CSV files from the extraction pipeline.")
-    p.add_argument("--diagnostics-dir", type=str, default="LC_products_multi",
-                   help="Directory containing centroids/background/aperture diagnostics from the extraction pipeline.")
-    p.add_argument("--output-dir", type=str, default="LC_products_multi",
-                   help="Directory for detrended light-curve CSV files.")
+    p.add_argument("--diagnostics-dir", type=str, default="",
+                   help="Directory containing companion diagnostics; defaults to --lightcurve-dir.")
+    p.add_argument("--output-dir", type=str, default="",
+                   help="Directory for detrended products; defaults to --lightcurve-dir.")
     p.add_argument("--prefix", type=str, default="detrended_",
                    help="Prefix added to all detrended output filenames.")
     p.add_argument("--recursive", action="store_true",
@@ -1476,16 +1776,15 @@ def parse_args(argv=None):
                    help="Sigma threshold for residual clipping before decorrelation.")
     p.add_argument("--clip-residuals-iters", type=int, default=1,
                    help="Number of iterations for residual clipping before decorrelation.")
-    p.add_argument("--gap-days", type=float, default=0.5,
-                   help="Gap threshold reserved for chunk-wise workflows and compatibility with the GUI.")
     p.add_argument("--save-figure-pickles", action="store_true",
                    help="Save pickled Matplotlib figure objects alongside PNG plots.")
     p.add_argument("--skip-xybg-decorrelation", action="store_true",
                    help="Skip centroid/background decorrelation entirely, but still allow orbital and optional PCHIP corrections.")
     p.add_argument("--apply-orbital-phase-template", action="store_true",
-                   help="Apply the MATLAB-style orbital phase-template correction in the detrending stage.")
-    p.add_argument("--orbtable", type=str, default="",
-                   help="Path to tess_sector_orbfreq_midpoints.csv used for orbital phase-template correction.")
+                   help="Apply a TESS orbital-phase template correction in the detrending stage.")
+    p.add_argument("--orbtable", type=str, default=str(DEFAULT_ORBITAL_TABLE),
+                   help=("Path to the sector orbital-frequency table used for orbital phase-template "
+                         "correction. The bundled tess_sector_orbfreq_midpoints.csv is the default."))
     p.add_argument("--phase-bin", type=float, default=0.01,
                    help="Phase bin width for orbital phase-template subtraction.")
     p.add_argument("--use-quaternion-regression", action="store_true",
@@ -1515,37 +1814,71 @@ def parse_args(argv=None):
     return p.parse_args(argv)
 
 
+def validate_args(args) -> None:
+    """Validate numerical settings before any input files are modified."""
+    if int(args.robust_iters) < 1 or float(args.huber_k) <= 0:
+        raise ValueError("Robust iterations and Huber k must be positive.")
+    if args.use_pchip_highpass and float(args.pchip_knot_spacing) <= 0:
+        raise ValueError("--pchip-knot-spacing must be positive.")
+    if args.pre_model_pchip:
+        if float(args.pre_model_bin_days) <= 0 or int(args.pre_model_min_points) < 1:
+            raise ValueError("Pre-model PCHIP bin size and minimum point count must be positive.")
+    if not (0.0 < float(args.phase_bin) <= 1.0):
+        raise ValueError("--phase-bin must be in the interval (0, 1].")
+    if int(args.quaternion_min_samples) < 1:
+        raise ValueError("--quaternion-min-samples must be at least 1.")
+
+
+def write_run_configuration(
+    out_root: Path,
+    args,
+    csv_files: list[Path],
+    *,
+    lightcurve_root: Path,
+    diagnostics_root: Path,
+) -> Path:
+    """Record resolved detrending options and the selected input CSV files."""
+    created = datetime.now(timezone.utc)
+    settings = {}
+    for key, value in vars(args).items():
+        if isinstance(value, float) and not np.isfinite(value):
+            value = str(value)
+        settings[key] = value
+    settings["lightcurve_dir"] = str(lightcurve_root)
+    settings["diagnostics_dir"] = str(diagnostics_root)
+    settings["output_dir"] = str(out_root)
+    payload = {
+        "schema_version": 1,
+        "created_utc": created.isoformat(),
+        "detrender": Path(__file__).name,
+        "settings": settings,
+        "input_files": [str(path) for path in csv_files],
+    }
+    stamp = created.strftime("%Y%m%dT%H%M%S_%fZ")
+    path = out_root / f"detrend_run_config_{stamp}.json"
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return path
+
+
 def main(argv=None):
     global SAVE_FIGURE_PICKLES
     args = parse_args(argv)
+    validate_args(args)
     SAVE_FIGURE_PICKLES = bool(getattr(args, "save_figure_pickles", False))
 
     lc_root = Path(args.lightcurve_dir).expanduser().resolve()
 
-    # Path policy:
-    # - If the user leaves --diagnostics-dir / --output-dir at their defaults,
-    #   place them alongside --lightcurve-dir (i.e. under lc_root.parent).
-    # - If the user explicitly supplies a relative path such as
-    #   "LC_products/lightcurves_detrended", respect it relative to the
-    #   current working directory instead of prepending lc_root.parent again.
-    default_diag = "LC_products_multi"
-    default_out = "LC_products_multi"
-
-    diag_candidate = Path(args.diagnostics_dir).expanduser()
-    if diag_candidate.is_absolute():
-        diag_root = diag_candidate.resolve()
-    elif args.diagnostics_dir == default_diag:
-        diag_root = (lc_root.parent / diag_candidate).resolve()
-    else:
-        diag_root = diag_candidate.resolve()
-
-    out_candidate = Path(args.output_dir).expanduser()
-    if out_candidate.is_absolute():
-        out_root = out_candidate.resolve()
-    elif args.output_dir == default_out:
-        out_root = (lc_root.parent / out_candidate).resolve()
-    else:
-        out_root = out_candidate.resolve()
+    # Companion diagnostics are normally written next to the extracted CSVs.
+    # Explicit relative paths remain relative to the launch directory, matching
+    # normal command-line expectations on Windows, macOS, and Linux.
+    diag_root = (
+        Path(args.diagnostics_dir).expanduser().resolve()
+        if str(args.diagnostics_dir).strip() else lc_root
+    )
+    out_root = (
+        Path(args.output_dir).expanduser().resolve()
+        if str(args.output_dir).strip() else lc_root
+    )
 
     out_root.mkdir(parents=True, exist_ok=True)
 
@@ -1553,16 +1886,23 @@ def main(argv=None):
     if getattr(args, "apply_orbital_phase_template", False):
         if not getattr(args, "orbtable", ""):
             raise ValueError("--apply-orbital-phase-template requires --orbtable.")
+        args.orbtable = str(Path(args.orbtable).expanduser().resolve())
         sector_orb = load_sector_orbtable(args.orbtable)
 
     if not lc_root.exists():
         raise FileNotFoundError(f"--lightcurve-dir not found: {lc_root}")
-    if not diag_root.exists():
-        raise FileNotFoundError(f"--diagnostics-dir not found: {diag_root}")
-
     csv_files = sorted(lc_root.rglob(args.pattern) if args.recursive else lc_root.glob(args.pattern))
     if not csv_files:
         raise FileNotFoundError(f"No CSV files found in {lc_root} matching {args.pattern!r}")
+
+    config_path = write_run_configuration(
+        out_root,
+        args,
+        csv_files,
+        lightcurve_root=lc_root,
+        diagnostics_root=diag_root,
+    )
+    print(f"Resolved detrending settings: {config_path}")
 
     print(f"Raw light curves to detrend: {len(csv_files)}")
     combined_rows = {}
@@ -1570,15 +1910,27 @@ def main(argv=None):
     for csv_path in csv_files:
         stem = csv_path.stem
         stem_core = normalize_lc_stem(stem)
-        if stem.startswith(str(args.prefix)) or "_detrend" in stem or "_combined_detrend" in stem or "_combined" in stem and stem.startswith(str(args.prefix)):
+        if stem.startswith(str(args.prefix)) or "_detrend" in stem:
             print(f"Skipping already-detrended file: {csv_path.name}")
             continue
         print(f"\nProcessing: {csv_path.name}")
 
         df = pd.read_csv(csv_path)
+        # Mission-aware time handling.  New extractor products always include
+        # time_btjd for backward compatibility, while Kepler/K2 also retain
+        # native time_bkjd.  Accept native-only external tables as well.
+        if "time_btjd" not in df.columns and "time_bkjd" in df.columns:
+            df["time_btjd"] = pd.to_numeric(df["time_bkjd"], errors="coerce") - 2167.0
         if "time_btjd" not in df.columns:
             print(f"Skipping non-light-curve CSV: {csv_path.name}")
             continue
+        mission = "UNKNOWN"
+        if "mission" in df.columns:
+            vals = df["mission"].dropna().astype(str).str.strip()
+            if len(vals):
+                mission = vals.iloc[0].upper()
+        elif "time_bkjd" in df.columns:
+            mission = "KEPLER/K2"
         flux_col = (
             "flux_rel" if "flux_rel" in df.columns else
             ("flux_detrended_rel" if "flux_detrended_rel" in df.columns else
@@ -1591,36 +1943,64 @@ def main(argv=None):
         t = np.asarray(df["time_btjd"], float)
         flux = np.asarray(df[flux_col], float)
 
-        crow_file = find_matching_file(diag_root, "centroid_row", stem_core)
-        ccol_file = find_matching_file(diag_root, "centroid_col", stem_core)
-        if crow_file is None or ccol_file is None:
-            raise FileNotFoundError(f"Could not find centroid files for {stem_core} under {diag_root}")
-
-        crow = np.load(crow_file)
-        ccol = np.load(ccol_file)
+        skip_xybg = bool(getattr(args, "skip_xybg_decorrelation", False))
+        crow, ccol, position_source = load_position_regressors(
+            df,
+            diag_root,
+            stem_core,
+            require=not skip_xybg,
+        )
+        if crow is not None and ccol is not None:
+            print(f"  Position regressors: {position_source}")
+        elif skip_xybg:
+            print("  Position regressors: unavailable/not required because XY/background decorrelation is skipped")
 
         bg = None
-        if args.use_background:
-            bg_file = find_matching_file(diag_root, "background", stem_core)
-            if bg_file is not None:
-                bg = np.load(bg_file)
+        background_source = "not_requested"
+        if args.use_background and not skip_xybg:
+            bg, background_source = load_background_regressor(df, diag_root, stem_core)
+            if bg is None:
+                print(
+                    f"  [WARN] --use-background was requested, but no background diagnostic or "
+                    f"inline background column was found for {stem_core}; continuing without it."
+                )
+            else:
+                print(f"  Background regressor: {background_source}")
 
-        n = min(len(t), len(flux), len(crow), len(ccol), len(bg) if bg is not None else 10**12)
+        lengths = [len(t), len(flux)]
+        if crow is not None:
+            lengths.append(len(crow))
+        if ccol is not None:
+            lengths.append(len(ccol))
+        if bg is not None:
+            lengths.append(len(bg))
+        n = min(lengths)
+
         t = t[:n]
         flux = flux[:n]
-        crow = crow[:n]
-        ccol = ccol[:n]
+        if crow is not None:
+            crow = np.asarray(crow[:n], float)
+        if ccol is not None:
+            ccol = np.asarray(ccol[:n], float)
         if bg is not None:
-            bg = bg[:n]
+            bg = np.asarray(bg[:n], float)
 
-        mask = np.isfinite(t) & np.isfinite(flux) & np.isfinite(crow) & np.isfinite(ccol)
-        if bg is not None:
-            mask &= np.isfinite(bg)
+        mask = np.isfinite(t) & np.isfinite(flux)
+        if not skip_xybg:
+            mask &= np.isfinite(crow) & np.isfinite(ccol)
+            if bg is not None:
+                mask &= np.isfinite(bg)
 
         t = t[mask]
         flux = flux[mask]
-        crow = crow[mask]
-        ccol = ccol[mask]
+        if crow is None:
+            crow = np.full(len(t), np.nan, dtype=float)
+        else:
+            crow = crow[mask]
+        if ccol is None:
+            ccol = np.full(len(t), np.nan, dtype=float)
+        else:
+            ccol = ccol[mask]
         if bg is not None:
             bg = bg[mask]
 
@@ -1652,6 +2032,12 @@ def main(argv=None):
             flux_variability_resid = flux_for_fit.copy()
 
         use_quat = bool(getattr(args, "use_quaternion_regression", False))
+        if use_quat and mission in {"KEPLER", "K2", "KEPLER/K2"}:
+            print(
+                f"  [WARN] {mission} light curve detected: TESS quaternion regression "
+                "is not applicable and will be skipped for this file."
+            )
+            use_quat = False
         quaternion_source = str(getattr(args, "quaternion_source", "")).strip()
         quaternion_auto_download = bool(getattr(args, "quaternion_auto_download", False))
         if use_quat and not quaternion_source and not quaternion_auto_download:
@@ -1667,7 +2053,7 @@ def main(argv=None):
         # used for quaternion alignment when available.
         df_masked = df.iloc[:n].loc[mask].reset_index(drop=True)
 
-        if getattr(args, "skip_xybg_decorrelation", False):
+        if skip_xybg:
             X_xy = np.ones((len(t), 1), dtype=float)
             xy_names = ["intercept"]
         else:
@@ -1717,7 +2103,7 @@ def main(argv=None):
                         cadence_for_download,
                         base_url=args.tessvectors_base_url,
                     ))
-                except FileNotFoundError as tessvectors_exc:
+                except Exception as tessvectors_exc:
                     print(f"  [WARN] {tessvectors_exc}")
                     print("  TESSVectors is unavailable; trying the raw MAST quaternion engineering file.")
                     try:
@@ -1846,7 +2232,12 @@ def main(argv=None):
             "flux_decor_only_rel": flux_decor,
             "centroid_col": ccol,
             "centroid_row": crow,
+            "position_regressor_source": np.full(len(t), position_source, dtype=object),
         })
+        if args.use_background:
+            out_df["background_regressor_source"] = np.full(
+                len(t), background_source, dtype=object
+            )
         if use_quat and quat_info is not None:
             out_df["flux_quaternion_corrected_rel"] = flux_decor
             out_df["flux_quaternion_only_corrected_rel"] = flux_quaternion_only
@@ -1859,7 +2250,7 @@ def main(argv=None):
             out_df["background"] = bg
         if np.any(np.isfinite(variability_model)):
             out_df["pre_model_pchip_trend"] = variability_model
-        if np.any(np.isfinite(orbital_trend)):
+        if orbital_trend is not None and np.any(np.isfinite(orbital_trend)):
             out_df["orbital_phase"] = orbital_phase
             out_df["orbital_phase_trend"] = orbital_trend
             out_df["flux_orbital_corrected_rel"] = flux_orbital
