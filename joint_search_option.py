@@ -1,9 +1,10 @@
-# Auto-exported companion script from notebook v6
+"""Joint TESS-photometry and polarimetry frequency analysis."""
 
 import numpy as np
 import pandas as pd
 from dataclasses import dataclass
 from pathlib import Path
+import json
 import matplotlib.pyplot as plt
 
 try:
@@ -43,7 +44,7 @@ TESS_SECTOR_RESCALE_MIN_POINTS = 20
 TESS_SECTOR_SCALE_MIN = 0.10
 TESS_SECTOR_SCALE_MAX = 100.0
 
-POL_CSV  = Path("bet Cep_IND_nm_pchip_analysis_frame.csv")  # <-- change
+POL_CSV = Path("target_nm_pchip_analysis_frame.csv")
 
 # --- Polarimetry product to analyze ---
 POL_PRODUCT = "resid_nm_pchip"  # 'nm' | 'resid_nm_pchip' | 'pw_resid_nm_pchip'
@@ -51,6 +52,7 @@ POL_PRODUCT = "resid_nm_pchip"  # 'nm' | 'resid_nm_pchip' | 'pw_resid_nm_pchip'
 # --- Frequency range (cycles/day) ---
 FMIN = 0.01
 FMAX = 50.0
+TESS_CAP_FMAX_TO_NYQUIST = True
 
 # --- Two-stage search ---
 K_CANDIDATES = 10
@@ -72,9 +74,9 @@ TRIM_TOP_FRAC = 0.10
 # --- Whitening robustness ---
 N_SIDE_BINS = 30
 
-# --- Polarimetry night-model (Option C default; D-ready) ---
+# --- Night-aware polarimetry baseline model ---
 USE_POL_NIGHT_OFFSETS = True
-USE_POL_NIGHT_SLOPES  = False    # keep False for now; easy upgrade to Option D later
+USE_POL_NIGHT_SLOPES = False
 POL_NIGHT_GROUP_MODE  = "gap"    # 'gap' | 'integer_jd' | 'run' | 'subrun'
 POL_NIGHT_GAP_HOURS   = 8.0      # used if mode='gap'
 
@@ -97,17 +99,20 @@ MANUAL_W_POL = 1.0
 PHASE_ZERO_MODE = "local_start"   # "local_start" | "btjd_zero" | "custom_btjd"
 PHASE_ZERO_BTJD = 0.0
 
-# --- Optional extra summary-spectrum outputs ---
-SUMMARY_SAVE_PERIOD_VERSION = False
-SUMMARY_SAVE_LOG_AMPLITUDE_VERSION = False
+# Smoothing affects only the polarimetry spectrum used for joint candidate
+# selection. Final time-domain fits and reported local SNRs remain unsmoothed.
+POL_SMOOTH_ENABLED = False
+POL_SMOOTH_KERNEL = "gaussian"       # "gaussian" | "boxcar"
+POL_SMOOTH_WIDTH_RES_ELEMS = 10.0    # Gaussian FWHM or boxcar full width
+POL_SMOOTH_SAMPLES_PER_WIDTH = 4.0   # minimum sampling during local Joint refinement
+POL_SMOOTH_MAX_REFINE_FACTOR = 200   # protects against pathological baselines/settings
 
 
-# --- Notebook display ---
+# --- Interactive display ---
 SHOW_PLOTS_INLINE = True
 
 # --- Output ---
-OUTROOT = Path("joint_phot_pol_outputs_optionC")
-OUTROOT.mkdir(parents=True, exist_ok=True)
+OUTROOT = Path("joint_phot_pol_outputs")
 
 @dataclass
 class TimeSeries:
@@ -125,29 +130,6 @@ class NightTrendConfig:
     group_mode: str = "gap"
     gap_days: float = 8.0 / 24.0
 
-def _clean_sort(t, y, yerr=None, t_abs=None):
-    t = np.asarray(t, dtype=float)
-    y = np.asarray(y, dtype=float)
-    m = np.isfinite(t) & np.isfinite(y)
-    if yerr is not None:
-        yerr = np.asarray(yerr, dtype=float)
-        yerr = np.where(np.isfinite(yerr) & (yerr > 0), yerr, np.nan)
-        m &= np.isfinite(yerr)
-        yerr = yerr[m]
-    if t_abs is not None:
-        t_abs = np.asarray(t_abs, dtype=float)
-        m &= np.isfinite(t_abs)
-        t_abs = t_abs[m]
-    t, y = t[m], y[m]
-    idx = np.argsort(t)
-    t, y = t[idx], y[idx]
-    if yerr is not None:
-        yerr = yerr[idx]
-    if t_abs is not None:
-        t_abs = t_abs[idx]
-    return t, y, yerr, t_abs
-
-TESS_TIME_COL = "time_btjd"
 TESS_TIME_COL_CANDIDATES = ["time_btjd", "btjd", "time", "bjd", "jd"]
 TESS_Y_COL_CANDIDATES = [
     "flux_detrend_rel",
@@ -663,13 +645,22 @@ def load_tess_input() -> TimeSeries:
         )
     raise ValueError(f"TESS_INPUT_MODE must be 'spoc_csv' or 'pipeline_dir'. Got: {TESS_INPUT_MODE}")
 
-def load_polarimetry_csv(path: Path, product: str, trend_cfg: NightTrendConfig) -> dict:
+def load_polarimetry_csv(
+    path: Path,
+    product: str,
+    trend_cfg: NightTrendConfig,
+    channels: list[str] | tuple[str, ...] | None = None,
+) -> dict:
     if product not in POL_PRODUCTS:
         raise ValueError(f"POL_PRODUCT must be one of {list(POL_PRODUCTS.keys())}. Got: {product}")
+    selected = [str(k).lower() for k in (channels or ("q", "u", "p"))]
+    invalid = [k for k in selected if k not in {"q", "u", "p"}]
+    if invalid:
+        raise ValueError(f"Unsupported polarimetry channel(s): {invalid}")
     df = pd.read_csv(path)
     required = [POL_TIME_COL]
-    required += [POL_PRODUCTS[product][k] for k in ["q","u","p"]]
-    required += [POL_ERR_COLS[k] for k in ["q","u","p"]]
+    required += [POL_PRODUCTS[product][k] for k in selected]
+    required += [POL_ERR_COLS[k] for k in selected]
     missing = [c for c in required if c not in df.columns]
     if missing:
         raise ValueError(f"{path}: missing columns: {missing}. Found: {list(df.columns)}")
@@ -683,7 +674,7 @@ def load_polarimetry_csv(path: Path, product: str, trend_cfg: NightTrendConfig) 
         group_labels = get_polarimetry_group_labels(df, trend_cfg.group_mode)
 
     out = {}
-    for k in ["q", "u", "p"]:
+    for k in selected:
         y = df[POL_PRODUCTS[product][k]].to_numpy(dtype=float)
         yerr = df[POL_ERR_COLS[k]].to_numpy(dtype=float)
         tt, yy, ee, ta, glab = _clean_sort_with_group(t_rel, y, yerr, t_abs=t_abs, group_labels=group_labels)
@@ -709,15 +700,6 @@ def detrend_poly(ts: TimeSeries, order: int = 1) -> TimeSeries:
         t_abs=None if ts.t_abs is None else ts.t_abs.copy(),
         group_id=None if ts.group_id is None else ts.group_id.copy()
     )
-
-def estimate_time_domain_noise(ts: TimeSeries) -> float:
-    if len(ts.y) < 5:
-        return np.nan
-    dy = np.diff(ts.y)
-    med = np.nanmedian(dy)
-    mad = np.nanmedian(np.abs(dy - med))
-    sigma_dy = mad / 0.6745 if mad > 0 else np.nanstd(dy)
-    return sigma_dy / np.sqrt(2.0) if np.isfinite(sigma_dy) else np.nan
 
 def estimate_scale_free_weight(ts: TimeSeries, basis: str = "tseg") -> float:
     basis = str(basis).lower()
@@ -759,9 +741,100 @@ def longest_contiguous_segment_duration(t: np.ndarray, gap_days: float) -> float
 def compute_Tseg(ts: TimeSeries, gap_days: float = 1.0) -> float:
     return longest_contiguous_segment_duration(ts.t, gap_days=gap_days)
 
+
+def compute_tess_nyquist_cpd(ts: TimeSeries) -> float:
+    """Estimate the cadence Nyquist frequency from finite positive time steps."""
+    t = np.asarray(ts.t, dtype=float)
+    t = np.sort(t[np.isfinite(t)])
+    if t.size < 3:
+        return np.nan
+    dt = np.diff(t)
+    dt = dt[np.isfinite(dt) & (dt > 0)]
+    if dt.size == 0:
+        return np.nan
+    median_dt = float(np.nanmedian(dt))
+    return 0.5 / median_dt if np.isfinite(median_dt) and median_dt > 0 else np.nan
+
 def make_frequency_grid(fmin: float, fmax: float, df: float) -> np.ndarray:
     n = int(np.floor((fmax - fmin) / df)) + 1
     return fmin + df * np.arange(max(n, 1))
+
+
+def _same_length_convolve(values: np.ndarray, kernel: np.ndarray) -> np.ndarray:
+    """Return a centered convolution with exactly ``len(values)`` samples."""
+    full = np.convolve(values, kernel, mode="full")
+    start = (len(kernel) - 1) // 2
+    return full[start:start + len(values)]
+
+
+def smooth_polarimetry_periodogram(
+    freqs: np.ndarray,
+    power: np.ndarray,
+    baseline_days: float,
+    *,
+    enabled: bool | None = None,
+    kernel_name: str | None = None,
+    width_resolution_elements: float | None = None,
+) -> tuple[np.ndarray, dict]:
+    """Smooth power with width tied to the independent resolution ``1/T``."""
+    f = np.asarray(freqs, dtype=float)
+    p = np.asarray(power, dtype=float)
+    use = POL_SMOOTH_ENABLED if enabled is None else bool(enabled)
+    name = (POL_SMOOTH_KERNEL if kernel_name is None else str(kernel_name)).strip().lower()
+    width_re = POL_SMOOTH_WIDTH_RES_ELEMS if width_resolution_elements is None else float(width_resolution_elements)
+    if name not in {"gaussian", "boxcar"}:
+        raise ValueError("Polarimetry smoothing kernel must be 'gaussian' or 'boxcar'.")
+    if not np.isfinite(width_re) or width_re <= 0:
+        raise ValueError("Polarimetry smoothing width must be positive.")
+
+    resolution_cpd = 1.0 / float(baseline_days) if np.isfinite(baseline_days) and baseline_days > 0 else np.nan
+    steps = np.diff(f)
+    steps = steps[np.isfinite(steps) & (steps > 0)]
+    grid_step_cpd = float(np.nanmedian(steps)) if steps.size else np.nan
+    width_cpd = width_re * resolution_cpd if np.isfinite(resolution_cpd) else np.nan
+    metadata = {
+        "enabled": bool(use),
+        "applied": False,
+        "kernel": name,
+        "width_resolution_elements": float(width_re),
+        "resolution_cpd": float(resolution_cpd) if np.isfinite(resolution_cpd) else None,
+        "effective_width_cpd": float(width_cpd) if np.isfinite(width_cpd) else None,
+        "grid_step_cpd": float(grid_step_cpd) if np.isfinite(grid_step_cpd) else None,
+        "width_definition": "Gaussian FWHM or boxcar full width",
+        "fit_uses_unsmoothed_time_series": True,
+    }
+    if not use or len(p) < 3 or not np.isfinite(width_cpd) or not np.isfinite(grid_step_cpd):
+        return p.copy(), metadata
+
+    width_bins = width_cpd / grid_step_cpd
+    metadata["requested_width_grid_samples"] = float(width_bins)
+    if width_bins < 2.0:
+        metadata["not_applied_reason"] = "requested width is under-sampled on this frequency grid"
+        return p.copy(), metadata
+    if name == "boxcar":
+        n = max(1, int(round(width_bins)))
+        if n % 2 == 0:
+            n += 1
+        n = min(n, len(p) if len(p) % 2 == 1 else max(1, len(p) - 1))
+        kernel = np.ones(n, dtype=float)
+    else:
+        sigma_bins = max(width_bins / 2.354820045, 1e-6)
+        radius = min(max(1, int(np.ceil(4.0 * sigma_bins))), max(1, len(p) - 1))
+        x = np.arange(-radius, radius + 1, dtype=float)
+        kernel = np.exp(-0.5 * np.square(x / sigma_bins))
+    kernel /= np.sum(kernel)
+    valid = np.isfinite(p).astype(float)
+    numerator = _same_length_convolve(np.where(np.isfinite(p), p, 0.0), kernel)
+    denominator = _same_length_convolve(valid, kernel)
+    smoothed = np.divide(
+        numerator,
+        denominator,
+        out=np.full_like(p, np.nan, dtype=float),
+        where=denominator > 1e-12,
+    )
+    metadata["kernel_samples"] = int(len(kernel))
+    metadata["applied"] = True
+    return smoothed, metadata
 
 def lomb_scargle_power(ts: TimeSeries, freqs: np.ndarray) -> np.ndarray:
     if _HAVE_ASTROPY:
@@ -1055,16 +1128,6 @@ def _phase_reference_epoch_btjd(ts: TimeSeries) -> float:
         return float(PHASE_ZERO_BTJD)
     raise ValueError(f"Unknown PHASE_ZERO_MODE={PHASE_ZERO_MODE!r}")
 
-def phase_zero_summary_text() -> str:
-    mode = str(PHASE_ZERO_MODE).strip().lower()
-    if mode == "local_start":
-        return "local_start (each dataset uses its own first timestamp)"
-    if mode == "btjd_zero":
-        return "btjd_zero (shared absolute BTJD = 0.0)"
-    if mode == "custom_btjd":
-        return f"custom_btjd (shared BTJD = {float(PHASE_ZERO_BTJD):.6f})"
-    return str(PHASE_ZERO_MODE)
-
 def phase_fold(t: np.ndarray, f: float, t_ref: float = 0.0) -> np.ndarray:
     phase = ((t - t_ref) * f) % 1.0
     return phase
@@ -1083,7 +1146,7 @@ def plot_phased_modes(mode_snapshots: list[dict], res: pd.DataFrame, outdir: Pat
                       n_phase_plots: int = 3, sort_by: str = "score_comb",
                       plot_style: str = "isolated_mode",
                       show_plots_inline: bool = False):
-    if res.empty or not mode_snapshots:
+    if int(n_phase_plots) <= 0 or res.empty or not mode_snapshots:
         return
     pick = sort_modes_for_phasing(res, sort_by, n_phase_plots)
     by_n = {row["n"]: row for _, row in pick.iterrows()}
@@ -1165,6 +1228,27 @@ def run_joint_extraction_one(tess0: TimeSeries, pol0: TimeSeries, outdir: Path,
                              pol_trend_cfg: NightTrendConfig, show_plots_inline: bool = False) -> pd.DataFrame:
     outdir.mkdir(parents=True, exist_ok=True)
 
+    smoothing_metadata = {
+        "enabled": bool(POL_SMOOTH_ENABLED),
+        "kernel": str(POL_SMOOTH_KERNEL),
+        "width_resolution_elements": float(POL_SMOOTH_WIDTH_RES_ELEMS),
+        "resolution_cpd": float(1.0 / max(compute_T_full(pol0), 1e-8)),
+        "effective_width_cpd": float(POL_SMOOTH_WIDTH_RES_ELEMS / max(compute_T_full(pol0), 1e-8)),
+        "width_definition": "Gaussian FWHM or boxcar full width",
+        "fit_uses_unsmoothed_time_series": True,
+    }
+    (outdir / "analysis_run_config.json").write_text(
+        json.dumps(
+            {
+                "analysis_track": "joint",
+                "polarimetry_channel": str(pol0.name),
+                "polarimetry_periodogram_smoothing": smoothing_metadata,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
     tess = TimeSeries(
         t=tess0.t.copy(), y=tess0.y.copy(),
         yerr=None if tess0.yerr is None else tess0.yerr.copy(),
@@ -1183,11 +1267,27 @@ def run_joint_extraction_one(tess0: TimeSeries, pol0: TimeSeries, outdir: Path,
 
     Tseg_tess = compute_Tseg(tess, gap_days=1.0)
     Tseg_pol  = compute_Tseg(pol,  gap_days=1.0)
+    Tfull_pol = max(compute_T_full(pol), 1e-8)
     Tseg_max = max(Tseg_tess, Tseg_pol)
     df_coarse = (1.0 / Tseg_max) / max(COARSE_OVERSAMPLE, 1e-6)
     freqs_coarse = make_frequency_grid(FMIN, FMAX, df_coarse)
     df_grid_run = float(np.nanmedian(np.diff(freqs_coarse))) if len(freqs_coarse) > 1 else np.nan
     print(f"[{pol.name}] Tseg_tess={Tseg_tess:.3f} d | Tseg_pol={Tseg_pol:.3f} d | df_grid={df_grid_run:.6g} c/d")
+
+    refine_factor_used = max(1, int(REFINE_FACTOR))
+    if POL_SMOOTH_ENABLED:
+        requested_width_cpd = float(POL_SMOOTH_WIDTH_RES_ELEMS) / Tfull_pol
+        if np.isfinite(requested_width_cpd) and requested_width_cpd > 0:
+            required = int(np.ceil(POL_SMOOTH_SAMPLES_PER_WIDTH * (1.0 / Tseg_max) / requested_width_cpd))
+            refine_factor_used = min(
+                max(refine_factor_used, required),
+                max(1, int(POL_SMOOTH_MAX_REFINE_FACTOR)),
+            )
+            if refine_factor_used != int(REFINE_FACTOR):
+                print(
+                    f"[{pol.name}] local refinement factor increased from {REFINE_FACTOR} "
+                    f"to {refine_factor_used} to resolve the requested smoothing width"
+                )
 
     win_te = spectral_window(tess, freqs_coarse)
     win_po = spectral_window(pol, freqs_coarse)
@@ -1206,9 +1306,10 @@ def run_joint_extraction_one(tess0: TimeSeries, pol0: TimeSeries, outdir: Path,
         T1 = compute_T_full(tess)
         T2 = compute_T_full(pol)
         W1 = whitened_power(freqs_local, P1, T=T1, kfit=KFIT, ks=KS_TESS, trim_top_frac=TRIM_TOP_FRAC)
-        W2 = whitened_power(freqs_local, P2, T=T2, kfit=KFIT, ks=KS_POL, trim_top_frac=TRIM_TOP_FRAC)
-        Wc = combine_whitened(W1, W2, w_te, w_po)
-        return Wc, W1, W2, P1, P2
+        W2_raw = whitened_power(freqs_local, P2, T=T2, kfit=KFIT, ks=KS_POL, trim_top_frac=TRIM_TOP_FRAC)
+        W2_for_selection, _ = smooth_polarimetry_periodogram(freqs_local, W2_raw, T2)
+        Wc = combine_whitened(W1, W2_for_selection, w_te, w_po)
+        return Wc, W1, W2_for_selection, P1, P2
 
     for n in range(1, MAX_ITERS + 1):
         Wc, W1, W2, P1, P2 = compute_combined_at_freqs(freqs_coarse)
@@ -1233,7 +1334,7 @@ def run_joint_extraction_one(tess0: TimeSeries, pol0: TimeSeries, outdir: Path,
             def _ccb(fine):
                 Wc_f, W1_f, W2_f, _, _ = compute_combined_at_freqs(fine)
                 return Wc_f, W1_f, W2_f
-            f_ref, details = refine_peak(f0=f0, df_ref=df_ref, refine_factor=REFINE_FACTOR,
+            f_ref, details = refine_peak(f0=f0, df_ref=df_ref, refine_factor=refine_factor_used,
                                          fmin=FMIN, fmax=FMAX, compute_combined_at_freqs=_ccb)
             j = int(np.nanargmax(details["Wcomb"]))
             W1p = float(details["W1"][j])
@@ -1283,6 +1384,17 @@ def run_joint_extraction_one(tess0: TimeSeries, pol0: TimeSeries, outdir: Path,
             "phase_pol": fit_po["phase"],
             "snr_pol": snr_po,
             "W_pol": W_po,
+            "pol_smoothing_enabled": bool(POL_SMOOTH_ENABLED),
+            "pol_smoothing_kernel": str(POL_SMOOTH_KERNEL),
+            "pol_smoothing_width_res_elements": float(POL_SMOOTH_WIDTH_RES_ELEMS),
+            "pol_smoothing_resolution_cpd": float(1.0 / max(T2, 1e-8)),
+            "pol_smoothing_effective_width_cpd": float(POL_SMOOTH_WIDTH_RES_ELEMS / max(T2, 1e-8)),
+            "pol_smoothing_applied_at_refinement": bool(
+                POL_SMOOTH_ENABLED
+                and (POL_SMOOTH_WIDTH_RES_ELEMS / max(T2, 1e-8))
+                / max(df_ref / refine_factor_used, 1e-12) >= 2.0
+            ),
+            "joint_refine_factor_used": int(refine_factor_used),
             "n_pol_groups": int(np.unique(pol.group_id).size) if pol.group_id is not None else 0,
             "pol_use_offsets": bool(pol_trend_cfg.use_offsets),
             "pol_use_slopes": bool(pol_trend_cfg.use_slopes),
@@ -1318,6 +1430,21 @@ def run_joint_extraction_one(tess0: TimeSeries, pol0: TimeSeries, outdir: Path,
 
     Pte_end = lomb_scargle_power(tess, freqs_coarse)
     Ppo_end = nuisance_periodogram(pol, freqs_coarse, baseline_matrix=make_pol_baseline_matrix(pol, pol_trend_cfg))
+    Ppo_start_smoothed, _ = smooth_polarimetry_periodogram(
+        freqs_coarse, Ppo_start, max(compute_T_full(pol0), 1e-8)
+    )
+    Ppo_end_smoothed, _ = smooth_polarimetry_periodogram(
+        freqs_coarse, Ppo_end, max(compute_T_full(pol0), 1e-8)
+    )
+    pd.DataFrame(
+        {
+            "frequency_cpd": freqs_coarse,
+            "power_start_raw": Ppo_start,
+            "power_start_smoothed": Ppo_start_smoothed,
+            "power_end_raw": Ppo_end,
+            "power_end_smoothed": Ppo_end_smoothed,
+        }
+    ).to_csv(outdir / "polarimetry_periodogram_diagnostic.csv", index=False)
 
     # time-series plot (stacked panels: TESS and polarimetry separated; start/end overplotted)
     C_TESS_START = "#0072B2"
@@ -1344,7 +1471,7 @@ def run_joint_extraction_one(tess0: TimeSeries, pol0: TimeSeries, outdir: Path,
     ax.set_title(f"{pol0.name} time series")
     ax.legend(loc="best", fontsize=9)
 
-    fig.suptitle(f"Time series: TESS + {pol0.name} (Option C night offsets)", y=0.98)
+    fig.suptitle(f"Time series: TESS + {pol0.name} (night-aware baseline)", y=0.98)
     fig.tight_layout()
     fig.savefig(outdir / "timeseries_start_end.png", dpi=180)
     if show_plots_inline:
@@ -1368,6 +1495,8 @@ def run_joint_extraction_one(tess0: TimeSeries, pol0: TimeSeries, outdir: Path,
     Pte_e = _norm_spec(Pte_end,   q=99.0)
     Ppo_s = _norm_spec(Ppo_start, q=99.0)
     Ppo_e = _norm_spec(Ppo_end,   q=99.0)
+    Ppo_s_smoothed = _norm_spec(Ppo_start_smoothed, q=99.0)
+    Ppo_e_smoothed = _norm_spec(Ppo_end_smoothed, q=99.0)
 
     off_te_s = 0.0
     off_te_e = 1.2
@@ -1389,8 +1518,14 @@ def run_joint_extraction_one(tess0: TimeSeries, pol0: TimeSeries, outdir: Path,
     ax.legend(loc="best", fontsize=9)
 
     ax = axes[1]
-    ax.plot(freqs_coarse, Ppo_s + off_po_s, lw=0.9, label=f"{pol0.name} start", color=C_POL_START, linestyle="-")
-    ax.plot(freqs_coarse, Ppo_e + off_po_e, lw=0.9, label=f"{pol0.name} end (offset)", color=C_POL_END, linestyle="--")
+    if POL_SMOOTH_ENABLED:
+        ax.plot(freqs_coarse, Ppo_s + off_po_s, lw=0.7, alpha=0.30, label=f"{pol0.name} start raw", color=C_POL_START)
+        ax.plot(freqs_coarse, Ppo_s_smoothed + off_po_s, lw=1.2, label=f"{pol0.name} start smoothed", color=C_POL_START)
+        ax.plot(freqs_coarse, Ppo_e + off_po_e, lw=0.7, alpha=0.30, label=f"{pol0.name} end raw (offset)", color=C_POL_END, linestyle="--")
+        ax.plot(freqs_coarse, Ppo_e_smoothed + off_po_e, lw=1.2, label=f"{pol0.name} end smoothed (offset)", color=C_POL_END, linestyle="--")
+    else:
+        ax.plot(freqs_coarse, Ppo_s + off_po_s, lw=0.9, label=f"{pol0.name} start", color=C_POL_START, linestyle="-")
+        ax.plot(freqs_coarse, Ppo_e + off_po_e, lw=0.9, label=f"{pol0.name} end (offset)", color=C_POL_END, linestyle="--")
     if len(accepted) > 0:
         y_top_p = np.nanmax(Ppo_e + off_po_e) if np.isfinite(np.nanmax(Ppo_e + off_po_e)) else (off_po_e + 1.0)
         for i, f in enumerate(accepted, start=1):
@@ -1466,44 +1601,100 @@ def run_joint_extraction_one(tess0: TimeSeries, pol0: TimeSeries, outdir: Path,
                       show_plots_inline=show_plots_inline)
     return res
 
-POL_TREND_CFG = NightTrendConfig(
-    use_offsets=USE_POL_NIGHT_OFFSETS,
-    use_slopes=USE_POL_NIGHT_SLOPES,
-    group_mode=POL_NIGHT_GROUP_MODE,
-    gap_days=POL_NIGHT_GAP_HOURS / 24.0
-)
+def _run_joint_analysis_impl(channels: list[str] | tuple[str, ...]) -> dict[str, pd.DataFrame]:
+    """Load configured inputs and run the joint search for selected channels.
 
-print("TESS_INPUT_MODE =", TESS_INPUT_MODE)
-print("TESS_WEIGHT_MODE =", TESS_WEIGHT_MODE, "| TESS_ERROR_FLOOR_FRAC =", TESS_ERROR_FLOOR_FRAC)
-if str(TESS_INPUT_MODE).lower() == "pipeline_dir":
-    print("TESS_PIPELINE_DIR =", TESS_PIPELINE_DIR, "| flux =", TESS_PIPELINE_FLUX, "| pattern =", TESS_PIPELINE_PATTERN)
-else:
-    print("TESS_CSV =", TESS_CSV)
+    Keeping execution behind a normal function makes the module safe to import
+    from the GUI, command-line wrappers, and tests.
+    """
+    trend_cfg = NightTrendConfig(
+        use_offsets=USE_POL_NIGHT_OFFSETS,
+        use_slopes=USE_POL_NIGHT_SLOPES,
+        group_mode=POL_NIGHT_GROUP_MODE,
+        gap_days=POL_NIGHT_GAP_HOURS / 24.0,
+    )
 
-tess = load_tess_input()
-pol_dict = load_polarimetry_csv(POL_CSV, product=POL_PRODUCT, trend_cfg=POL_TREND_CFG)
+    print("TESS_INPUT_MODE =", TESS_INPUT_MODE)
+    print("TESS_WEIGHT_MODE =", TESS_WEIGHT_MODE, "| TESS_ERROR_FLOOR_FRAC =", TESS_ERROR_FLOOR_FRAC)
+    print(
+        "POL periodogram smoothing =",
+        POL_SMOOTH_ENABLED,
+        "| kernel =",
+        POL_SMOOTH_KERNEL,
+        "| width =",
+        POL_SMOOTH_WIDTH_RES_ELEMS,
+        "resolution elements",
+    )
+    if str(TESS_INPUT_MODE).lower() == "pipeline_dir":
+        print("TESS_PIPELINE_DIR =", TESS_PIPELINE_DIR, "| flux =", TESS_PIPELINE_FLUX, "| pattern =", TESS_PIPELINE_PATTERN)
+    else:
+        print("TESS_CSV =", TESS_CSV)
 
-if DO_DETREND:
-    tess_dt = detrend_poly(tess, order=DETREND_POLY_ORDER)
-    pol_dt = {k: detrend_poly(v, order=DETREND_POLY_ORDER) for k, v in pol_dict.items()}
-else:
-    tess_dt = tess
-    pol_dt = pol_dict
+    tess = load_tess_input()
+    requested_fmax = float(FMAX)
+    nyquist_cpd = compute_tess_nyquist_cpd(tess)
+    effective_fmax = requested_fmax
+    if TESS_CAP_FMAX_TO_NYQUIST and np.isfinite(nyquist_cpd):
+        effective_fmax = max(float(FMIN), min(requested_fmax, float(nyquist_cpd)))
+    globals()["FMAX"] = float(effective_fmax)
+    if np.isfinite(nyquist_cpd):
+        print(
+            "Requested FMAX =", requested_fmax,
+            "| TESS Nyquist =", f"{nyquist_cpd:.6g}",
+            "| effective FMAX =", f"{effective_fmax:.6g}",
+            "| cap_to_nyquist =", TESS_CAP_FMAX_TO_NYQUIST,
+        )
+    else:
+        print("Requested FMAX =", requested_fmax, "| TESS Nyquist = unavailable")
+    selected = [str(k).lower() for k in channels]
+    invalid = [k for k in selected if k not in {"q", "u", "p"}]
+    if invalid:
+        raise ValueError(f"Unsupported polarimetry channel(s): {invalid}")
+    pol_dict = load_polarimetry_csv(
+        POL_CSV,
+        product=POL_PRODUCT,
+        trend_cfg=trend_cfg,
+        channels=selected,
+    )
+    if DO_DETREND and DETREND_POLY_ORDER > 0:
+        tess_dt = detrend_poly(tess, order=DETREND_POLY_ORDER)
+        pol_dt = {k: detrend_poly(v, order=DETREND_POLY_ORDER) for k, v in pol_dict.items()}
+    else:
+        tess_dt = tess
+        pol_dt = pol_dict
 
-print("JOINT_WEIGHT_MODE =", JOINT_WEIGHT_MODE, "| SCALE_FREE_WEIGHT_BASIS =", SCALE_FREE_WEIGHT_BASIS)
-print("TOP_N_RAW_TESS_CANDIDATES =", TOP_N_RAW_TESS_CANDIDATES)
-print("TESS:", len(tess_dt.t), "Tfull=", compute_T_full(tess_dt), "weight=", estimate_dataset_weight(tess_dt, mode=JOINT_WEIGHT_MODE, scale_free_basis=SCALE_FREE_WEIGHT_BASIS))
-for k in ["q", "u", "p"]:
-    ts = pol_dt[k]
-    ngrp = int(np.unique(ts.group_id).size) if ts.group_id is not None else 0
-    print(ts.name, "N=", len(ts.t), "Tfull=", compute_T_full(ts), "weight=", estimate_dataset_weight(ts, mode=JOINT_WEIGHT_MODE, scale_free_basis=SCALE_FREE_WEIGHT_BASIS), "night groups=", ngrp)
+    print("JOINT_WEIGHT_MODE =", JOINT_WEIGHT_MODE, "| SCALE_FREE_WEIGHT_BASIS =", SCALE_FREE_WEIGHT_BASIS)
+    print("TOP_N_RAW_TESS_CANDIDATES =", TOP_N_RAW_TESS_CANDIDATES)
+    print("TESS:", len(tess_dt.t), "Tfull=", compute_T_full(tess_dt), "weight=", estimate_dataset_weight(tess_dt, mode=JOINT_WEIGHT_MODE, scale_free_basis=SCALE_FREE_WEIGHT_BASIS))
 
-results = {}
-for k in ["q", "u", "p"]:
-    outdir = OUTROOT / k
-    print("\n=== RUN:", k, "->", outdir, "===")
-    results[k] = run_joint_extraction_one(tess_dt, pol_dt[k], outdir=outdir, pol_trend_cfg=POL_TREND_CFG,
-                                          show_plots_inline=SHOW_PLOTS_INLINE)
+    results: dict[str, pd.DataFrame] = {}
+    for k in selected:
+        if k not in pol_dt:
+            print(f"Skipping unavailable polarimetry channel {k!r}.")
+            continue
+        ts = pol_dt[k]
+        ngrp = int(np.unique(ts.group_id).size) if ts.group_id is not None else 0
+        print(ts.name, "N=", len(ts.t), "Tfull=", compute_T_full(ts), "weight=", estimate_dataset_weight(ts, mode=JOINT_WEIGHT_MODE, scale_free_basis=SCALE_FREE_WEIGHT_BASIS), "night groups=", ngrp)
+        outdir = OUTROOT / k
+        print("\n=== RUN:", k, "->", outdir, "===")
+        results[k] = run_joint_extraction_one(
+            tess_dt,
+            ts,
+            outdir=outdir,
+            pol_trend_cfg=trend_cfg,
+            show_plots_inline=SHOW_PLOTS_INLINE,
+        )
+    return results
 
-results["q"].head()
 
+def run_joint_analysis(channels: list[str] | tuple[str, ...] = ("q", "u", "p")) -> dict[str, pd.DataFrame]:
+    """Run Joint analysis and restore mutable frequency limits afterward."""
+    requested_fmax = float(FMAX)
+    try:
+        return _run_joint_analysis_impl(channels)
+    finally:
+        globals()["FMAX"] = requested_fmax
+
+
+if __name__ == "__main__":
+    run_joint_analysis()

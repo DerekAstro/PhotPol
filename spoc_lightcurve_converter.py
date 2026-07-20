@@ -40,7 +40,6 @@ import glob
 import json
 from pathlib import Path
 import re
-import sys
 from typing import Iterable
 
 import numpy as np
@@ -449,7 +448,7 @@ def select_sector_products(dfs: list[pd.DataFrame], cadence_policy: str) -> tupl
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
-        description="Convert standard SPOC *lc.fits files to CSV for PhotPol detrending and guided analysis.",
+        description="Convert standard SPOC *lc.fits files to CSV for PhotPol Guided and Joint analysis.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
