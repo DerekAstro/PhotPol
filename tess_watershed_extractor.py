@@ -2135,6 +2135,14 @@ def parse_args(argv=None):
         action="store_true",
         help="Do not save aperture overlay PNGs.",
     )
+    p.add_argument(
+        "--save-figure-pickles",
+        action="store_true",
+        help=(
+            "Save each Matplotlib figure as a .png.pickle companion to its PNG. "
+            "Only open figure pickles produced by trusted runs."
+        ),
+    )
 
     # Optional jitter-aware PRF photometry. This is an additional extraction
     # product; it never replaces the selected aperture product.
@@ -2355,10 +2363,11 @@ def write_run_configuration(
 
 
 def main(argv=None):
-    global APERTURE_FOM_MODE
+    global APERTURE_FOM_MODE, SAVE_FIGURE_PICKLES
     args = parse_args(argv)
     validate_args(args)
     APERTURE_FOM_MODE = str(getattr(args, "aperture_fom", "stddiff")).strip().lower()
+    SAVE_FIGURE_PICKLES = bool(getattr(args, "save_figure_pickles", False))
 
     # Parse a fixed external aperture once. Shape validation is repeated for
     # each input TPF so directory runs fail clearly if stamp dimensions differ.
@@ -2929,6 +2938,7 @@ def main(argv=None):
                                     "parent_primary_index": int(prf_k + 1),
                                 },
                                 save_diagnostics=(not args.prf_no_diagnostics),
+                                save_figure_pickle=SAVE_FIGURE_PICKLES,
                             )
                             written_csvs.append(paths_written["csv"].name)
                             coupling_all = prf_result.metadata.get("motion_coupling", [])

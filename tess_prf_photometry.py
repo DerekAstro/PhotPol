@@ -30,6 +30,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Sequence
 import json
+import pickle
 import time
 
 import numpy as np
@@ -2541,7 +2542,9 @@ def save_prf_diagnostic(
     output_path: str | Path,
     source_index: int = 0,
     title: str = "Jitter-aware PRF photometry",
+    save_figure_pickle: bool = False,
 ) -> None:
+    """Write the six-panel PRF diagnostic and, optionally, its Figure pickle."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -2655,7 +2658,20 @@ def save_prf_diagnostic(
 
     fig.suptitle(title)
     fig.tight_layout()
-    fig.savefig(Path(output_path), dpi=170, bbox_inches="tight")
+    output_path = Path(output_path)
+    fig.savefig(output_path, dpi=170, bbox_inches="tight")
+    if save_figure_pickle:
+        try:
+            pickle_path = output_path.with_suffix(output_path.suffix + ".pickle")
+            with pickle_path.open("wb") as handle:
+                pickle.dump(fig, handle, protocol=pickle.HIGHEST_PROTOCOL)
+        except Exception as exc:
+            # A serialization problem must not discard the scientifically
+            # useful PNG or abort an otherwise successful extraction run.
+            print(
+                f"  [WARN] Could not save pickled figure for "
+                f"{output_path.name}: {exc}"
+            )
     plt.close(fig)
 
 
@@ -2669,6 +2685,7 @@ def save_prf_products(
     extra_columns: dict | None = None,
     extra_metadata: dict | None = None,
     save_diagnostics: bool | None = None,
+    save_figure_pickle: bool = False,
 ) -> dict[str, Path]:
     """Write a downstream-compatible target light curve and scene diagnostics."""
     import pandas as pd
@@ -2733,8 +2750,13 @@ def save_prf_products(
         save_prf_diagnostic(
             result, mean_image, png_path, source_index=source_index,
             title=f"{result.sources[source_index].label}: jitter-aware PRF photometry",
+            save_figure_pickle=save_figure_pickle,
         )
         paths["diagnostic"] = png_path
+        if save_figure_pickle:
+            pickle_path = png_path.with_suffix(png_path.suffix + ".pickle")
+            if pickle_path.exists():
+                paths["diagnostic_pickle"] = pickle_path
     return paths
 
 
