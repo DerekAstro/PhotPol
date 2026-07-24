@@ -698,6 +698,30 @@ def _numeric_series(values):
     return pd.to_numeric(pd.Series(values), errors="coerce").to_numpy(float)
 
 
+def normalize_tess_camera(value) -> int | None:
+    """Return a valid TESS camera number (1..4), or None for placeholders/missing values."""
+    if value is None:
+        return None
+    try:
+        if np.ma.is_masked(value):
+            return None
+    except Exception:
+        pass
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    s = str(value).strip()
+    if s.lower() in {"", "none", "nan", "null", "na", "n/a", "--"}:
+        return None
+    try:
+        cam = int(float(s))
+    except Exception:
+        return None
+    return cam if cam in (1, 2, 3, 4) else None
+
+
 def _native_endian_copy(values):
     """
     Return an independent C-contiguous NumPy array in native byte order.
@@ -873,9 +897,8 @@ def infer_camera_from_lightcurve(df: pd.DataFrame, stem: str) -> int | None:
         col = _first_matching_column(df.columns, [candidate])
         if col is None:
             continue
-        vals = pd.to_numeric(df[col], errors="coerce")
-        vals = vals[np.isfinite(vals)]
-        unique = sorted(set(int(v) for v in vals if 1 <= int(v) <= 4))
+        cameras = [normalize_tess_camera(value) for value in df[col].dropna().to_numpy()]
+        unique = sorted({cam for cam in cameras if cam is not None})
         if len(unique) == 1:
             return unique[0]
 
@@ -906,12 +929,8 @@ def _camera_from_fits_header(path: str | Path) -> int | None:
                 if hdr is None:
                     continue
                 for key in ("CAMERA", "CAM"):
-                    value = hdr.get(key)
-                    try:
-                        camera = int(value)
-                    except Exception:
-                        continue
-                    if camera in (1, 2, 3, 4):
+                    camera = normalize_tess_camera(hdr.get(key))
+                    if camera is not None:
                         return camera
     except Exception:
         return None
@@ -975,11 +994,8 @@ def _camera_from_metadata_mapping(mapping) -> int | None:
         # Prefer explicit camera keys at the current level before descending.
         for key, value in mapping.items():
             if _norm_name(key) in {"camera", "cam", "cameranumber", "cameranum"}:
-                try:
-                    camera = int(value)
-                except Exception:
-                    continue
-                if camera in (1, 2, 3, 4):
+                camera = normalize_tess_camera(value)
+                if camera is not None:
                     return camera
         for value in mapping.values():
             camera = _camera_from_metadata_mapping(value)
@@ -1809,6 +1825,8 @@ def parse_args(argv=None):
                    help="Barycentric-minus-spacecraft time offset in days, or 'auto'. A timecorr column is preferred when present.")
     p.add_argument("--save-quaternion-diagnostics", action="store_true",
                    help="Save quaternion feature/model NPZ data and a diagnostic PNG.")
+    p.add_argument("--skip-existing", action="store_true",
+                   help="Skip an input light curve when its filename-based detrended output CSV already exists. Combined outputs are also left untouched when present.")
     p.add_argument("--no-combine-sectors", action="store_true",
                    help="Do not write combined multi-sector CSV/PNG products.")
     return p.parse_args(argv)
@@ -1912,6 +1930,11 @@ def main(argv=None):
         stem_core = normalize_lc_stem(stem)
         if stem.startswith(str(args.prefix)) or "_detrend" in stem:
             print(f"Skipping already-detrended file: {csv_path.name}")
+            continue
+        simple_stem = simple_output_stem(stem_core)
+        out_path = out_root / f"{args.prefix}{simple_stem}.csv"
+        if getattr(args, "skip_existing", False) and out_path.exists():
+            print(f"Skipping existing output: {out_path.name}")
             continue
         print(f"\nProcessing: {csv_path.name}")
 
@@ -2070,14 +2093,19 @@ def main(argv=None):
             resolved_quaternion_source = quaternion_source
 
             # Resolve the camera once and retain it for both downloading and
-            # parsing. Previously auto mode inferred the camera for the
-            # download, then discarded it and passed "auto" to the raw-FITS
-            # parser, which could not choose among C1_... through C4_... .
+            # parsing.  Missing/placeholder metadata such as CAMERA=NONE is a
+            # per-file warning, not a fatal batch error.
             camera_for_regression = None
             camera_setting = str(args.quaternion_camera).strip().lower()
             if camera_setting not in ("", "auto"):
-                camera_for_regression = int(camera_setting)
-            if camera_for_regression is None:
+                camera_for_regression = normalize_tess_camera(camera_setting)
+                if camera_for_regression is None:
+                    print(
+                        f"  [WARN] Invalid explicit quaternion camera {args.quaternion_camera!r}; "
+                        "continuing this light curve without quaternion regression."
+                    )
+                    use_quat = False
+            if use_quat and camera_for_regression is None:
                 camera_for_regression = infer_camera_from_companion_products(
                     df_masked,
                     stem_core,
@@ -2091,7 +2119,15 @@ def main(argv=None):
                 else args.quaternion_camera
             )
 
-            if not resolved_quaternion_source:
+            if use_quat and not resolved_quaternion_source and camera_for_regression is None:
+                print(
+                    "  [WARN] Could not infer a valid TESS camera for this light curve "
+                    "(metadata may contain CAMERA=NONE). Continuing without quaternion regression; "
+                    "the other selected detrending steps will still be applied."
+                )
+                use_quat = False
+
+            if use_quat and not resolved_quaternion_source:
                 sector_for_download = infer_sector_from_csv_stem(stem_core)
                 cadence_for_download = _typical_cadence_seconds(t)
                 camera_for_download = camera_for_regression
@@ -2124,25 +2160,38 @@ def main(argv=None):
                         resolved_quaternion_source = ""
 
             if use_quat:
-                quat_info = prepare_qlp_quaternion_regressors(
-                    resolved_quaternion_source,
-                    t,
-                    df_masked,
-                    stem_core,
-                    camera_setting=resolved_camera_setting,
-                    min_samples=int(args.quaternion_min_samples),
-                    time_offset_days=args.quaternion_time_offset_days,
-                )
-                X_quat = np.asarray(quat_info["X"], float)
-                print(
-                    f"  Quaternion regressors: mode={quat_info['source_mode']} "
-                    f"features={X_quat.shape[1]} coverage={np.mean(quat_info['coverage']):.1%} "
-                    f"camera={quat_info['camera']} offset={quat_info['time_offset_days']:.6g} d "
-                    f"({quat_info['alignment_method']})"
-                )
-                if not any("quat_skew_" in name for name in quat_info["names"]):
-                    print("  [WARN] Quaternion source lacks skew statistics; using the available "
-                          "mean/median and scatter features rather than the full 36-feature QLP set.")
+                try:
+                    quat_info = prepare_qlp_quaternion_regressors(
+                        resolved_quaternion_source,
+                        t,
+                        df_masked,
+                        stem_core,
+                        camera_setting=resolved_camera_setting,
+                        min_samples=int(args.quaternion_min_samples),
+                        time_offset_days=args.quaternion_time_offset_days,
+                    )
+                    X_quat = np.asarray(quat_info["X"], float)
+                    print(
+                        f"  Quaternion regressors: mode={quat_info['source_mode']} "
+                        f"features={X_quat.shape[1]} coverage={np.mean(quat_info['coverage']):.1%} "
+                        f"camera={quat_info['camera']} offset={quat_info['time_offset_days']:.6g} d "
+                        f"({quat_info['alignment_method']})"
+                    )
+                    if not any("quat_skew_" in name for name in quat_info["names"]):
+                        print("  [WARN] Quaternion source lacks skew statistics; using the available "
+                              "mean/median and scatter features rather than the full 36-feature QLP set.")
+                except Exception as exc:
+                    print(
+                        "  [WARN] Quaternion regression setup failed for this light curve: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                    print(
+                        "  [WARN] Continuing this light curve without quaternion regression; "
+                        "the other selected detrending steps will still be applied."
+                    )
+                    use_quat = False
+                    quat_info = None
+                    X_quat = np.empty((len(t), 0), dtype=float)
 
         X = np.column_stack([X_xy, X_quat])
         y_center = np.nanmedian(flux_variability_resid)
@@ -2158,13 +2207,43 @@ def main(argv=None):
             )
 
         if use_quat:
-            beta, final_fit_keep = qlp_sigma_clipped_fit(
-                X,
-                y,
-                initial_keep=fit_keep,
-                sigma=float(args.quaternion_clip_sigma),
-                n_iter=int(args.quaternion_clip_iters),
-            )
+            try:
+                beta, final_fit_keep = qlp_sigma_clipped_fit(
+                    X,
+                    y,
+                    initial_keep=fit_keep,
+                    sigma=float(args.quaternion_clip_sigma),
+                    n_iter=int(args.quaternion_clip_iters),
+                )
+            except Exception as exc:
+                print(
+                    "  [WARN] Quaternion regression fit failed for this light curve: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                print(
+                    "  [WARN] Re-fitting this light curve without quaternion regressors."
+                )
+                use_quat = False
+                quat_info = None
+                X_quat = np.empty((len(t), 0), dtype=float)
+                X = X_xy
+                fit_keep = np.isfinite(y) & np.all(np.isfinite(X), axis=1)
+                if getattr(args, "clip_residuals_before_detrend", False):
+                    fit_keep &= iterative_sigma_keep(
+                        y,
+                        sigma_thresh=float(args.clip_residuals_sigma),
+                        n_iter=int(args.clip_residuals_iters),
+                    )
+                final_fit_keep = fit_keep.copy()
+                if fit_keep.sum() >= max(5, X.shape[1] + 1):
+                    beta = robust_wls(
+                        X[fit_keep], y[fit_keep],
+                        n_iter=args.robust_iters, huber_k=args.huber_k
+                    )
+                else:
+                    beta = robust_wls(
+                        X, y, n_iter=args.robust_iters, huber_k=args.huber_k
+                    )
         else:
             final_fit_keep = fit_keep.copy()
             if fit_keep.sum() >= max(5, X.shape[1] + 1):
@@ -2264,8 +2343,6 @@ def main(argv=None):
                 except Exception:
                     pass
 
-        simple_stem = simple_output_stem(stem_core)
-        out_path = out_root / f"{args.prefix}{simple_stem}.csv"
         out_df.to_csv(out_path, index=False)
 
         plot_path = out_root / f"{args.prefix}{simple_stem}.png"
@@ -2331,8 +2408,11 @@ def main(argv=None):
                 continue
             df_all = pd.concat(frames, ignore_index=True).sort_values("time_btjd").reset_index(drop=True)
             comb_csv = out_root / f"{args.prefix}{comb_key}_combined.csv"
-            df_all.to_csv(comb_csv, index=False)
             comb_png = out_root / f"{args.prefix}{comb_key}_combined.png"
+            if getattr(args, "skip_existing", False) and comb_csv.exists():
+                print(f"Skipping existing combined output: {comb_csv.name}")
+                continue
+            df_all.to_csv(comb_csv, index=False)
             save_combined_plot(df_all, comb_png, f"{comb_key} combined detrended light curve")
             print(f"Combined      : {comb_csv.name}")
             print(f"Combined plot : {comb_png.name}")

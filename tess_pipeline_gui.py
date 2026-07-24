@@ -102,6 +102,7 @@ EXPERT_DEFAULTS = {
     "dt_pattern": "*.csv",
     "dt_recursive": False,
     "dt_prefix": "detrended_",
+    "dt_skip_existing": False,
     "dt_use_pchip": False,
     "dt_skip_xybg": False,
     "dt_knot_spacing": "inf",
@@ -431,6 +432,12 @@ Prefix
   --prefix
   Prefix added to output filenames.
 
+Skip existing outputs
+  --skip-existing
+  If checked, the detrender skips an input light curve when the filename-based
+  detrended output CSV already exists. Existing combined CSV outputs are also
+  left untouched.
+
 Recursive
   --recursive
   Search input CSVs recursively under the lightcurve directory.
@@ -596,6 +603,7 @@ TOOLTIPS = {
     "dt_pattern": "Filename pattern used to choose input CSV light curves.",
     "dt_prefix": "Prefix added to detrended output filenames.",
     "dt_recursive": "Search input CSV files recursively under the lightcurve directory.",
+    "dt_skip_existing": "Skip an input light curve if the filename-based detrended output CSV already exists. Existing combined CSV outputs are also left untouched.",
     "dt_use_background": "Include the saved background series as a regression term when decorrelating.",
     "dt_use_pchip": "Apply a smooth PCHIP high-pass step after position/background decorrelation.",
     "dt_skip_xybg": "Skip centroid/background regression while retaining optional orbital, PCHIP, and sector-combination steps.",
@@ -1004,6 +1012,7 @@ class TESSGui(tk.Tk):
         self.dt_pattern = tk.StringVar(value="*.csv")
         self.dt_recursive = tk.BooleanVar(value=False)
         self.dt_prefix = tk.StringVar(value="detrended_")
+        self.dt_skip_existing = tk.BooleanVar(value=False)
 
         self.dt_use_background = tk.BooleanVar(value=False)
         self.dt_use_pchip = tk.BooleanVar(value=False)
@@ -1522,6 +1531,11 @@ class TESSGui(tk.Tk):
             command=self._update_detrender_command_preview, tooltip_key="dt_combine_sectors",
             row=2, column=3, sticky="w", padx=6, pady=4,
         )
+        self._make_checkbutton(
+            self.dt_basic_frame, text="Skip existing outputs", variable=self.dt_skip_existing,
+            command=self._update_detrender_command_preview, tooltip_key="dt_skip_existing",
+            row=3, column=0, columnspan=2, sticky="w", padx=6, pady=4,
+        )
 
         dirs = ttk.LabelFrame(root, text="Directories")
         self.dt_expert_dirs_frame = dirs
@@ -1539,6 +1553,7 @@ class TESSGui(tk.Tk):
         self._entry(sel, "Pattern", self.dt_pattern, 0, 0, tooltip_key="dt_pattern")
         self._entry(sel, "Prefix", self.dt_prefix, 0, 2, tooltip_key="dt_prefix")
         self._make_checkbutton(sel, text="Recursive", variable=self.dt_recursive, command=self._update_detrender_command_preview, tooltip_key="dt_recursive", row=1, column=0, sticky="w", padx=6, pady=4)
+        self._make_checkbutton(sel, text="Skip existing outputs", variable=self.dt_skip_existing, command=self._update_detrender_command_preview, tooltip_key="dt_skip_existing", row=1, column=1, sticky="w", padx=6, pady=4)
 
         opts = ttk.LabelFrame(root, text="Detrending options")
         self.dt_expert_options_frame = opts
@@ -1913,7 +1928,7 @@ class TESSGui(tk.Tk):
         vars_to_trace = [
             self.detrender_script, self.dt_lightcurve_dir, self.dt_diagnostics_dir,
             self.dt_output_dir, self.dt_pattern, self.dt_recursive, self.dt_prefix,
-            self.dt_use_background, self.dt_use_pchip, self.dt_skip_xybg,
+            self.dt_skip_existing, self.dt_use_background, self.dt_use_pchip, self.dt_skip_xybg,
             self.dt_combine_sectors, self.dt_knot_spacing, self.dt_robust_iters,
             self.dt_huber_k, self.dt_pchip_knot_spacing, self.dt_pre_model_pchip, self.dt_pre_model_bin_days, self.dt_pre_model_stat, self.dt_pre_model_min_points, self.dt_pre_model_sigma_clip, self.dt_pre_model_sigma_iters, self.dt_clip_residuals_before_detrend, self.dt_clip_residuals_sigma, self.dt_clip_residuals_iters, self.dt_save_pickled_figures, self.dt_apply_orbital_phase_template, self.dt_orbtable, self.dt_phase_bin,
             self.dt_use_quaternion_regression, self.dt_quaternion_source,
@@ -2226,6 +2241,8 @@ class TESSGui(tk.Tk):
         cmd += ["--prefix", self.dt_prefix.get().strip() or "detrended_"]
         if self.dt_recursive.get():
             cmd.append("--recursive")
+        if self.dt_skip_existing.get():
+            cmd.append("--skip-existing")
         if self.dt_use_background.get() and not self.dt_skip_xybg.get():
             cmd.append("--use-background")
         if self.dt_use_pchip.get():
@@ -2633,6 +2650,7 @@ class TESSGui(tk.Tk):
             "dt_pattern": self.dt_pattern.get(),
             "dt_recursive": self.dt_recursive.get(),
             "dt_prefix": self.dt_prefix.get(),
+            "dt_skip_existing": self.dt_skip_existing.get(),
             "dt_use_background": self.dt_use_background.get(),
             "dt_use_pchip": self.dt_use_pchip.get(),
             "dt_skip_xybg": self.dt_skip_xybg.get(),
