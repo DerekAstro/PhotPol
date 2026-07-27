@@ -1,0 +1,8 @@
+# Example only: a 5-row by 7-column fixed aperture mask.
+# Replace this matrix with one whose row/column shape exactly matches your TPF.
+# First data row = local image row 0; first value = local image column 0.
+0,0,0,0,0,0,0
+0,0,1,1,1,0,0
+0,1,1,1,1,1,0
+0,0,1,1,1,0,0
+0,0,0,0,0,0,0

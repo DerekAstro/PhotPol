@@ -1,0 +1,31 @@
+# PhotPol combined runtime requirements
+# Covers:
+#   1. TESS/Kepler/K2 light-curve extraction and detrending
+#   2. Guided and Joint TESS + polarimetry frequency analysis
+
+# Shared numerical and astronomy stack
+numpy
+pandas
+scipy
+matplotlib
+astropy
+
+# Extraction, catalog queries, and image segmentation
+astroquery
+lightkurve
+scikit-image
+
+# Tk GUI figure preview support
+Pillow
+
+# Tkinter is supplied by Python or the operating system rather than pip.
+# On Ubuntu/Debian, install it separately if needed:
+#   sudo apt install python3-tk
+
+# Optional engineering-PRF backends are not required because the extractor
+# has a warned Gaussian fallback. Install one separately if desired:
+#   pip install lkprf
+#   pip install TESS_PRF
+
+# IPython is optional. The frequency-analysis backend uses it only for richer
+# interactive display when it is already installed.
