@@ -134,6 +134,22 @@ that grid is left unsmoothed rather than silently broadening the requested
 width. Joint mode increases its local refinement sampling when needed so the
 kernel is resolved during candidate refinement.
 
+Photometric-spectrum background
+-------------------------------
+The polarimetry spectrum panels can include a faint TESS spectrum for visual
+context. The default right-axis mode preserves both datasets' native power
+scales. Expert mode also offers normalized scaling. This display option does
+not change candidate selection or any fit.
+
+Stokes q/u phase relation
+-------------------------
+Free retains independent q and u phases. Auto tests both physically allowed
+quadrature relations for each retained frequency and chooses +pi/2 or -pi/2
+from the weighted residuals. Expert mode can force either sign. The constraint
+is applied in one simultaneous final q/u fit to the original unsmoothed time
+series; p remains independent. Output tables retain unconstrained q/u phase
+diagnostics for comparison.
+
 Basic and Expert modes
 ----------------------
 Basic mode shows the controls needed for a typical run. Expert mode reveals
@@ -288,8 +304,11 @@ TOOLTIPS = {
     "n_phase_plots": "Number of strongest modes to show in the phased-summary plots.",
     "phase_sort_by": "How to rank modes when selecting phased-summary plots.",
     "phase_plot_style": "Joint only: whether phased plots use isolated_mode or prefit_residual style.",
-    "phase_zero_mode": "Joint-analysis phase-reference convention. Guided analysis retains its established local-start convention.",
-    "phase_zero_btjd": "Custom BTJD phase zero for Joint analysis when phase_zero_mode = custom_btjd.",
+    "phase_zero_mode": "Common phase-reference convention used by Joint plots and by Guided/Joint constrained q/u phase reporting.",
+    "phase_zero_btjd": "Custom BTJD phase zero when phase_zero_mode = custom_btjd.",
+    "show_tess_spectrum_background": "Draw the TESS power spectrum faintly behind every polarimetry spectrum panel. This affects figures only.",
+    "tess_spectrum_background_scale": "Scale for the faint TESS background: right_axis preserves native TESS power on a secondary axis; normalized rescales it for display.",
+    "qu_phase_mode": "q/u phase relation in the authoritative final fit: free, automatic choice of +/-pi/2, or an Expert forced sign. Requires both q and u.",
     "preview_dir": "Directory scanned recursively for PNG previews.",
     "preview_scale_mode": "Choose how preview images are displayed: Fit scales the image to the visible preview pane; percentage modes use a fixed zoom level.",
     "preview_zoom": "Manual preview zoom level. Also adjustable with Ctrl + mouse wheel.",
@@ -426,6 +445,7 @@ class GuidedAnalysisGUI(tk.Tk):
         self._update_analysis_mode_state()
         self._update_polarimetry_state()
         self._update_smoothing_state()
+        self._update_quadrature_state()
         self._update_joint_weight_mode_state()
         self._update_phase_zero_mode_state()
         self._update_run_plan_preview()
@@ -494,6 +514,9 @@ class GuidedAnalysisGUI(tk.Tk):
         self.pol_smooth_enabled = tk.BooleanVar(value=False)
         self.pol_smooth_kernel = tk.StringVar(value="gaussian")
         self.pol_smooth_width = tk.DoubleVar(value=10.0)
+        self.show_tess_spectrum_background = tk.BooleanVar(value=False)
+        self.tess_spectrum_background_scale = tk.StringVar(value="right_axis")
+        self.qu_phase_mode = tk.StringVar(value="free")
 
         self.channel_q = tk.BooleanVar(value=True)
         self.channel_u = tk.BooleanVar(value=True)
@@ -529,7 +552,6 @@ class GuidedAnalysisGUI(tk.Tk):
         self.joint_manual_w_tess = tk.DoubleVar(value=1.0)
         self.joint_manual_w_pol = tk.DoubleVar(value=1.0)
 
-        self.run_plan_preview = tk.StringVar(value="")
         self.preview_dir = tk.StringVar(value="")
         self.preview_scale_mode = tk.StringVar(value="Fit")
         self.preview_zoom = tk.IntVar(value=100)
@@ -784,6 +806,25 @@ class GuidedAnalysisGUI(tk.Tk):
             smoothing,
             text="Gaussian width is FWHM; boxcar width is full width. Final time-series fits are not smoothed.",
         ).grid(row=1, column=2, columnspan=2, sticky="w", padx=6, pady=4)
+        self.tess_spectrum_background_chk = self._check(
+            smoothing,
+            "Show faint TESS spectrum behind polarimetry spectra",
+            self.show_tess_spectrum_background,
+            2,
+            0,
+            tooltip_key="show_tess_spectrum_background",
+            command=self._update_run_plan_preview,
+            colspan=2,
+        )
+        self.qu_phase_mode_combo = self._combo(
+            smoothing,
+            "q/u phase relation",
+            self.qu_phase_mode,
+            ["free", "auto"],
+            2,
+            2,
+            tooltip_key="qu_phase_mode",
+        )
 
         basic_output = ttk.LabelFrame(root, text="Output")
         basic_output.grid(row=4, column=0, sticky="ew", padx=8, pady=6)
@@ -859,6 +900,15 @@ class GuidedAnalysisGUI(tk.Tk):
         self.phase_zero_mode_combo = self._combo(extras, "Phase zero mode", self.phase_zero_mode, ["local_start", "btjd_zero", "custom_btjd"], 2, 2, tooltip_key="phase_zero_mode")
         ttk.Label(extras, text="BTJD=0.0 uses the absolute TESS zero point.").grid(row=3, column=0, columnspan=2, sticky="w", padx=6, pady=2)
         self.phase_zero_btjd_entry = self._entry(extras, "Custom phase BTJD", self.phase_zero_btjd, 3, 2, tooltip_key="phase_zero_btjd")
+        self.tess_spectrum_background_scale_combo = self._combo(
+            extras,
+            "TESS background scale",
+            self.tess_spectrum_background_scale,
+            ["right_axis", "normalized"],
+            4,
+            0,
+            tooltip_key="tess_spectrum_background_scale",
+        )
 
         jointf = ttk.LabelFrame(root, text="Joint-search settings")
         jointf.grid(row=10, column=0, sticky="ew", padx=8, pady=6)
@@ -905,6 +955,8 @@ class GuidedAnalysisGUI(tk.Tk):
             getattr(self, "pol_product_combo", None),
             getattr(self, "save_generated_frame_chk", None),
             getattr(self, "generated_analysis_dir_entry", None),
+            getattr(self, "tess_spectrum_background_chk", None),
+            getattr(self, "tess_spectrum_background_scale_combo", None),
         ]
 
         self._trace_vars([
@@ -915,7 +967,9 @@ class GuidedAnalysisGUI(tk.Tk):
             self.tess_grid_mode, self.tess_snr_stop, self.max_tess_modes,
             self.pol_snr_stop, self.max_pol_modes, self.guided_pol_fmin, self.search_window_mult,
             self.noise_ks, self.noise_bins, self.pol_smooth_enabled, self.pol_smooth_kernel,
-            self.pol_smooth_width, self.channel_q, self.channel_u, self.channel_p,
+            self.pol_smooth_width, self.show_tess_spectrum_background,
+            self.tess_spectrum_background_scale, self.qu_phase_mode,
+            self.channel_q, self.channel_u, self.channel_p,
             self.use_offsets, self.use_slopes, self.group_mode, self.gap_hours,
             self.do_detrend, self.detrend_order, self.n_phase_plots, self.phase_sort_by,
             self.phase_plot_style, self.phase_zero_mode, self.phase_zero_btjd,
@@ -931,6 +985,7 @@ class GuidedAnalysisGUI(tk.Tk):
         self._trace_vars([self.joint_weight_mode], self._update_joint_weight_mode_state)
         self._trace_vars([self.phase_zero_mode], self._update_phase_zero_mode_state)
         self._trace_vars([self.pol_smooth_enabled], self._update_smoothing_state)
+        self._trace_vars([self.qu_phase_mode], self._update_quadrature_state)
 
     def _build_tess_tab(self):
         sf = ScrollableFrame(self.tab_tess)
@@ -1140,6 +1195,7 @@ class GuidedAnalysisGUI(tk.Tk):
                 frame.grid_remove()
         if hasattr(self, "analysis_mode_groups"):
             self._update_analysis_mode_state()
+        self._update_quadrature_state()
         self._update_run_plan_preview()
 
     def _update_smoothing_state(self):
@@ -1151,6 +1207,29 @@ class GuidedAnalysisGUI(tk.Tk):
             )
         except Exception:
             pass
+        self._update_run_plan_preview()
+
+    def _update_quadrature_state(self):
+        """Expose the common choices in Basic and forced signs in Expert."""
+        expert = self.ui_mode.get().strip().lower() == "expert"
+        values = (
+            ["free", "auto", "force_plus", "force_minus"]
+            if expert
+            else ["free", "auto"]
+        )
+        use_pol = (
+            bool(self.use_polarimetry.get())
+            if self.analysis_mode.get().strip() == "guided_analysis"
+            else True
+        )
+        try:
+            self.qu_phase_mode_combo.configure(
+                values=values,
+                state="readonly" if use_pol else "disabled",
+            )
+        except Exception:
+            pass
+        self._update_phase_zero_mode_state()
         self._update_run_plan_preview()
 
     def _update_tess_mode_state(self):
@@ -1222,6 +1301,7 @@ class GuidedAnalysisGUI(tk.Tk):
                         w.configure(state=("normal" if use_pol else "disabled"))
             except Exception:
                 pass
+        self._update_quadrature_state()
         self._update_run_plan_preview()
 
     def _update_joint_weight_mode_state(self):
@@ -1243,10 +1323,9 @@ class GuidedAnalysisGUI(tk.Tk):
 
     def _update_phase_zero_mode_state(self):
         mode = self.phase_zero_mode.get().strip().lower()
-        joint = self.analysis_mode.get().strip() == "joint_search"
-        state = "normal" if joint and mode == "custom_btjd" else "disabled"
+        state = "normal" if mode == "custom_btjd" else "disabled"
         try:
-            self.phase_zero_mode_combo.configure(state="readonly" if joint else "disabled")
+            self.phase_zero_mode_combo.configure(state="readonly")
             self.phase_zero_btjd_entry.configure(state=state)
         except Exception:
             pass
@@ -1390,6 +1469,13 @@ class GuidedAnalysisGUI(tk.Tk):
             "pol_smooth_enabled": bool(self.pol_smooth_enabled.get()),
             "pol_smooth_kernel": self.pol_smooth_kernel.get().strip().lower(),
             "pol_smooth_width": float(self.pol_smooth_width.get()),
+            "show_tess_spectrum_background": bool(
+                self.show_tess_spectrum_background.get()
+            ),
+            "tess_spectrum_background_scale": (
+                self.tess_spectrum_background_scale.get().strip().lower()
+            ),
+            "qu_phase_mode": self.qu_phase_mode.get().strip().lower(),
             "channels": (channels if use_polarimetry_active else []),
             "use_offsets": bool(self.use_offsets.get()),
             "use_slopes": bool(self.use_slopes.get()),
@@ -1442,6 +1528,38 @@ class GuidedAnalysisGUI(tk.Tk):
             raise ValueError("Polarimetry smoothing kernel must be gaussian or boxcar.")
         if cfg["pol_smooth_width"] <= 0:
             raise ValueError("Polarimetry smoothing width must be positive.")
+        if cfg["tess_spectrum_background_scale"] not in {
+            "right_axis",
+            "normalized",
+        }:
+            raise ValueError(
+                "TESS spectrum background scale must be right_axis or normalized."
+            )
+        if cfg["qu_phase_mode"] not in {
+            "free",
+            "auto",
+            "force_plus",
+            "force_minus",
+        }:
+            raise ValueError(
+                "q/u phase relation must be free, auto, force_plus, or force_minus."
+            )
+        if (
+            cfg["use_polarimetry"]
+            and cfg["qu_phase_mode"] != "free"
+            and not {"q", "u"}.issubset(cfg["channels"])
+        ):
+            raise ValueError(
+                "A constrained q/u phase relation requires both q and u channels."
+            )
+        if cfg["phase_zero_mode"] not in {
+            "local_start",
+            "btjd_zero",
+            "custom_btjd",
+        }:
+            raise ValueError(
+                "Phase zero mode must be local_start, btjd_zero, or custom_btjd."
+            )
         if cfg["n_phase_plots"] < 0:
             raise ValueError("Number of phase plots cannot be negative.")
 
@@ -1508,6 +1626,18 @@ class GuidedAnalysisGUI(tk.Tk):
                     f"{cfg['pol_smooth_kernel']}, width={cfg['pol_smooth_width']:g} resolution elements"
                     if cfg["pol_smooth_enabled"] else "off"
                 ),
+                "TESS spectrum background: " + (
+                    cfg["tess_spectrum_background_scale"]
+                    if cfg["show_tess_spectrum_background"]
+                    else "off"
+                ),
+                f"q/u phase relation: {cfg['qu_phase_mode']}",
+                f"Phase zero: {cfg['phase_zero_mode']}"
+                + (
+                    f" (BTJD={cfg['phase_zero_btjd']})"
+                    if cfg["phase_zero_mode"] == "custom_btjd"
+                    else ""
+                ),
                 f"Output root: {cfg['outroot']}",
                 f"Target subdirectory: {cfg['output_target_subdir']}",
                 f"Cap Fmax to Nyquist: {cfg['tess_cap_fmax_to_nyquist']}",
@@ -1519,10 +1649,6 @@ class GuidedAnalysisGUI(tk.Tk):
                 else:
                     lines.append("Run style: wrapper script imports guided module, applies settings, and calls run_analysis().")
             else:
-                lines.append(
-                    f"Phase zero: {cfg['phase_zero_mode']}" +
-                    (f" (BTJD={cfg['phase_zero_btjd']})" if cfg['phase_zero_mode'] == 'custom_btjd' else "")
-                )
                 lines.append("Run style: wrapper imports the joint backend, applies settings, and calls run_joint_analysis().")
                 lines.append(
                     "Joint settings: "
@@ -1655,6 +1781,11 @@ def _apply_guided_common_settings(mod, *, outroot_override: Path | None = None, 
     mod.POL_SMOOTH_ENABLED = bool(CFG["pol_smooth_enabled"])
     mod.POL_SMOOTH_KERNEL = CFG["pol_smooth_kernel"]
     mod.POL_SMOOTH_WIDTH_RES_ELEMS = float(CFG["pol_smooth_width"])
+    mod.SHOW_TESS_SPECTRUM_BACKGROUND = bool(CFG["show_tess_spectrum_background"])
+    mod.TESS_SPECTRUM_BACKGROUND_SCALE = CFG["tess_spectrum_background_scale"]
+    mod.QU_PHASE_MODE = CFG["qu_phase_mode"]
+    mod.PHASE_ZERO_MODE = CFG["phase_zero_mode"]
+    mod.PHASE_ZERO_BTJD = float(CFG["phase_zero_btjd"])
     mod.POL_CHANNELS = list(CFG["channels"]) if use_pol else []
     mod.USE_POL_NIGHT_OFFSETS = bool(CFG["use_offsets"])
     mod.USE_POL_NIGHT_SLOPES = bool(CFG["use_slopes"])
@@ -1872,6 +2003,9 @@ elif CFG["analysis_mode"] == "joint_search":
     jmod.POL_SMOOTH_ENABLED = bool(CFG["pol_smooth_enabled"])
     jmod.POL_SMOOTH_KERNEL = CFG["pol_smooth_kernel"]
     jmod.POL_SMOOTH_WIDTH_RES_ELEMS = float(CFG["pol_smooth_width"])
+    jmod.SHOW_TESS_SPECTRUM_BACKGROUND = bool(CFG["show_tess_spectrum_background"])
+    jmod.TESS_SPECTRUM_BACKGROUND_SCALE = CFG["tess_spectrum_background_scale"]
+    jmod.QU_PHASE_MODE = CFG["qu_phase_mode"]
     jmod.SHOW_PLOTS_INLINE = bool(CFG["show_plots_inline"])
     jmod.OUTROOT = Path(CFG["outroot"])
     jmod.OUTROOT.mkdir(parents=True, exist_ok=True)
@@ -2239,7 +2373,9 @@ else:
             "tess_grid_mode", "tess_snr_stop",
             "max_tess_modes", "pol_snr_stop", "max_pol_modes", "guided_pol_fmin",
             "search_window_mult", "noise_ks", "noise_bins", "pol_smooth_enabled",
-            "pol_smooth_kernel", "pol_smooth_width", "use_offsets",
+            "pol_smooth_kernel", "pol_smooth_width",
+            "show_tess_spectrum_background", "tess_spectrum_background_scale",
+            "qu_phase_mode", "use_offsets",
             "use_slopes", "group_mode", "gap_hours", "do_detrend", "detrend_order",
             "n_phase_plots", "phase_sort_by", "phase_plot_style", "phase_zero_mode",
             "phase_zero_btjd",
@@ -2291,6 +2427,7 @@ else:
         self._update_analysis_mode_state()
         self._update_polarimetry_state()
         self._update_smoothing_state()
+        self._update_quadrature_state()
         self._update_joint_weight_mode_state()
         self._update_phase_zero_mode_state()
         self._update_run_plan_preview()

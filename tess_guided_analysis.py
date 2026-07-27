@@ -17,6 +17,8 @@ import json
 import time
 import matplotlib.pyplot as plt
 import re
+import importlib.util
+import sys
 
 try:
     from IPython.display import display
@@ -47,6 +49,31 @@ try:
 except Exception:
     LombScargle = None
     _HAVE_ASTROPY = False
+
+try:
+    from polarimetry_quadrature import (
+        fit_quadrature_multisin,
+        normalize_quadrature_mode,
+        phase_at_reference,
+        wrap_phase_radians,
+    )
+except ModuleNotFoundError:
+    # GUI runners import this file by absolute path, which does not always put
+    # the backend directory on sys.path.  Load the colocated shared fitter
+    # explicitly so direct, GUI, and notebook execution behave identically.
+    _quadrature_path = Path(__file__).resolve().with_name("polarimetry_quadrature.py")
+    _quadrature_spec = importlib.util.spec_from_file_location(
+        "photpol_polarimetry_quadrature", _quadrature_path
+    )
+    if _quadrature_spec is None or _quadrature_spec.loader is None:
+        raise
+    _quadrature_module = importlib.util.module_from_spec(_quadrature_spec)
+    sys.modules[_quadrature_spec.name] = _quadrature_module
+    _quadrature_spec.loader.exec_module(_quadrature_module)
+    fit_quadrature_multisin = _quadrature_module.fit_quadrature_multisin
+    normalize_quadrature_mode = _quadrature_module.normalize_quadrature_mode
+    phase_at_reference = _quadrature_module.phase_at_reference
+    wrap_phase_radians = _quadrature_module.wrap_phase_radians
 
 print("Astropy:", _HAVE_ASTROPY, "| SciPy least_squares:", _HAVE_LSQ)
 
@@ -122,6 +149,16 @@ POL_SMOOTH_ENABLED = False
 POL_SMOOTH_KERNEL = "gaussian"       # "gaussian" | "boxcar"
 POL_SMOOTH_WIDTH_RES_ELEMS = 10.0    # Gaussian FWHM or boxcar full width
 
+# Optional visual comparison.  The background spectrum never enters candidate
+# selection, fitting, SNR calculation, or prewhitening.
+SHOW_TESS_SPECTRUM_BACKGROUND = False
+TESS_SPECTRUM_BACKGROUND_SCALE = "right_axis"  # "right_axis" | "normalized"
+
+# Optional physically constrained Stokes q/u fit.  ``auto`` tests both
+# quadrature signs separately for every accepted frequency.
+QU_PHASE_MODE = "free"  # "free" | "auto" | "force_plus" | "force_minus"
+QUADRATURE_MAX_NFEV = 300
+
 # --- Polarimetry guided extraction ---
 POL_CHANNELS = ["q", "u", "p"]  # p is analyzed directly from the observed CSV column
 POL_SNR_STOP = 2.0
@@ -137,6 +174,8 @@ GUIDED_POL_FMIN = 0.2       # minimum TESS/template frequency [c/d] to test in g
 
 # --- Phase-plot summaries ---
 PHASE_BIN_N = 16             # number of phase bins for overplotted median points in phased plots
+PHASE_ZERO_MODE = "local_start"  # "local_start" | "btjd_zero" | "custom_btjd"
+PHASE_ZERO_BTJD = 0.0
 
 # --- Final global multisinusoid fit ---
 GLOBAL_FREQ_BOUND_MULT = 3.0  # each frequency may move by +/- this x frequency resolution
@@ -2347,6 +2386,378 @@ def search_guided_channel(pol0: TimeSeries, tess_table: pd.DataFrame, tess_freq_
             freqs_plot, start_power, end_power, local_diags,
             freqs_plot_full, start_power_full, end_power_full)
 
+
+def _series_btjd_abs(ts: TimeSeries) -> np.ndarray:
+    """Return absolute time in the BTJD convention when it can be inferred."""
+    values = ts.t if ts.t_abs is None else np.asarray(ts.t_abs, dtype=float)
+    values = np.asarray(values, dtype=float)
+    finite = values[np.isfinite(values)]
+    if finite.size and float(np.nanmedian(finite)) > 1.0e6:
+        values = values - 2457000.0
+    return values
+
+
+def _series_local_zero_btjd(ts: TimeSeries) -> float:
+    absolute = _series_btjd_abs(ts)
+    offset = absolute - np.asarray(ts.t, dtype=float)
+    finite = offset[np.isfinite(offset)]
+    return float(np.nanmedian(finite)) if finite.size else 0.0
+
+
+def resolve_phase_reference_btjd(*series: TimeSeries) -> float:
+    """Resolve one shared phase-reference epoch for TESS, q, and u."""
+    mode = str(PHASE_ZERO_MODE).strip().lower()
+    if mode == "btjd_zero":
+        return 0.0
+    if mode == "custom_btjd":
+        value = float(PHASE_ZERO_BTJD)
+        if not np.isfinite(value):
+            raise ValueError("Custom phase-zero BTJD must be finite.")
+        return value
+    if mode != "local_start":
+        raise ValueError(
+            "PHASE_ZERO_MODE must be 'local_start', 'btjd_zero', or 'custom_btjd'."
+        )
+    starts = []
+    for ts in series:
+        values = _series_btjd_abs(ts)
+        finite = values[np.isfinite(values)]
+        if finite.size:
+            starts.append(float(np.nanmin(finite)))
+    return min(starts) if starts else 0.0
+
+
+def _quadrature_channel_global_fit(
+    pol0: TimeSeries,
+    fit: dict,
+    channel: str,
+    rows: list[dict],
+) -> dict:
+    if channel == "q":
+        signal = np.asarray(fit["signal_q"], dtype=float)
+        baseline = np.asarray(fit["baseline_q"], dtype=float)
+        model = np.asarray(fit["model_q"], dtype=float)
+        resid = np.asarray(fit["resid_q"], dtype=float)
+    else:
+        signal = np.asarray(fit["signal_u"], dtype=float)
+        baseline = np.asarray(fit["baseline_u"], dtype=float)
+        model = np.asarray(fit["model_u"], dtype=float)
+        resid = np.asarray(fit["resid_u"], dtype=float)
+    weights = signal_weights(pol0)
+    return {
+        "success": bool(fit.get("success", False)),
+        "message": str(fit.get("message", "")),
+        "freqs": np.asarray(fit["frequencies"], dtype=float),
+        "rss": float(np.sum(weights * np.square(resid))),
+        "full_model": model,
+        "signal_model": signal,
+        "baseline_model": baseline,
+        "resid": resid,
+        "component_rows": rows,
+        "quadrature_mode": str(fit["mode"]),
+        "quadrature_signs": np.asarray(fit["signs"], dtype=int),
+    }
+
+
+def apply_guided_quadrature_refit(
+    tess0: TimeSeries,
+    tess_table: pd.DataFrame,
+    channel_states: dict[str, dict],
+    trend_cfg: NightTrendConfig,
+) -> tuple[dict[str, dict], pd.DataFrame]:
+    """Replace independent q/u final fits with one constrained global fit.
+
+    The existing per-channel periodogram searches remain the candidate
+    discovery stage.  Their accepted TESS-mode union seeds this authoritative
+    fit to the original, unsmoothed q and u time series.
+    """
+    mode = normalize_quadrature_mode(QU_PHASE_MODE)
+    if mode == "free":
+        return channel_states, pd.DataFrame()
+    if "q" not in channel_states or "u" not in channel_states:
+        print(
+            "[WARN] q/u quadrature was requested, but both q and u were not "
+            "selected and available; retaining independent channel fits."
+        )
+        return channel_states, pd.DataFrame()
+
+    accepted_modes = set()
+    for channel in ("q", "u"):
+        table = channel_states[channel].get("final_df")
+        if table is not None and not table.empty and "tess_mode" in table.columns:
+            accepted_modes.update(
+                pd.to_numeric(table["tess_mode"], errors="coerce")
+                .dropna()
+                .astype(int)
+                .tolist()
+            )
+    if not accepted_modes:
+        print(
+            "[q/u quadrature] No independently retained q/u candidates; "
+            "there is no constrained final model to fit."
+        )
+        return channel_states, pd.DataFrame()
+
+    tess_by_mode = {
+        int(row["mode"]): row for _, row in tess_table.iterrows()
+    }
+    accepted_modes = sorted(mode for mode in accepted_modes if mode in tess_by_mode)
+    if not accepted_modes:
+        return channel_states, pd.DataFrame()
+    seed_frequencies = np.array(
+        [float(tess_by_mode[mode_n]["f"]) for mode_n in accepted_modes],
+        dtype=float,
+    )
+
+    q_state = channel_states["q"]
+    u_state = channel_states["u"]
+    q0 = q_state["pol0"]
+    u0 = u_state["pol0"]
+    baseline_q = make_pol_baseline_matrix(q0, trend_cfg)
+    baseline_u = make_pol_baseline_matrix(u0, trend_cfg)
+
+    print(
+        f"[q/u quadrature] fitting {len(seed_frequencies)} Guided component(s) "
+        f"at the accepted TESS frequencies | mode={mode}"
+    )
+    fit = fit_quadrature_multisin(
+        q_time=q0.t,
+        q_values=q0.y,
+        q_weights=signal_weights(q0),
+        q_baseline=baseline_q,
+        u_time=u0.t,
+        u_values=u0.y,
+        u_weights=signal_weights(u0),
+        u_baseline=baseline_u,
+        seed_frequencies=seed_frequencies,
+        mode=mode,
+        optimize_frequencies=False,
+        max_nfev=QUADRATURE_MAX_NFEV,
+    )
+
+    reference_btjd = resolve_phase_reference_btjd(tess0, q0, u0)
+    zero_tess = _series_local_zero_btjd(tess0)
+    zero_q = _series_local_zero_btjd(q0)
+    zero_u = _series_local_zero_btjd(u0)
+    combined_rows = []
+    q_rows = []
+    u_rows = []
+
+    for component, fit_row in enumerate(fit["component_rows"], start=1):
+        frequency = float(fit_row["frequency_cpd"])
+        nearest = int(np.argmin(np.abs(seed_frequencies - frequency)))
+        tess_mode = int(accepted_modes[nearest])
+        tess_row = tess_by_mode[tess_mode]
+        phase_tess_local = float(tess_row.get("phase", np.nan))
+        phase_tess_common = (
+            phase_at_reference(
+                phase_tess_local,
+                frequency,
+                zero_tess,
+                reference_btjd,
+            )
+            if np.isfinite(phase_tess_local)
+            else np.nan
+        )
+        phase_q_common = phase_at_reference(
+            float(fit_row["phase_q_rad"]),
+            frequency,
+            zero_q,
+            reference_btjd,
+        )
+        phase_u_common = phase_at_reference(
+            float(fit_row["phase_u_rad"]),
+            frequency,
+            zero_u,
+            reference_btjd,
+        )
+        snr_q, w_q = pol_local_snr_from_fit(
+            q0,
+            frequency,
+            T_noise=max(compute_T_full(q0), 1e-8),
+            ks=POL_LOCAL_NOISE_KS,
+            baseline_matrix=baseline_q,
+        )
+        snr_u, w_u = pol_local_snr_from_fit(
+            u0,
+            frequency,
+            T_noise=max(compute_T_full(u0), 1e-8),
+            ks=POL_LOCAL_NOISE_KS,
+            baseline_matrix=baseline_u,
+        )
+        common = {
+            **fit_row,
+            "tess_mode": tess_mode,
+            "f_tess": float(tess_row["f"]),
+            "phase_reference_btjd": float(reference_btjd),
+            "phase_tess_at_reference_rad": phase_tess_common,
+            "phase_q_at_reference_rad": phase_q_common,
+            "phase_u_at_reference_rad": phase_u_common,
+            "phase_q_minus_tess_rad": (
+                float(wrap_phase_radians(phase_q_common - phase_tess_common))
+                if np.isfinite(phase_tess_common)
+                else np.nan
+            ),
+            "phase_u_minus_tess_rad": (
+                float(wrap_phase_radians(phase_u_common - phase_tess_common))
+                if np.isfinite(phase_tess_common)
+                else np.nan
+            ),
+            "snr_q": float(snr_q),
+            "snr_u": float(snr_u),
+            "W_q": float(w_q),
+            "W_u": float(w_u),
+            "quadrature_mode": mode,
+            "constrained_weighted_rss_total": float(fit["weighted_rss"]),
+            "unconstrained_weighted_rss_total": float(
+                fit["unconstrained_weighted_rss_total"]
+            ),
+        }
+        combined_rows.append(common)
+
+        for channel, amplitude_key, phase_key, snr, weight, phase_common in (
+            ("q", "amp_q", "phase_q_rad", snr_q, w_q, phase_q_common),
+            ("u", "amp_u", "phase_u_rad", snr_u, w_u, phase_u_common),
+        ):
+            amplitude = float(fit_row[amplitude_key])
+            phase = float(fit_row[phase_key])
+            channel_row = {
+                "mode": component,
+                "tess_mode": tess_mode,
+                "f_tess": float(tess_row["f"]),
+                "f": frequency,
+                "amp": amplitude,
+                "phase": phase,
+                "s_coeff": float(amplitude * np.cos(phase)),
+                "c_coeff": float(amplitude * np.sin(phase)),
+                "postfit_snr_local": float(snr),
+                "postfit_W_local": float(weight),
+                "postfit_keep": True,
+                "quadrature_mode": mode,
+                "quadrature_sign": int(fit_row["quadrature_sign"]),
+                "quadrature_relation": str(fit_row["quadrature_relation"]),
+                "phase_diff_u_minus_q_rad": float(
+                    fit_row["phase_diff_u_minus_q_rad"]
+                ),
+                "unconstrained_phase_diff_u_minus_q_rad": float(
+                    fit_row["unconstrained_phase_diff_u_minus_q_rad"]
+                ),
+                "phase_reference_btjd": float(reference_btjd),
+                "phase_at_reference_rad": float(phase_common),
+                "phase_minus_tess_rad": (
+                    float(wrap_phase_radians(phase_common - phase_tess_common))
+                    if np.isfinite(phase_tess_common)
+                    else np.nan
+                ),
+            }
+            source_search = channel_states[channel]["search_df"]
+            source = source_search.loc[source_search["tess_mode"] == tess_mode]
+            if not source.empty:
+                source = source.iloc[0]
+                for name in (
+                    "f_local",
+                    "amp_local",
+                    "phase_local",
+                    "snr_local",
+                    "W_local",
+                    "detected",
+                    "seed_for_global",
+                    "near_tess",
+                    "freq_offset",
+                ):
+                    if name in source:
+                        channel_row[name] = source[name]
+            (q_rows if channel == "q" else u_rows).append(channel_row)
+
+    quadrature_table = pd.DataFrame(combined_rows).sort_values(
+        "tess_mode"
+    ).reset_index(drop=True)
+
+    for channel, rows in (("q", q_rows), ("u", u_rows)):
+        state = channel_states[channel]
+        pol0 = state["pol0"]
+        component_rows = sorted(rows, key=lambda row: row["f"])
+        state["final_df"] = pd.DataFrame(component_rows).reset_index(drop=True)
+        state["global_fit"] = _quadrature_channel_global_fit(
+            pol0, fit, channel, component_rows
+        )
+        residual_values = (
+            np.asarray(fit["resid_q"], dtype=float)
+            if channel == "q"
+            else np.asarray(fit["resid_u"], dtype=float)
+        )
+        state["final_resid"] = TimeSeries(
+            t=pol0.t.copy(),
+            y=residual_values,
+            yerr=None if pol0.yerr is None else pol0.yerr.copy(),
+            name=pol0.name,
+            t_abs=None if pol0.t_abs is None else pol0.t_abs.copy(),
+            group_id=None if pol0.group_id is None else pol0.group_id.copy(),
+        )
+        state["Ppo_end"] = nuisance_periodogram(
+            state["final_resid"],
+            state["freqs_pol"],
+            baseline_matrix=make_pol_baseline_matrix(state["final_resid"], trend_cfg),
+        )
+        state["Ppo_end_full"] = nuisance_periodogram(
+            state["final_resid"],
+            state["freqs_pol_full"],
+            baseline_matrix=make_pol_baseline_matrix(state["final_resid"], trend_cfg),
+        )
+
+        result_by_mode = {
+            int(row["tess_mode"]): row for row in component_rows
+        }
+        search_df = state["search_df"].copy()
+        search_df["quadrature_mode"] = mode
+        search_df["quadrature_postfit_keep"] = search_df["tess_mode"].isin(
+            result_by_mode
+        )
+        search_df["quadrature_phase_rad"] = search_df["tess_mode"].map(
+            {
+                tess_mode: float(row["phase"])
+                for tess_mode, row in result_by_mode.items()
+            }
+        )
+        search_df["quadrature_sign"] = search_df["tess_mode"].map(
+            {
+                tess_mode: int(row["quadrature_sign"])
+                for tess_mode, row in result_by_mode.items()
+            }
+        )
+        search_df["f_global"] = search_df["tess_mode"].map(
+            {
+                tess_mode: float(row["f"])
+                for tess_mode, row in result_by_mode.items()
+            }
+        )
+        search_df["postfit_snr_global"] = search_df["tess_mode"].map(
+            {
+                tess_mode: float(row["postfit_snr_local"])
+                for tess_mode, row in result_by_mode.items()
+            }
+        )
+        search_df["postfit_keep"] = search_df["quadrature_postfit_keep"]
+        search_df["decision_status"] = np.where(
+            search_df["quadrature_postfit_keep"],
+            "retained_quadrature_global_fit",
+            "not_retained_in_quadrature_global_fit",
+        )
+        state["search_df"] = search_df
+        for diagnostic in state["guided_diags"]:
+            row = result_by_mode.get(int(diagnostic["tess_mode"]))
+            if row is not None:
+                diagnostic["f_global"] = float(row["f"])
+                diagnostic["postfit_keep"] = True
+                diagnostic["postfit_snr_global"] = float(
+                    row["postfit_snr_local"]
+                )
+                diagnostic["decision_status"] = "retained_quadrature_global_fit"
+                diagnostic["quadrature_mode"] = mode
+                diagnostic["quadrature_sign"] = int(row["quadrature_sign"])
+
+    return channel_states, quadrature_table
+
 # ----------------------------------------------------------------------
 # Plotting
 # ----------------------------------------------------------------------
@@ -2374,6 +2785,70 @@ def _norm_spec_shared(reference: np.ndarray, *arrays: np.ndarray, q: float = 99.
     if not np.isfinite(scale) or scale <= 0:
         scale = 1.0
     return tuple(np.asarray(values, dtype=float) / scale for values in (reference, *arrays))
+
+
+def normalize_tess_spectrum_background_scale(value: str) -> str:
+    """Validate the user-facing TESS-spectrum background scaling mode."""
+    mode = str(value).strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {"right": "right_axis", "secondary_axis": "right_axis", "panel": "normalized"}
+    mode = aliases.get(mode, mode)
+    if mode not in {"right_axis", "normalized"}:
+        raise ValueError(
+            "TESS spectrum background scale must be 'right_axis' or 'normalized'."
+        )
+    return mode
+
+
+def add_tess_spectrum_background(
+    ax,
+    tess_frequencies: np.ndarray,
+    tess_power: np.ndarray,
+    *,
+    log_y: bool = False,
+):
+    """Add the optional faint TESS spectrum to one polarimetry spectrum axis."""
+    if not SHOW_TESS_SPECTRUM_BACKGROUND:
+        return None
+    mode = normalize_tess_spectrum_background_scale(TESS_SPECTRUM_BACKGROUND_SCALE)
+    frequencies = np.asarray(tess_frequencies, dtype=float)
+    power = np.asarray(tess_power, dtype=float)
+    finite = np.isfinite(frequencies) & np.isfinite(power)
+    if log_y:
+        finite &= power > 0
+    if np.count_nonzero(finite) < 2:
+        return None
+    frequencies = frequencies[finite]
+    power = power[finite]
+    if mode == "normalized":
+        scale = float(np.nanpercentile(power, 99.0))
+        if not np.isfinite(scale) or scale <= 0:
+            scale = float(np.nanmax(power))
+        if not np.isfinite(scale) or scale <= 0:
+            scale = 1.0
+        power = power / scale
+
+    background_axis = ax.twinx()
+    background_axis.set_zorder(0)
+    ax.set_zorder(1)
+    ax.patch.set_visible(False)
+    background_axis.plot(
+        frequencies,
+        power,
+        color="#737373",
+        linewidth=0.85,
+        alpha=0.22,
+        zorder=0,
+    )
+    if log_y:
+        background_axis.set_yscale("log")
+    label = "TESS normalized power" if mode == "normalized" else "TESS power"
+    background_axis.set_ylabel(label, color="#737373", alpha=0.60, fontsize=8)
+    background_axis.tick_params(
+        axis="y", colors="#737373", labelsize=7, length=2, width=0.6
+    )
+    background_axis.spines["right"].set_color("#A6A6A6")
+    background_axis.spines["right"].set_alpha(0.45)
+    return background_axis
 
 
 def guided_diagnostic_marker_specs(diag: dict) -> list[dict]:
@@ -2610,6 +3085,7 @@ def plot_channel_timeseries_and_spectra(tess0: TimeSeries, tess_final_resid: Tim
             ax.set_ylabel(f"{pol0.name} normalized power")
             if i == len(guided_diags):
                 ax.set_xlabel("Frequency [c/d]")
+            add_tess_spectrum_background(ax, freqs_tess, Pte_start)
             ax.legend(loc="best", fontsize=8)
     else:
         ax = axes[1]
@@ -2620,6 +3096,7 @@ def plot_channel_timeseries_and_spectra(tess0: TimeSeries, tess_final_resid: Tim
         ax.set_xlabel("Frequency [c/d]")
         ax.set_ylabel(f"{pol0.name} norm. power + offset")
         ax.set_title(f"{pol0.name} spectra")
+        add_tess_spectrum_background(ax, freqs_tess, Pte_start)
         ax.legend(loc="best", fontsize=9)
 
     fig.tight_layout()
@@ -2654,6 +3131,7 @@ def plot_channel_timeseries_and_spectra(tess0: TimeSeries, tess_final_resid: Tim
     ax.set_xlabel("Frequency [c/d]")
     ax.set_ylabel(f"{pol0.name} norm. power + offset")
     ax.set_title(f"{pol0.name} spectra (full-range, full-baseline grid)")
+    add_tess_spectrum_background(ax, freqs_tess, Pte_start)
     ax.legend(loc="best", fontsize=9)
     fig.tight_layout()
     fig.savefig(outdir / prefixed_output_name(file_prefix, "spectra_fullrange_start_end.png"), dpi=180)
@@ -2690,6 +3168,7 @@ def plot_channel_timeseries_and_spectra(tess0: TimeSeries, tess_final_resid: Tim
                 )
             ax.set_title(guided_diagnostic_title(pol0.name, gd), fontsize=9.5)
             ax.set_ylabel("Power")
+            add_tess_spectrum_background(ax, freqs_tess, Pte_start, log_y=True)
             ax.legend(loc="best", fontsize=8)
         axes[-1].set_xlabel("Frequency [c/d]")
     else:
@@ -2706,6 +3185,7 @@ def plot_channel_timeseries_and_spectra(tess0: TimeSeries, tess_final_resid: Tim
         axes[1].set_xlabel("Frequency [c/d]")
         axes[1].set_ylabel(f"{pol0.name} power")
         axes[1].set_title(f"{pol0.name} spectra (log y)")
+        add_tess_spectrum_background(axes[1], freqs_tess, Pte_start, log_y=True)
     fig.tight_layout()
     fig.savefig(outdir / prefixed_output_name(file_prefix, "spectra_start_end_log_offset.png"), dpi=180)
     if show_plots_inline:
@@ -2730,6 +3210,7 @@ def plot_channel_timeseries_and_spectra(tess0: TimeSeries, tess_final_resid: Tim
     axes[1].set_xlabel("Frequency [c/d]")
     axes[1].set_ylabel(f"{pol0.name} power")
     axes[1].set_title(f"{pol0.name} spectra (full-range, log y)")
+    add_tess_spectrum_background(axes[1], freqs_tess, Pte_start, log_y=True)
     axes[1].legend(loc="best", fontsize=9)
     fig.tight_layout()
     fig.savefig(outdir / prefixed_output_name(file_prefix, "spectra_fullrange_start_end_log.png"), dpi=180)
@@ -2792,13 +3273,43 @@ def plot_tess_phased_modes(tess_snapshots: list[dict], mode_table: pd.DataFrame,
         plt.show()
     plt.close(fig)
 
-def plot_channel_phased_modes(tess_snapshots: list[dict], tess_table: pd.DataFrame,
-                              pol_search_df: pd.DataFrame, pol_snapshots: list[dict], pol0: TimeSeries,
-                              outdir: Path, n_phase_plots: int = 3, sort_by: str = "amp",
-                              show_plots_inline: bool = False, file_prefix: str = ""):
+def plot_channel_phased_modes(
+    tess_snapshots: list[dict],
+    tess_table: pd.DataFrame,
+    pol_search_df: pd.DataFrame,
+    pol_snapshots: list[dict],
+    pol0: TimeSeries,
+    outdir: Path,
+    n_phase_plots: int = 3,
+    sort_by: str = "amp",
+    show_plots_inline: bool = False,
+    file_prefix: str = "",
+    *,
+    tess0: TimeSeries | None = None,
+    tess_global_fit: dict | None = None,
+    pol_final_df: pd.DataFrame | None = None,
+    pol_global_fit: dict | None = None,
+):
+    """Plot isolated components from the authoritative final global fits.
+
+    Older releases plotted sequential local snapshots even after a global fit
+    moved or pruned a component.  The fallback remains for compatibility, but
+    current callers provide the final tables and models.
+    """
     if int(n_phase_plots) <= 0:
         return
-    if pol_search_df is not None and len(pol_search_df):
+    final_available = (
+        pol_final_df is not None
+        and not pol_final_df.empty
+        and pol_global_fit is not None
+        and tess0 is not None
+        and tess_global_fit is not None
+    )
+    if final_available:
+        detected = pol_final_df.copy()
+        if "tess_mode" not in detected.columns:
+            return
+    elif pol_search_df is not None and len(pol_search_df):
         if "postfit_keep" in pol_search_df.columns:
             detected = pol_search_df.loc[pol_search_df["postfit_keep"]].copy()
         elif "seed_for_global" in pol_search_df.columns:
@@ -2807,70 +3318,180 @@ def plot_channel_phased_modes(tess_snapshots: list[dict], tess_table: pd.DataFra
             detected = pol_search_df.loc[pol_search_df["detected"]].copy()
     else:
         detected = pd.DataFrame()
-    if detected.empty or not pol_snapshots:
+    if detected.empty:
         return
+
     snap_map = {int(s["tess_mode"]): s for s in pol_snapshots if "tess_mode" in s}
     tess_snap_map = {int(s["mode"]): s for s in tess_snapshots if "mode" in s}
-    sort_col = {"amp": "amp_local", "snr": "snr_local", "mode": "tess_mode"}.get(sort_by, sort_by)
-    if sort_col not in detected.columns:
-        sort_col = "amp_local" if "amp_local" in detected.columns else "snr_local"
-    pick = detected.sort_values(sort_col, ascending=(sort_col == "tess_mode")).head(n_phase_plots).reset_index(drop=True)
-    fig, axes = plt.subplots(nrows=len(pick), ncols=2, figsize=(12, 3.8 * len(pick)), squeeze=False)
+    sort_candidates = {
+        "amp": ("amp", "amp_local"),
+        "snr": ("postfit_snr_local", "snr_local"),
+        "mode": ("tess_mode",),
+    }.get(sort_by, (sort_by,))
+    sort_col = next((name for name in sort_candidates if name in detected.columns), None)
+    if sort_col is None:
+        sort_col = "tess_mode"
+    pick = (
+        detected.sort_values(sort_col, ascending=(sort_col == "tess_mode"))
+        .head(n_phase_plots)
+        .reset_index(drop=True)
+    )
+    fig, axes = plt.subplots(
+        nrows=len(pick), ncols=2, figsize=(12, 3.8 * len(pick)), squeeze=False
+    )
 
     for i, (_, pr) in enumerate(pick.iterrows()):
         tess_mode = int(pr["tess_mode"])
-
-        # TESS panel: use the local single-mode snapshot rather than a global component
-        ax = axes[i, 0]
-        tsnap = tess_snap_map.get(tess_mode)
         tr = tess_table.loc[tess_table["mode"] == tess_mode]
-        if tsnap is not None and not tr.empty:
-            tr = tr.iloc[0]
-            tfit = tsnap["fit"]
-            tprefit = tsnap["prefit"]
-            f_t = float(tfit["best_f"])
-            y_t = tprefit.y - np.nanmedian(tprefit.y)
-            ph_t = phase_fold(tprefit.t, f_t)
-            ax.scatter(ph_t, y_t, s=6, alpha=0.65, color="0.25")
-            ax.scatter(ph_t + 1.0, y_t, s=6, alpha=0.65, color="0.25")
-            ph_grid = np.linspace(0.0, 2.0, 500)
-            model_t = float(tfit["s_coeff"]) * np.sin(2.0 * np.pi * ph_grid) + float(tfit["c_coeff"]) * np.cos(2.0 * np.pi * ph_grid)
-            model_t = model_t - np.nanmedian(model_t)
-            ax.plot(ph_grid, model_t, lw=1.4, color="0.0")
-            set_robust_time_ylim(ax, y_t, model_t, central_pct=98.0, pad_frac=0.12)
-            ax.set_title(f"Mode {tess_mode} | TESS | f={float(tr['f']):.6f} c/d | amp={float(tr['amp']):.4g} | SNR={float(tr['snr_local']):.2f}")
-        ax.set_xlim(0.0, 2.0)
-        ax.set_xlabel("Phase")
-        ax.set_ylabel("TESS (median-subtracted)")
+        tr = None if tr.empty else tr.iloc[0]
 
-        # Polarimetry panel: show baseline-corrected folded data plus the local single-frequency fit
-        ax = axes[i, 1]
-        psnap = snap_map.get(tess_mode)
-        if psnap is not None:
-            pfit = psnap["fit"]
-            pprefit = psnap["prefit"]
-            f_p = float(pfit["best_f"])
-            y_p = pprefit.y - np.asarray(pfit["baseline_model"], dtype=float)
-            y_p = y_p - np.nanmedian(y_p)
-            ph_p = phase_fold(pprefit.t, f_p)
-            ax.scatter(ph_p, y_p, s=8, alpha=0.50, color="0.25")
-            ax.scatter(ph_p + 1.0, y_p, s=8, alpha=0.50, color="0.25")
-            bph, by = phase_bin_medians(ph_p, y_p, nbin=PHASE_BIN_N)
-            if len(bph):
-                ax.scatter(bph, by, s=20, alpha=0.95, color="#D55E00", zorder=3)
-                ax.scatter(bph + 1.0, by, s=20, alpha=0.95, color="#D55E00", zorder=3, label="phase-bin median")
-            ph_grid = np.linspace(0.0, 2.0, 500)
-            model_p = float(pfit["s_coeff"]) * np.sin(2.0 * np.pi * ph_grid) + float(pfit["c_coeff"]) * np.cos(2.0 * np.pi * ph_grid)
-            model_p = model_p - np.nanmedian(model_p)
-            ax.plot(ph_grid, model_p, lw=1.4, color="0.0")
-            set_robust_time_ylim(ax, y_p, model_p, by if 'by' in locals() else None, central_pct=98.0, pad_frac=0.12)
-            ax.set_title(f"Mode {tess_mode} | {pol0.name} | f={float(pr['f_local']):.6f} c/d | amp={float(pr['amp_local']):.4g} | SNR={float(pr['snr_local']):.2f}")
+        ax = axes[i, 0]
+        if final_available and tr is not None:
+            frequency_t = float(tr["f"])
+            component_t = component_signal(
+                tess0.t,
+                frequency_t,
+                float(tr["s_coeff"]),
+                float(tr["c_coeff"]),
+            )
+            isolated_t = (
+                tess0.y
+                - np.asarray(tess_global_fit["baseline_model"], dtype=float)
+                - (
+                    np.asarray(tess_global_fit["signal_model"], dtype=float)
+                    - component_t
+                )
+            )
+            reference = float(pr.get("phase_reference_btjd", resolve_phase_reference_btjd(tess0, pol0)))
+            phase_t = ((_series_btjd_abs(tess0) - reference) * frequency_t) % 1.0
+            phase_t_ref = phase_at_reference(
+                float(tr["phase"]),
+                frequency_t,
+                _series_local_zero_btjd(tess0),
+                reference,
+            )
+            phase_grid = np.linspace(0.0, 2.0, 500)
+            model_t = float(tr["amp"]) * np.sin(
+                2.0 * np.pi * phase_grid + phase_t_ref
+            )
+            ax.scatter(phase_t, isolated_t, s=6, alpha=0.65, color="0.25")
+            ax.scatter(phase_t + 1.0, isolated_t, s=6, alpha=0.65, color="0.25")
+            ax.plot(phase_grid, model_t, lw=1.4, color="0.0")
+            set_robust_time_ylim(
+                ax, isolated_t, model_t, central_pct=98.0, pad_frac=0.12
+            )
+            ax.set_title(
+                f"Mode {tess_mode} | TESS final global fit | "
+                f"f={frequency_t:.6f} c/d | amp={float(tr['amp']):.4g}"
+            )
+        else:
+            tsnap = tess_snap_map.get(tess_mode)
+            if tsnap is not None and tr is not None:
+                tfit = tsnap["fit"]
+                tprefit = tsnap["prefit"]
+                frequency_t = float(tfit["best_f"])
+                isolated_t = tprefit.y - np.nanmedian(tprefit.y)
+                phase_t = phase_fold(tprefit.t, frequency_t)
+                ax.scatter(phase_t, isolated_t, s=6, alpha=0.65, color="0.25")
+                ax.scatter(phase_t + 1.0, isolated_t, s=6, alpha=0.65, color="0.25")
         ax.set_xlim(0.0, 2.0)
         ax.set_xlabel("Phase")
-        ax.set_ylabel(f"{pol0.name} (median-subtracted)")
+        ax.set_ylabel("TESS isolated component")
+
+        ax = axes[i, 1]
+        binned_y = np.array([], dtype=float)
+        if final_available:
+            frequency_p = float(pr["f"])
+            component_p = component_signal(
+                pol0.t,
+                frequency_p,
+                float(pr["s_coeff"]),
+                float(pr["c_coeff"]),
+            )
+            isolated_p = (
+                pol0.y
+                - np.asarray(pol_global_fit["baseline_model"], dtype=float)
+                - (
+                    np.asarray(pol_global_fit["signal_model"], dtype=float)
+                    - component_p
+                )
+            )
+            reference = float(pr.get("phase_reference_btjd", resolve_phase_reference_btjd(tess0, pol0)))
+            phase_p = ((_series_btjd_abs(pol0) - reference) * frequency_p) % 1.0
+            phase_p_ref = float(
+                pr.get(
+                    "phase_at_reference_rad",
+                    phase_at_reference(
+                        float(pr["phase"]),
+                        frequency_p,
+                        _series_local_zero_btjd(pol0),
+                        reference,
+                    ),
+                )
+            )
+            phase_grid = np.linspace(0.0, 2.0, 500)
+            model_p = float(pr["amp"]) * np.sin(
+                2.0 * np.pi * phase_grid + phase_p_ref
+            )
+            ax.scatter(phase_p, isolated_p, s=8, alpha=0.50, color="0.25")
+            ax.scatter(phase_p + 1.0, isolated_p, s=8, alpha=0.50, color="0.25")
+            binned_phase, binned_y = phase_bin_medians(
+                phase_p, isolated_p, nbin=PHASE_BIN_N
+            )
+            if len(binned_phase):
+                ax.scatter(
+                    binned_phase,
+                    binned_y,
+                    s=20,
+                    alpha=0.95,
+                    color="#D55E00",
+                    zorder=3,
+                )
+                ax.scatter(
+                    binned_phase + 1.0,
+                    binned_y,
+                    s=20,
+                    alpha=0.95,
+                    color="#D55E00",
+                    zorder=3,
+                    label="phase-bin median",
+                )
+            ax.plot(phase_grid, model_p, lw=1.4, color="0.0")
+            set_robust_time_ylim(
+                ax,
+                isolated_p,
+                model_p,
+                binned_y,
+                central_pct=98.0,
+                pad_frac=0.12,
+            )
+            relation = (
+                f" | {pr['quadrature_relation']}"
+                if "quadrature_relation" in pr and pd.notna(pr["quadrature_relation"])
+                else ""
+            )
+            ax.set_title(
+                f"Mode {tess_mode} | {pol0.name} final global fit | "
+                f"f={frequency_p:.6f} c/d | amp={float(pr['amp']):.4g}{relation}"
+            )
+        else:
+            psnap = snap_map.get(tess_mode)
+            if psnap is not None:
+                pfit = psnap["fit"]
+                pprefit = psnap["prefit"]
+                frequency_p = float(pfit["best_f"])
+                isolated_p = pprefit.y - np.asarray(pfit["baseline_model"], dtype=float)
+                phase_p = phase_fold(pprefit.t, frequency_p)
+                ax.scatter(phase_p, isolated_p, s=8, alpha=0.50, color="0.25")
+                ax.scatter(phase_p + 1.0, isolated_p, s=8, alpha=0.50, color="0.25")
+        ax.set_xlim(0.0, 2.0)
+        ax.set_xlabel("Phase")
+        ax.set_ylabel(f"{pol0.name} isolated component")
 
     fig.tight_layout()
-    fig.savefig(outdir / prefixed_output_name(file_prefix, "phased_top_modes.png"), dpi=180)
+    fig.savefig(
+        outdir / prefixed_output_name(file_prefix, "phased_top_modes.png"), dpi=180
+    )
     if show_plots_inline:
         plt.show()
     plt.close(fig)
@@ -2994,6 +3615,23 @@ def _run_analysis_impl():
         POL_SMOOTH_WIDTH_RES_ELEMS,
         "resolution elements",
     )
+    print(
+        "TESS spectrum background =",
+        SHOW_TESS_SPECTRUM_BACKGROUND,
+        "| scale =",
+        TESS_SPECTRUM_BACKGROUND_SCALE,
+    )
+    print(
+        "q/u phase relation =",
+        QU_PHASE_MODE,
+        "| phase reference =",
+        PHASE_ZERO_MODE,
+        (
+            f"(BTJD {PHASE_ZERO_BTJD})"
+            if str(PHASE_ZERO_MODE).strip().lower() == "custom_btjd"
+            else ""
+        ),
+    )
     print("VERBOSE =", VERBOSE, "| LSQ_VERBOSE =", LSQ_VERBOSE)
     print("POL channels =", POL_CHANNELS, "| p is treated as a directly observed channel in this version")
 
@@ -3053,6 +3691,18 @@ def _run_analysis_impl():
                 "polarimetry_product": str(POL_PRODUCT),
                 "polarimetry_channels": list(POL_CHANNELS),
                 "polarimetry_periodogram_smoothing": smoothing_config,
+                "tess_spectrum_background": {
+                    "enabled": bool(SHOW_TESS_SPECTRUM_BACKGROUND),
+                    "scale": normalize_tess_spectrum_background_scale(
+                        TESS_SPECTRUM_BACKGROUND_SCALE
+                    ),
+                },
+                "qu_phase_constraint": {
+                    "mode": normalize_quadrature_mode(QU_PHASE_MODE),
+                    "phase_zero_mode": str(PHASE_ZERO_MODE),
+                    "phase_zero_btjd": float(PHASE_ZERO_BTJD),
+                    "maximum_function_evaluations": int(QUADRATURE_MAX_NFEV),
+                },
             },
             indent=2,
         ),
@@ -3088,19 +3738,73 @@ def _run_analysis_impl():
         vprint(1, f"Photometry-only analysis complete in {time.time()-t_all:.1f}s")
         return outputs
 
+    channel_states: dict[str, dict] = {}
     for k in POL_CHANNELS:
         if k not in pol_dt:
             print(f"Skipping channel {k!r}: not present.")
             continue
-        channel_prefix = f"{star_safe}_{k}"
-        outdir = analysis_outroot / channel_prefix
-        outdir.mkdir(parents=True, exist_ok=True)
         print(f"\n=== Guided run for {star_label} {k} ===")
         (search_df, final_df, global_fit, pol_snapshots, pol_final_resid,
          freqs_pol, Ppo_start, Ppo_end, guided_diags,
          freqs_pol_full, Ppo_start_full, Ppo_end_full) = search_guided_channel(
             pol_dt[k], tess_table, 1.0 / max(compute_T_full(tess_dt), 1e-8), trend_cfg
         )
+        channel_states[k] = {
+            "pol0": pol_dt[k],
+            "search_df": search_df,
+            "final_df": final_df,
+            "global_fit": global_fit,
+            "pol_snapshots": pol_snapshots,
+            "final_resid": pol_final_resid,
+            "freqs_pol": freqs_pol,
+            "Ppo_start": Ppo_start,
+            "Ppo_end": Ppo_end,
+            "guided_diags": guided_diags,
+            "freqs_pol_full": freqs_pol_full,
+            "Ppo_start_full": Ppo_start_full,
+            "Ppo_end_full": Ppo_end_full,
+        }
+
+    channel_states, quadrature_table = apply_guided_quadrature_refit(
+        tess_dt,
+        tess_table,
+        channel_states,
+        trend_cfg,
+    )
+    if not quadrature_table.empty:
+        quadrature_prefix = f"{star_safe}_qu"
+        quadrature_outdir = analysis_outroot / quadrature_prefix
+        quadrature_outdir.mkdir(parents=True, exist_ok=True)
+        quadrature_table.to_csv(
+            quadrature_outdir
+            / prefixed_output_name(quadrature_prefix, "quadrature_peaks_table.csv"),
+            index=False,
+        )
+        print(
+            "[q/u quadrature] wrote",
+            quadrature_outdir
+            / prefixed_output_name(quadrature_prefix, "quadrature_peaks_table.csv"),
+        )
+
+    for k in POL_CHANNELS:
+        if k not in channel_states:
+            continue
+        state = channel_states[k]
+        channel_prefix = f"{star_safe}_{k}"
+        outdir = analysis_outroot / channel_prefix
+        outdir.mkdir(parents=True, exist_ok=True)
+        search_df = state["search_df"]
+        final_df = state["final_df"]
+        global_fit = state["global_fit"]
+        pol_snapshots = state["pol_snapshots"]
+        pol_final_resid = state["final_resid"]
+        freqs_pol = state["freqs_pol"]
+        Ppo_start = state["Ppo_start"]
+        Ppo_end = state["Ppo_end"]
+        guided_diags = state["guided_diags"]
+        freqs_pol_full = state["freqs_pol_full"]
+        Ppo_start_full = state["Ppo_start_full"]
+        Ppo_end_full = state["Ppo_end_full"]
         search_df.to_csv(outdir / prefixed_output_name(channel_prefix, "matched_search_table.csv"), index=False)
         final_df.to_csv(outdir / prefixed_output_name(channel_prefix, "peaks_table.csv"), index=False)
         pd.DataFrame(global_fit["component_rows"]).to_csv(outdir / prefixed_output_name(channel_prefix, "global_components_raw.csv"), index=False)
@@ -3140,9 +3844,13 @@ def _run_analysis_impl():
             tess_snapshots, tess_table,
             search_df, pol_snapshots, pol_dt[k],
             outdir, n_phase_plots=N_PHASE_PLOTS, sort_by=PHASE_SORT_BY,
-            show_plots_inline=SHOW_PLOTS_INLINE, file_prefix=channel_prefix
+            show_plots_inline=SHOW_PLOTS_INLINE, file_prefix=channel_prefix,
+            tess0=tess_dt, tess_global_fit=tess_global_fit,
+            pol_final_df=final_df, pol_global_fit=global_fit,
         )
         outputs[k] = final_df
+    if not quadrature_table.empty:
+        outputs["qu_quadrature"] = quadrature_table
 
     vprint(1, f"All analysis complete in {time.time()-t_all:.1f}s")
     return outputs

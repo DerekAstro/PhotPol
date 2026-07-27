@@ -5,7 +5,33 @@ import pandas as pd
 from dataclasses import dataclass
 from pathlib import Path
 import json
+import importlib.util
 import matplotlib.pyplot as plt
+import sys
+
+try:
+    from polarimetry_quadrature import (
+        fit_quadrature_multisin,
+        normalize_quadrature_mode,
+        phase_at_reference,
+        wrap_phase_radians,
+    )
+except ModuleNotFoundError:
+    # The GUI imports this backend directly from a selected file path rather
+    # than as an installed package. Load the colocated helper explicitly.
+    _helper_path = Path(__file__).with_name("polarimetry_quadrature.py")
+    _helper_spec = importlib.util.spec_from_file_location(
+        "polarimetry_quadrature", _helper_path
+    )
+    if _helper_spec is None or _helper_spec.loader is None:
+        raise
+    _helper_module = importlib.util.module_from_spec(_helper_spec)
+    sys.modules.setdefault("polarimetry_quadrature", _helper_module)
+    _helper_spec.loader.exec_module(_helper_module)
+    fit_quadrature_multisin = _helper_module.fit_quadrature_multisin
+    normalize_quadrature_mode = _helper_module.normalize_quadrature_mode
+    phase_at_reference = _helper_module.phase_at_reference
+    wrap_phase_radians = _helper_module.wrap_phase_radians
 
 try:
     from scipy.signal import find_peaks
@@ -107,6 +133,15 @@ POL_SMOOTH_WIDTH_RES_ELEMS = 10.0    # Gaussian FWHM or boxcar full width
 POL_SMOOTH_SAMPLES_PER_WIDTH = 4.0   # minimum sampling during local Joint refinement
 POL_SMOOTH_MAX_REFINE_FACTOR = 200   # protects against pathological baselines/settings
 
+# Optional photometric-spectrum context on polarimetry spectrum panels.
+SHOW_TESS_SPECTRUM_BACKGROUND = False
+TESS_SPECTRUM_BACKGROUND_SCALE = "right_axis"  # "right_axis" | "normalized"
+
+# Optional physically motivated Stokes-q/u phase relation. Candidate
+# discovery remains channel-specific; this setting controls the authoritative
+# simultaneous final fit to the original time series.
+QU_PHASE_MODE = "free"  # "free" | "auto" | "force_plus" | "force_minus"
+QUADRATURE_MAX_NFEV = 300
 
 # --- Interactive display ---
 SHOW_PLOTS_INLINE = True
@@ -1132,6 +1167,79 @@ def phase_fold(t: np.ndarray, f: float, t_ref: float = 0.0) -> np.ndarray:
     phase = ((t - t_ref) * f) % 1.0
     return phase
 
+
+def normalize_tess_spectrum_background_scale(value: str) -> str:
+    """Return the canonical scaling name for the optional background curve."""
+    mode = str(value).strip().lower().replace("-", "_").replace(" ", "_")
+    mode = {
+        "right": "right_axis",
+        "secondary_axis": "right_axis",
+        "panel": "normalized",
+    }.get(mode, mode)
+    if mode not in {"right_axis", "normalized"}:
+        raise ValueError(
+            "TESS spectrum background scale must be 'right_axis' or 'normalized'."
+        )
+    return mode
+
+
+def add_tess_spectrum_background(
+    ax,
+    frequencies: np.ndarray,
+    tess_power: np.ndarray,
+    *,
+    log_y: bool = False,
+):
+    """Draw a low-contrast TESS spectrum behind a polarimetry spectrum."""
+    if not SHOW_TESS_SPECTRUM_BACKGROUND:
+        return None
+    mode = normalize_tess_spectrum_background_scale(
+        TESS_SPECTRUM_BACKGROUND_SCALE
+    )
+    frequencies = np.asarray(frequencies, dtype=float)
+    power = np.asarray(tess_power, dtype=float)
+    finite = np.isfinite(frequencies) & np.isfinite(power)
+    if log_y:
+        finite &= power > 0
+    if np.count_nonzero(finite) < 2:
+        return None
+    frequencies = frequencies[finite]
+    power = power[finite]
+    if mode == "normalized":
+        scale = float(np.nanpercentile(power, 99.0))
+        if not np.isfinite(scale) or scale <= 0:
+            scale = float(np.nanmax(power))
+        if not np.isfinite(scale) or scale <= 0:
+            scale = 1.0
+        power = power / scale
+    background_axis = ax.twinx()
+    background_axis.set_zorder(0)
+    ax.set_zorder(1)
+    ax.patch.set_visible(False)
+    background_axis.plot(
+        frequencies,
+        power,
+        color="#737373",
+        linewidth=0.85,
+        alpha=0.22,
+        zorder=0,
+    )
+    if log_y:
+        background_axis.set_yscale("log")
+    background_axis.set_ylabel(
+        "TESS normalized power" if mode == "normalized" else "TESS power",
+        color="#737373",
+        alpha=0.60,
+        fontsize=8,
+    )
+    background_axis.tick_params(
+        axis="y", colors="#737373", labelsize=7, length=2, width=0.6
+    )
+    background_axis.spines["right"].set_color("#A6A6A6")
+    background_axis.spines["right"].set_alpha(0.45)
+    return background_axis
+
+
 def sort_modes_for_phasing(res: pd.DataFrame, how: str, nmax: int) -> pd.DataFrame:
     if res.empty:
         return res
@@ -1224,8 +1332,14 @@ def plot_phased_modes(mode_snapshots: list[dict], res: pd.DataFrame, outdir: Pat
     plt.close(fig)
 
 
-def run_joint_extraction_one(tess0: TimeSeries, pol0: TimeSeries, outdir: Path,
-                             pol_trend_cfg: NightTrendConfig, show_plots_inline: bool = False) -> pd.DataFrame:
+def run_joint_extraction_one(
+    tess0: TimeSeries,
+    pol0: TimeSeries,
+    outdir: Path,
+    pol_trend_cfg: NightTrendConfig,
+    show_plots_inline: bool = False,
+    return_state: bool = False,
+):
     outdir.mkdir(parents=True, exist_ok=True)
 
     smoothing_metadata = {
@@ -1243,6 +1357,18 @@ def run_joint_extraction_one(tess0: TimeSeries, pol0: TimeSeries, outdir: Path,
                 "analysis_track": "joint",
                 "polarimetry_channel": str(pol0.name),
                 "polarimetry_periodogram_smoothing": smoothing_metadata,
+                "tess_spectrum_background": {
+                    "enabled": bool(SHOW_TESS_SPECTRUM_BACKGROUND),
+                    "scale": normalize_tess_spectrum_background_scale(
+                        TESS_SPECTRUM_BACKGROUND_SCALE
+                    ),
+                },
+                "qu_phase_constraint": {
+                    "mode": normalize_quadrature_mode(QU_PHASE_MODE),
+                    "phase_zero_mode": str(PHASE_ZERO_MODE),
+                    "phase_zero_btjd": float(PHASE_ZERO_BTJD),
+                    "maximum_function_evaluations": int(QUADRATURE_MAX_NFEV),
+                },
             },
             indent=2,
         ),
@@ -1526,6 +1652,7 @@ def run_joint_extraction_one(tess0: TimeSeries, pol0: TimeSeries, outdir: Path,
     else:
         ax.plot(freqs_coarse, Ppo_s + off_po_s, lw=0.9, label=f"{pol0.name} start", color=C_POL_START, linestyle="-")
         ax.plot(freqs_coarse, Ppo_e + off_po_e, lw=0.9, label=f"{pol0.name} end (offset)", color=C_POL_END, linestyle="--")
+    add_tess_spectrum_background(ax, freqs_coarse, Pte_start)
     if len(accepted) > 0:
         y_top_p = np.nanmax(Ppo_e + off_po_e) if np.isfinite(np.nanmax(Ppo_e + off_po_e)) else (off_po_e + 1.0)
         for i, f in enumerate(accepted, start=1):
@@ -1599,7 +1726,644 @@ def run_joint_extraction_one(tess0: TimeSeries, pol0: TimeSeries, outdir: Path,
                       n_phase_plots=N_PHASE_PLOTS, sort_by=PHASE_SORT_BY,
                       plot_style=PHASE_PLOT_STYLE,
                       show_plots_inline=show_plots_inline)
+    if return_state:
+        return {
+            "result": res,
+            "tess0": tess0,
+            "pol0": pol0,
+            "tess_final_resid": tess,
+            "pol_final_resid": pol,
+            "mode_snapshots": mode_snapshots,
+            "freqs": freqs_coarse,
+            "Pte_start": Pte_start,
+            "Pte_end": Pte_end,
+            "Ppo_start": Ppo_start,
+            "Ppo_end": Ppo_end,
+            "win_tess": win_te,
+            "win_pol": win_po,
+            "weight_tess": float(w_te),
+            "weight_pol": float(w_po),
+            "outdir": outdir,
+        }
     return res
+
+
+def _series_local_zero_btjd(ts: TimeSeries) -> float:
+    """Return the absolute BTJD represented by local time ``t == 0``."""
+    offset = to_btjd_abs(ts) - np.asarray(ts.t, dtype=float)
+    finite = offset[np.isfinite(offset)]
+    return float(np.nanmedian(finite)) if finite.size else 0.0
+
+
+def resolve_phase_reference_btjd(*series: TimeSeries) -> float:
+    """Resolve one shared phase epoch for TESS, q, and u."""
+    mode = str(PHASE_ZERO_MODE).strip().lower()
+    if mode == "btjd_zero":
+        return 0.0
+    if mode == "custom_btjd":
+        value = float(PHASE_ZERO_BTJD)
+        if not np.isfinite(value):
+            raise ValueError("Custom phase-zero BTJD must be finite.")
+        return value
+    if mode != "local_start":
+        raise ValueError(
+            "PHASE_ZERO_MODE must be 'local_start', 'btjd_zero', or 'custom_btjd'."
+        )
+    starts = []
+    for ts in series:
+        absolute = to_btjd_abs(ts)
+        finite = absolute[np.isfinite(absolute)]
+        if finite.size:
+            starts.append(float(np.nanmin(finite)))
+    return min(starts) if starts else 0.0
+
+
+def _joint_quadrature_seeds(states: dict[str, dict]) -> np.ndarray:
+    """Merge independently discovered q/u frequencies at one resolution."""
+    candidates = []
+    for channel in ("q", "u"):
+        table = states[channel]["result"]
+        if table is None or table.empty:
+            continue
+        for _, row in table.iterrows():
+            frequency = float(row["f_comb"])
+            if np.isfinite(frequency) and frequency > 0:
+                candidates.append(
+                    (
+                        frequency,
+                        max(float(row.get("score_comb", 1.0)), 1e-12),
+                    )
+                )
+    if not candidates:
+        return np.array([], dtype=float)
+    candidates.sort(key=lambda item: item[0])
+    series = [
+        states["q"]["tess0"],
+        states["q"]["pol0"],
+        states["u"]["pol0"],
+    ]
+    resolution = 1.0 / max(
+        max(compute_Tseg(ts, gap_days=1.0), 1e-8) for ts in series
+    )
+    clusters: list[list[tuple[float, float]]] = []
+    for candidate in candidates:
+        if not clusters:
+            clusters.append([candidate])
+            continue
+        center = np.average(
+            [item[0] for item in clusters[-1]],
+            weights=[item[1] for item in clusters[-1]],
+        )
+        if abs(candidate[0] - center) <= resolution:
+            clusters[-1].append(candidate)
+        else:
+            clusters.append([candidate])
+    return np.array(
+        [
+            np.average(
+                [item[0] for item in cluster],
+                weights=[item[1] for item in cluster],
+            )
+            for cluster in clusters
+        ],
+        dtype=float,
+    )
+
+
+def _copy_with_values(ts: TimeSeries, values: np.ndarray) -> TimeSeries:
+    return TimeSeries(
+        t=ts.t.copy(),
+        y=np.asarray(values, dtype=float),
+        yerr=None if ts.yerr is None else ts.yerr.copy(),
+        name=ts.name,
+        t_abs=None if ts.t_abs is None else ts.t_abs.copy(),
+        group_id=None if ts.group_id is None else ts.group_id.copy(),
+    )
+
+
+def _nearest_source_row(table: pd.DataFrame, frequency: float):
+    if table is None or table.empty or "f_comb" not in table:
+        return None
+    values = pd.to_numeric(table["f_comb"], errors="coerce").to_numpy(float)
+    finite = np.isfinite(values)
+    if not finite.any():
+        return None
+    indices = np.flatnonzero(finite)
+    return table.iloc[int(indices[np.argmin(np.abs(values[finite] - frequency))])]
+
+
+def _plot_joint_quadrature_outputs(
+    state: dict,
+    channel_table: pd.DataFrame,
+    fit: dict,
+    channel: str,
+    show_plots_inline: bool,
+):
+    """Overwrite channel plots with the authoritative constrained final fit."""
+    outdir = Path(state["outdir"])
+    tess0 = state["tess0"]
+    pol0 = state["pol0"]
+    tess_resid = state["tess_final_resid"]
+    pol_resid = state["pol_final_resid"]
+    frequencies = state["freqs"]
+    pte_start = state["Pte_start"]
+    pte_end = state["Pte_end"]
+    ppo_start = state["Ppo_start"]
+    ppo_end = state["Ppo_end"]
+    fitted_frequencies = channel_table["f_comb"].to_numpy(float)
+
+    colors = {
+        "tess_start": "#0072B2",
+        "tess_end": "#56B4E9",
+        "pol_start": "#E69F00",
+        "pol_end": "#CC79A7",
+    }
+    fig, axes = plt.subplots(2, 1, figsize=(11, 7.5), sharex=True)
+    axes[0].scatter(
+        tess0.t,
+        tess0.y - np.nanmedian(tess0.y),
+        s=8,
+        alpha=0.55,
+        color=colors["tess_start"],
+        label="TESS start",
+    )
+    axes[0].scatter(
+        tess_resid.t,
+        tess_resid.y - np.nanmedian(tess_resid.y),
+        s=8,
+        alpha=0.65,
+        color=colors["tess_end"],
+        label="TESS constrained-fit residual",
+    )
+    axes[0].set_ylabel("TESS value (median-subtracted)")
+    axes[0].legend(loc="best", fontsize=9)
+    axes[1].scatter(
+        pol0.t,
+        pol0.y,
+        s=10,
+        alpha=0.55,
+        color=colors["pol_start"],
+        label=f"{pol0.name} start",
+    )
+    axes[1].scatter(
+        pol_resid.t,
+        pol_resid.y,
+        s=10,
+        alpha=0.65,
+        color=colors["pol_end"],
+        label=f"{pol0.name} constrained-fit residual",
+    )
+    axes[1].set_xlabel("Time [days]")
+    axes[1].set_ylabel(f"{pol0.name} value")
+    axes[1].legend(loc="best", fontsize=9)
+    fig.suptitle(
+        f"Time series: TESS + {pol0.name} | q/u {fit['mode']} quadrature fit"
+    )
+    fig.tight_layout()
+    fig.savefig(outdir / "timeseries_start_end.png", dpi=180)
+    if show_plots_inline:
+        plt.show()
+    plt.close(fig)
+
+    def normalized(values):
+        values = np.asarray(values, dtype=float)
+        finite = values[np.isfinite(values)]
+        scale = float(np.nanpercentile(finite, 99.0)) if finite.size else 1.0
+        if not np.isfinite(scale) or scale <= 0:
+            scale = float(np.nanmax(finite)) if finite.size else 1.0
+        return values / max(scale, 1e-30)
+
+    fig, axes = plt.subplots(2, 1, figsize=(11, 7.5), sharex=True)
+    axes[0].plot(
+        frequencies,
+        normalized(pte_start),
+        color=colors["tess_start"],
+        lw=0.9,
+        label="TESS start",
+    )
+    axes[0].plot(
+        frequencies,
+        normalized(pte_end) + 1.2,
+        color=colors["tess_end"],
+        lw=0.9,
+        ls="--",
+        label="TESS constrained-fit residual (offset)",
+    )
+    axes[0].set_ylabel("TESS normalized power + offset")
+    axes[0].legend(loc="best", fontsize=9)
+    axes[1].plot(
+        frequencies,
+        normalized(ppo_start),
+        color=colors["pol_start"],
+        lw=0.9,
+        label=f"{pol0.name} start",
+    )
+    axes[1].plot(
+        frequencies,
+        normalized(ppo_end) + 1.2,
+        color=colors["pol_end"],
+        lw=0.9,
+        ls="--",
+        label=f"{pol0.name} constrained-fit residual (offset)",
+    )
+    add_tess_spectrum_background(axes[1], frequencies, pte_start)
+    for index, frequency in enumerate(fitted_frequencies, start=1):
+        for axis in axes:
+            axis.axvline(frequency, color="0.3", lw=0.8, alpha=0.35)
+        axes[1].text(
+            frequency,
+            0.98,
+            str(index),
+            transform=axes[1].get_xaxis_transform(),
+            rotation=90,
+            va="top",
+            ha="center",
+            fontsize=8,
+        )
+    axes[1].set_xlabel("Frequency [cycles/day]")
+    axes[1].set_ylabel(f"{pol0.name} normalized power + offset")
+    axes[1].legend(loc="best", fontsize=9)
+    fig.suptitle(
+        f"Power spectra: TESS + {pol0.name} | q/u {fit['mode']} quadrature fit"
+    )
+    fig.tight_layout()
+    fig.savefig(outdir / "spectra_start_end.png", dpi=180)
+    if show_plots_inline:
+        plt.show()
+    plt.close(fig)
+
+    eps = 1e-12
+    fig, axes = plt.subplots(2, 1, figsize=(11, 7.5), sharex=True)
+    axes[0].plot(
+        frequencies,
+        pte_start + eps,
+        color=colors["tess_start"],
+        lw=0.9,
+        label="TESS start",
+    )
+    axes[0].plot(
+        frequencies,
+        pte_end + eps,
+        color=colors["tess_end"],
+        lw=0.9,
+        ls="--",
+        label="TESS constrained-fit residual",
+    )
+    axes[1].plot(
+        frequencies,
+        ppo_start + eps,
+        color=colors["pol_start"],
+        lw=0.9,
+        label=f"{pol0.name} start",
+    )
+    axes[1].plot(
+        frequencies,
+        ppo_end + eps,
+        color=colors["pol_end"],
+        lw=0.9,
+        ls="--",
+        label=f"{pol0.name} constrained-fit residual",
+    )
+    add_tess_spectrum_background(
+        axes[1], frequencies, pte_start + eps, log_y=True
+    )
+    for frequency in fitted_frequencies:
+        axes[0].axvline(frequency, color="0.3", lw=0.8, alpha=0.35)
+        axes[1].axvline(frequency, color="0.3", lw=0.8, alpha=0.35)
+    for axis in axes:
+        axis.set_yscale("log")
+        axis.legend(loc="best", fontsize=9)
+    axes[1].set_xlabel("Frequency [cycles/day]")
+    axes[0].set_ylabel("TESS power")
+    axes[1].set_ylabel(f"{pol0.name} power")
+    fig.suptitle(
+        f"Log power spectra: TESS + {pol0.name} | q/u {fit['mode']} quadrature fit"
+    )
+    fig.tight_layout()
+    fig.savefig(outdir / "spectra_start_end_log_offset.png", dpi=180)
+    if show_plots_inline:
+        plt.show()
+    plt.close(fig)
+
+    if int(N_PHASE_PLOTS) <= 0 or channel_table.empty:
+        return
+    sort_column = PHASE_SORT_BY if PHASE_SORT_BY in channel_table else "score_comb"
+    picks = channel_table.sort_values(sort_column, ascending=False).head(
+        int(N_PHASE_PLOTS)
+    )
+    fig, axes = plt.subplots(
+        len(picks), 2, figsize=(12, 3.8 * len(picks)), squeeze=False
+    )
+    signal_tess = np.asarray(fit["signal_tess"], dtype=float)
+    signal_pol = np.asarray(
+        fit["signal_q"] if channel == "q" else fit["signal_u"], dtype=float
+    )
+    baseline_tess = np.asarray(fit["baseline_tess"], dtype=float)
+    baseline_pol = np.asarray(
+        fit["baseline_q"] if channel == "q" else fit["baseline_u"], dtype=float
+    )
+    for panel, (_, row) in enumerate(picks.iterrows()):
+        index = int(row["quadrature_component"]) - 1
+        frequency = float(row["f_comb"])
+        phase_reference = float(row["phase_reference_btjd"])
+        phase_grid = np.linspace(0.0, 2.0, 500)
+
+        component_tess = (
+            float(row["tess_sine_coefficient"])
+            * np.sin(2.0 * np.pi * frequency * tess0.t)
+            + float(row["tess_cosine_coefficient"])
+            * np.cos(2.0 * np.pi * frequency * tess0.t)
+        )
+        isolated_tess = tess0.y - baseline_tess - (signal_tess - component_tess)
+        folded_tess = (
+            (to_btjd_abs(tess0) - phase_reference) * frequency
+        ) % 1.0
+        model_tess = float(row["amp_tess"]) * np.sin(
+            2.0 * np.pi * phase_grid
+            + float(row["phase_tess_at_reference_rad"])
+        )
+        axes[panel, 0].scatter(
+            folded_tess, isolated_tess, s=8, alpha=0.60, color="0.25"
+        )
+        axes[panel, 0].scatter(
+            folded_tess + 1.0, isolated_tess, s=8, alpha=0.60, color="0.25"
+        )
+        axes[panel, 0].plot(phase_grid, model_tess, color="0.0", lw=1.4)
+        axes[panel, 0].set_title(
+            f"Mode {index + 1} | TESS final simultaneous fit | "
+            f"f={frequency:.6f} c/d"
+        )
+
+        amp_pol = float(row["amp_pol"])
+        phase_pol_local = float(row["phase_pol"])
+        component_pol = amp_pol * np.sin(
+            2.0 * np.pi * frequency * pol0.t + phase_pol_local
+        )
+        isolated_pol = pol0.y - baseline_pol - (signal_pol - component_pol)
+        folded_pol = (
+            (to_btjd_abs(pol0) - phase_reference) * frequency
+        ) % 1.0
+        model_pol = amp_pol * np.sin(
+            2.0 * np.pi * phase_grid
+            + float(row["phase_pol_at_reference_rad"])
+        )
+        axes[panel, 1].scatter(
+            folded_pol, isolated_pol, s=10, alpha=0.60, color="0.25"
+        )
+        axes[panel, 1].scatter(
+            folded_pol + 1.0, isolated_pol, s=10, alpha=0.60, color="0.25"
+        )
+        axes[panel, 1].plot(phase_grid, model_pol, color="0.0", lw=1.4)
+        axes[panel, 1].set_title(
+            f"Mode {index + 1} | {pol0.name} final simultaneous fit | "
+            f"{row['quadrature_relation']}"
+        )
+        for axis in axes[panel]:
+            axis.set_xlim(0.0, 2.0)
+            axis.set_xlabel("Phase")
+        axes[panel, 0].set_ylabel("TESS isolated component")
+        axes[panel, 1].set_ylabel(f"{pol0.name} isolated component")
+    fig.suptitle(
+        f"TESS + {pol0.name}: authoritative q/u {fit['mode']} quadrature fit",
+        y=1.01,
+    )
+    fig.tight_layout()
+    fig.savefig(outdir / "phased_top_modes.png", dpi=180, bbox_inches="tight")
+    if show_plots_inline:
+        plt.show()
+    plt.close(fig)
+
+
+def apply_joint_quadrature_refit(
+    states: dict[str, dict],
+    trend_cfg: NightTrendConfig,
+    show_plots_inline: bool,
+) -> tuple[dict[str, dict], pd.DataFrame]:
+    """Apply the selected q/u relation to the authoritative Joint final fit."""
+    mode = normalize_quadrature_mode(QU_PHASE_MODE)
+    if mode == "free":
+        return states, pd.DataFrame()
+    if "q" not in states or "u" not in states:
+        print(
+            "[WARN] q/u quadrature was requested, but both q and u were not "
+            "selected and available; retaining independent Joint fits."
+        )
+        return states, pd.DataFrame()
+    seeds = _joint_quadrature_seeds(states)
+    if not len(seeds):
+        print("[q/u quadrature] No Joint candidates were retained.")
+        return states, pd.DataFrame()
+
+    tess0 = states["q"]["tess0"]
+    q0 = states["q"]["pol0"]
+    u0 = states["u"]["pol0"]
+    tseg_max = max(
+        compute_Tseg(tess0, gap_days=1.0),
+        compute_Tseg(q0, gap_days=1.0),
+        compute_Tseg(u0, gap_days=1.0),
+        1e-8,
+    )
+    half_width = KFIT * (2.0 / tseg_max)
+    lower = np.maximum(float(FMIN), seeds - half_width)
+    upper = np.minimum(float(FMAX), seeds + half_width)
+    print(
+        f"[q/u quadrature] fitting {len(seeds)} Joint component(s) | "
+        f"mode={mode} | common frequencies optimized"
+    )
+    fit = fit_quadrature_multisin(
+        q_time=q0.t,
+        q_values=q0.y,
+        q_weights=signal_weights(q0),
+        q_baseline=make_pol_baseline_matrix(q0, trend_cfg),
+        u_time=u0.t,
+        u_values=u0.y,
+        u_weights=signal_weights(u0),
+        u_baseline=make_pol_baseline_matrix(u0, trend_cfg),
+        seed_frequencies=seeds,
+        mode=mode,
+        optimize_frequencies=True,
+        frequency_lower=lower,
+        frequency_upper=upper,
+        tess_time=tess0.t,
+        tess_values=tess0.y,
+        tess_weights=signal_weights(tess0),
+        tess_baseline=make_tess_baseline_matrix(tess0),
+        tess_dataset_weight=float(states["q"]["weight_tess"]),
+        pol_dataset_weight=float(
+            0.5 * (states["q"]["weight_pol"] + states["u"]["weight_pol"])
+        ),
+        max_nfev=QUADRATURE_MAX_NFEV,
+    )
+
+    reference = resolve_phase_reference_btjd(tess0, q0, u0)
+    zero_tess = _series_local_zero_btjd(tess0)
+    zero_q = _series_local_zero_btjd(q0)
+    zero_u = _series_local_zero_btjd(u0)
+    combined_rows = []
+    channel_rows = {"q": [], "u": []}
+    for component, fit_row in enumerate(fit["component_rows"], start=1):
+        frequency = float(fit_row["frequency_cpd"])
+        phase_tess_common = phase_at_reference(
+            float(fit_row["phase_tess_rad"]),
+            frequency,
+            zero_tess,
+            reference,
+        )
+        phase_q_common = phase_at_reference(
+            float(fit_row["phase_q_rad"]), frequency, zero_q, reference
+        )
+        phase_u_common = phase_at_reference(
+            float(fit_row["phase_u_rad"]), frequency, zero_u, reference
+        )
+        common = {
+            **fit_row,
+            "quadrature_component": component,
+            "phase_reference_btjd": reference,
+            "phase_tess_at_reference_rad": phase_tess_common,
+            "phase_q_at_reference_rad": phase_q_common,
+            "phase_u_at_reference_rad": phase_u_common,
+            "phase_q_minus_tess_rad": float(
+                wrap_phase_radians(phase_q_common - phase_tess_common)
+            ),
+            "phase_u_minus_tess_rad": float(
+                wrap_phase_radians(phase_u_common - phase_tess_common)
+            ),
+            "quadrature_mode": mode,
+            "constrained_weighted_rss_total": float(fit["weighted_rss"]),
+            "unconstrained_weighted_rss_total": float(
+                fit["unconstrained_weighted_rss_total"]
+            ),
+        }
+        combined_rows.append(common)
+        for channel, amplitude_key, phase_key, phase_common in (
+            ("q", "amp_q", "phase_q_rad", phase_q_common),
+            ("u", "amp_u", "phase_u_rad", phase_u_common),
+        ):
+            state = states[channel]
+            source = _nearest_source_row(state["result"], frequency)
+            snr_tess, w_tess = local_snr_from_power(
+                state["freqs"],
+                state["Pte_start"],
+                frequency,
+                T=max(compute_T_full(tess0), 1e-8),
+                ks=KS_TESS,
+            )
+            snr_pol, w_pol = local_snr_from_power(
+                state["freqs"],
+                state["Ppo_start"],
+                frequency,
+                T=max(compute_T_full(state["pol0"]), 1e-8),
+                ks=KS_POL,
+            )
+            amplitude = float(fit_row[amplitude_key])
+            phase_local = float(fit_row[phase_key])
+            row = {
+                "n": component,
+                "quadrature_component": component,
+                "f_comb": frequency,
+                "score_comb": (
+                    float(source.get("score_comb", np.nan))
+                    if source is not None
+                    else np.nan
+                ),
+                "W_tess_at_pick": (
+                    float(source.get("W_tess_at_pick", np.nan))
+                    if source is not None
+                    else np.nan
+                ),
+                "W_pol_at_pick": (
+                    float(source.get("W_pol_at_pick", np.nan))
+                    if source is not None
+                    else np.nan
+                ),
+                "f_tess": frequency,
+                "amp_tess": float(fit_row["amp_tess"]),
+                "phase_tess": float(fit_row["phase_tess_rad"]),
+                "tess_sine_coefficient": float(
+                    fit_row["tess_sine_coefficient"]
+                ),
+                "tess_cosine_coefficient": float(
+                    fit_row["tess_cosine_coefficient"]
+                ),
+                "snr_tess": float(snr_tess),
+                "W_tess": float(w_tess),
+                "f_pol": frequency,
+                "amp_pol": amplitude,
+                "phase_pol": phase_local,
+                "snr_pol": float(snr_pol),
+                "W_pol": float(w_pol),
+                "quadrature_mode": mode,
+                "quadrature_sign": int(fit_row["quadrature_sign"]),
+                "quadrature_relation": str(fit_row["quadrature_relation"]),
+                "phase_diff_u_minus_q_rad": float(
+                    fit_row["phase_diff_u_minus_q_rad"]
+                ),
+                "unconstrained_phase_diff_u_minus_q_rad": float(
+                    fit_row["unconstrained_phase_diff_u_minus_q_rad"]
+                ),
+                "phase_reference_btjd": reference,
+                "phase_tess_at_reference_rad": phase_tess_common,
+                "phase_pol_at_reference_rad": float(phase_common),
+                "phase_pol_minus_tess_rad": float(
+                    wrap_phase_radians(phase_common - phase_tess_common)
+                ),
+            }
+            channel_rows[channel].append(row)
+
+    combined_table = pd.DataFrame(combined_rows)
+    for channel in ("q", "u"):
+        state = states[channel]
+        table = pd.DataFrame(channel_rows[channel])
+        state["result"] = table
+        pol0 = state["pol0"]
+        state["tess_final_resid"] = _copy_with_values(
+            tess0, np.asarray(fit["resid_tess"], dtype=float)
+        )
+        state["pol_final_resid"] = _copy_with_values(
+            pol0,
+            np.asarray(
+                fit["resid_q"] if channel == "q" else fit["resid_u"],
+                dtype=float,
+            ),
+        )
+        state["Pte_end"] = lomb_scargle_power(
+            state["tess_final_resid"], state["freqs"]
+        )
+        state["Ppo_end"] = nuisance_periodogram(
+            state["pol_final_resid"],
+            state["freqs"],
+            baseline_matrix=make_pol_baseline_matrix(
+                state["pol_final_resid"], trend_cfg
+            ),
+        )
+        table.to_csv(Path(state["outdir"]) / "peaks_table.csv", index=False)
+        start_smoothed, _ = smooth_polarimetry_periodogram(
+            state["freqs"],
+            state["Ppo_start"],
+            max(compute_T_full(pol0), 1e-8),
+        )
+        end_smoothed, _ = smooth_polarimetry_periodogram(
+            state["freqs"],
+            state["Ppo_end"],
+            max(compute_T_full(pol0), 1e-8),
+        )
+        pd.DataFrame(
+            {
+                "frequency_cpd": state["freqs"],
+                "power_start_raw": state["Ppo_start"],
+                "power_start_smoothed": start_smoothed,
+                "power_end_raw": state["Ppo_end"],
+                "power_end_smoothed": end_smoothed,
+            }
+        ).to_csv(
+            Path(state["outdir"]) / "polarimetry_periodogram_diagnostic.csv",
+            index=False,
+        )
+        _plot_joint_quadrature_outputs(
+            state, table, fit, channel, show_plots_inline
+        )
+    return states, combined_table
+
 
 def _run_joint_analysis_impl(channels: list[str] | tuple[str, ...]) -> dict[str, pd.DataFrame]:
     """Load configured inputs and run the joint search for selected channels.
@@ -1624,6 +2388,23 @@ def _run_joint_analysis_impl(channels: list[str] | tuple[str, ...]) -> dict[str,
         "| width =",
         POL_SMOOTH_WIDTH_RES_ELEMS,
         "resolution elements",
+    )
+    print(
+        "TESS spectrum background =",
+        SHOW_TESS_SPECTRUM_BACKGROUND,
+        "| scale =",
+        TESS_SPECTRUM_BACKGROUND_SCALE,
+    )
+    print(
+        "q/u phase relation =",
+        QU_PHASE_MODE,
+        "| phase reference =",
+        PHASE_ZERO_MODE,
+        (
+            f"(BTJD {PHASE_ZERO_BTJD})"
+            if str(PHASE_ZERO_MODE).strip().lower() == "custom_btjd"
+            else ""
+        ),
     )
     if str(TESS_INPUT_MODE).lower() == "pipeline_dir":
         print("TESS_PIPELINE_DIR =", TESS_PIPELINE_DIR, "| flux =", TESS_PIPELINE_FLUX, "| pattern =", TESS_PIPELINE_PATTERN)
@@ -1667,7 +2448,7 @@ def _run_joint_analysis_impl(channels: list[str] | tuple[str, ...]) -> dict[str,
     print("TOP_N_RAW_TESS_CANDIDATES =", TOP_N_RAW_TESS_CANDIDATES)
     print("TESS:", len(tess_dt.t), "Tfull=", compute_T_full(tess_dt), "weight=", estimate_dataset_weight(tess_dt, mode=JOINT_WEIGHT_MODE, scale_free_basis=SCALE_FREE_WEIGHT_BASIS))
 
-    results: dict[str, pd.DataFrame] = {}
+    states: dict[str, dict] = {}
     for k in selected:
         if k not in pol_dt:
             print(f"Skipping unavailable polarimetry channel {k!r}.")
@@ -1677,13 +2458,32 @@ def _run_joint_analysis_impl(channels: list[str] | tuple[str, ...]) -> dict[str,
         print(ts.name, "N=", len(ts.t), "Tfull=", compute_T_full(ts), "weight=", estimate_dataset_weight(ts, mode=JOINT_WEIGHT_MODE, scale_free_basis=SCALE_FREE_WEIGHT_BASIS), "night groups=", ngrp)
         outdir = OUTROOT / k
         print("\n=== RUN:", k, "->", outdir, "===")
-        results[k] = run_joint_extraction_one(
+        states[k] = run_joint_extraction_one(
             tess_dt,
             ts,
             outdir=outdir,
             pol_trend_cfg=trend_cfg,
             show_plots_inline=SHOW_PLOTS_INLINE,
+            return_state=True,
         )
+    states, quadrature_table = apply_joint_quadrature_refit(
+        states,
+        trend_cfg,
+        SHOW_PLOTS_INLINE,
+    )
+    if not quadrature_table.empty:
+        quadrature_outdir = OUTROOT / "qu"
+        quadrature_outdir.mkdir(parents=True, exist_ok=True)
+        quadrature_table.to_csv(
+            quadrature_outdir / "quadrature_peaks_table.csv", index=False
+        )
+        print(
+            "[q/u quadrature] wrote",
+            quadrature_outdir / "quadrature_peaks_table.csv",
+        )
+    results = {channel: state["result"] for channel, state in states.items()}
+    if not quadrature_table.empty:
+        results["qu_quadrature"] = quadrature_table
     return results
 
 
