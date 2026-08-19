@@ -27,12 +27,35 @@ from PIL import Image, ImageTk
 
 
 APP_TITLE = "TESS Photometry Pipeline GUI"
-SETTINGS_SCHEMA_VERSION = 2
+SETTINGS_SCHEMA_VERSION = 3
 BASIC_PRESET_VERSION = 1
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_ORBITAL_TABLE = str(SCRIPT_DIR / "tess_sector_orbfreq_midpoints.csv")
 STANDARD_APPROACH = "Standard aperture extraction"
-SATURATED_APPROACH = "Saturation-optimized aperture extraction"
+SATURATED_APPROACH = "Saturated aperture extraction (RAW_CNTS preferred)"
+PREVIOUS_SATURATED_APPROACH = "RAW_CNTS saturated aperture extraction"
+LEGACY_SATURATED_APPROACH = "Saturation-optimized aperture extraction"
+SATURATED_SUCCESS_PLOT_CAPABILITY = "SATURATED_SUCCESS_PLOT_STYLE_V2"
+
+
+def latest_companion_script(filename: str) -> Path:
+    """Return the newest matching companion script beside this GUI.
+
+    ChatGPT/Library downloads commonly append a timestamp in parentheses to a
+    filename.  The old GUI required the exact un-timestamped name, which could
+    silently select an older copy left in the same directory.
+    """
+    requested = Path(filename)
+    candidates = [
+        path for path in SCRIPT_DIR.glob(f"{requested.stem}*.py")
+        if path.is_file()
+    ]
+    if not candidates:
+        return SCRIPT_DIR / filename
+    return max(candidates, key=lambda path: (path.stat().st_mtime_ns, path.name))
+
+
+DEFAULT_EXTRACTOR_SCRIPT = latest_companion_script("tess_watershed_extractor.py")
+DEFAULT_DETRENDER_SCRIPT = latest_companion_script("tess_lightcurve_detrend.py")
 
 
 def default_tessvectors_cache() -> str:
@@ -54,8 +77,8 @@ DEFAULT_TESSVECTORS_CACHE = default_tessvectors_cache()
 # to Basic mode.  Keeping the preset explicit prevents hidden custom values
 # from silently affecting a run after their controls disappear.
 EXPERT_DEFAULTS = {
-    "extractor_script": str(SCRIPT_DIR / "tess_watershed_extractor.py"),
-    "detrender_script": str(SCRIPT_DIR / "tess_lightcurve_detrend.py"),
+    "extractor_script": str(DEFAULT_EXTRACTOR_SCRIPT),
+    "detrender_script": str(DEFAULT_DETRENDER_SCRIPT),
     "ex_gaia_radius": 6.0,
     "ex_no_gaia": False,
     "ex_gaia_fallback": False,
@@ -65,7 +88,6 @@ EXPERT_DEFAULTS = {
     "ex_save_pickled_figures": False,
     "ex_saturated_systematics": False,
     "ex_external_mask_file": "",
-    "ex_orbtable": DEFAULT_ORBITAL_TABLE,
     "ex_aperture_fom": "stddiff",
     "ex_simple_aperture_mode": "auto",
     "ex_min_pixels": 10,
@@ -81,8 +103,6 @@ EXPERT_DEFAULTS = {
     "ex_sat_thresh": 1e5,
     "ex_sat_min_npix": 20,
     "ex_back_nfaint": 20,
-    "ex_phase_bin": 0.01,
-    "ex_saturated_aperture_threshold": 3000.0,
     "ex_prf_backend": "auto",
     "ex_prf_motion_source": "auto",
     "ex_prf_neighbor_treatment": "fixed",
@@ -118,9 +138,6 @@ EXPERT_DEFAULTS = {
     "dt_clip_residuals_sigma": 5.0,
     "dt_clip_residuals_iters": 1,
     "dt_save_pickled_figures": False,
-    "dt_apply_orbital_phase_template": False,
-    "dt_orbtable": DEFAULT_ORBITAL_TABLE,
-    "dt_phase_bin": 0.01,
     "dt_quaternion_source": "",
     "dt_quaternion_auto_download": True,
     "dt_tessvectors_cache_dir": DEFAULT_TESSVECTORS_CACHE,
@@ -248,10 +265,14 @@ Full-region sum
   Use the entire watershed-owned region for the selected target and sum all
   those pixels, instead of optimizing the aperture with jump/core growth.
 
-Saturation-optimized aperture extraction
+Saturated aperture extraction (RAW_CNTS preferred)
   --saturation-optimized-aperture
-  A single-target approach for heavily saturated sources. It bypasses Gaia
-  and jump/core growth and chooses an aperture by high-frequency scatter.
+  A single-target approach for heavily saturated sources. It uses the
+  target-connected RAW_CNTS bleed geometry when available. A TESSCut product
+  with null or constant RAW_CNTS uses calibrated FLUX for geometry instead.
+  The method bypasses Gaia, jump/core growth, and PRF photometry. If saturated
+  charge reaches a stamp boundary, the extractor saves a diagnostic and
+  failure record but no light curve.
 
 Advanced: Jump / core shared
   Min pixels
@@ -307,20 +328,6 @@ Advanced: Saturated-target processing
   Back nfaint
     --back-nfaint
     Number of faintest pixels used for per-cadence background estimation.
-
-  Phase bin
-    --phase-bin
-    Phase bin width used in the orbital-phase template step.
-
-  Initial saturated-aperture threshold
-    --saturated-aperture-threshold
-    Initial mean-image threshold for saturation-optimized aperture growth.
-
-  Orbital table CSV
-    --orbtable
-    The bundled tess_sector_orbfreq_midpoints.csv is selected by default.
-    Its preferred headings are sector, mid_btjd, and freq_cyc_per_day. Browse
-    to a replacement only when using a separately maintained table.
 
 Advanced: Fixed external aperture
   External mask file
@@ -503,8 +510,9 @@ Automatic TESSVectors download / cache
 Quaternion camera
   --quaternion-camera
   Select camera 1-4, or auto. Auto uses a camera column in the light-curve file
-  or source table when possible. Choose the camera explicitly if the source
-  contains multiple cameras and it cannot be inferred.
+  or source table when possible. For extractor products it can also use the
+  recorded TPF name/path and, for older CSVs, inspect a nearby source TPF.
+  Choose the camera explicitly only if those routes remain ambiguous.
 
 Quaternion time offset
   --quaternion-time-offset-days
@@ -558,8 +566,7 @@ TOOLTIPS = {
 "ex_gaia_region_sum": "For Gaia-defined targets, sum the full Gaia-owned watershed region for each target without aperture growth.",
 "ex_external_mask_file": "Fixed aperture for a single target. Use one local image row per text line with comma- or whitespace-separated 1/0 or Y/N values. The shape must exactly match the TPF; row 0 and column 0 come first.",
 "ex_aperture_fom": "Figure of merit used during watershed aperture growth.",
-    "ex_saturated_systematics": "Apply background, TESS orbital-phase, and split-sector corrections for a heavily saturated target.",
-    "ex_orbtable": "TESS sector midpoint/orbital-frequency CSV. The bundled table is selected by default; browse here only to use a replacement table.",
+    "ex_saturated_systematics": "Apply robust background and centroid regression to a heavily saturated target without fitting a time-dependent template.",
 "ex_save_pickled_figures": "Also save pickled Matplotlib figures alongside PNGs.",
 "ex_simple_aperture_mode": "Aperture mode used when running the simple extractor.",
     "ex_prf_photometry": "Write an additional cadence-dependent TESS PRF-weighted light curve. Kepler/K2 files are detected and skipped with a warning; aperture products are still generated.",
@@ -580,7 +587,7 @@ TOOLTIPS = {
     "ex_prf_save_diagnostics": "Save a PRF/image overlay, motion curves, extracted light curve, residual image, metadata JSON, and motion NPZ.",
     "ex_prf_allow_gaussian_fallback": "Allow a warned Gaussian approximation if neither lkprf nor TESS_PRF is installed or usable.",
     "ex_save_aperture_plots": "Save aperture-overlay PNGs. If unchecked, --no-aperture-plots is added.",
-    "ex_extraction_approach": "Choose standard watershed aperture extraction or the single-target saturation-optimized aperture approach.",
+    "ex_extraction_approach": "Choose standard watershed extraction or the single-target saturated aperture. RAW_CNTS is preferred; TESSCut products fall back to calibrated FLUX geometry only when RAW_CNTS is unusable. The saturated mode rejects a stamp when target charge reaches an axial boundary.",
     "ex_min_pixels": "Minimum aperture size before growth is allowed to stop just because the metric no longer improves.",
     "ex_amp_q_lo": "Lower percentile used in the aperture-amplitude sanity check.",
     "ex_amp_q_hi": "Upper percentile used in the aperture-amplitude sanity check.",
@@ -594,8 +601,6 @@ TOOLTIPS = {
     "ex_sat_thresh": "Threshold used to decide whether the target is heavily saturated.",
     "ex_sat_min_npix": "Minimum number of pixels above sat-thresh to count as heavily saturated.",
     "ex_back_nfaint": "Number of faintest pixels used for per-cadence background estimation.",
-    "ex_phase_bin": "Phase-bin width used in the orbital-phase template step.",
-    "ex_saturated_aperture_threshold": "Initial mean-image threshold for the saturation-optimized aperture seed.",
     "ex_command_preview": "The exact extractor command the GUI will run.",
     "dt_lightcurve_dir": "Directory containing input CSV light curves.",
     "dt_diagnostics_dir": "Directory containing centroid/background NPY files and related diagnostics.",
@@ -606,7 +611,7 @@ TOOLTIPS = {
     "dt_skip_existing": "Skip an input light curve if the filename-based detrended output CSV already exists. Existing combined CSV outputs are also left untouched.",
     "dt_use_background": "Include the saved background series as a regression term when decorrelating.",
     "dt_use_pchip": "Apply a smooth PCHIP high-pass step after position/background decorrelation.",
-    "dt_skip_xybg": "Skip centroid/background regression while retaining optional orbital, PCHIP, and sector-combination steps.",
+    "dt_skip_xybg": "Skip centroid/background regression while retaining optional PCHIP and sector-combination steps.",
     "dt_combine_sectors": "Write combined multi-sector CSV and PNG products.",
     "dt_knot_spacing": "Spacing for optional time-basis hinge functions used in decorrelation. Use inf to disable them.",
     "dt_robust_iters": "Number of robust weighted least-squares iterations.",
@@ -622,14 +627,11 @@ TOOLTIPS = {
     "dt_clip_residuals_sigma": "Sigma threshold used for clipping residuals before detrending.",
     "dt_clip_residuals_iters": "Number of sigma-clipping iterations used on the residuals before detrending.",
     "dt_save_pickled_figures": "Save pickled Matplotlib figure objects alongside PNGs so the plots can be reopened later for zooming and inspection.",
-    "dt_apply_orbital_phase_template": "Apply a TESS orbital-phase template correction using the sector orbital-frequency table.",
-    "dt_orbtable": "TESS sector midpoint/orbital-frequency CSV used during detrending. The bundled table is selected by default.",
-    "dt_phase_bin": "Phase bin width used when building the orbital phase-template correction.",
     "dt_use_quaternion_regression": "Add QLP-style camera-quaternion regressors to remove short-timescale pointing systematics. Pre-model PCHIP is selected by default when this is first enabled, but may then be unchecked.",
     "dt_quaternion_source": "Optional explicit raw quaternion FITS/CSV, TESSVectors CSV, or directory. Leave blank to use automatic TESSVectors downloading.",
     "dt_quaternion_auto_download": "Automatically download only the missing sector/camera/cadence TESSVectors file and reuse it from the local cache on later runs.",
     "dt_tessvectors_cache_dir": "Local cache root for automatically downloaded TESSVectors files. Files are organized by 020_Cadence, 120_Cadence, and FFI_Cadence.",
-    "dt_quaternion_camera": "TESS camera used for quaternion regressors. Auto infers it from metadata when possible; select 1-4 when automatic downloading cannot infer it.",
+    "dt_quaternion_camera": "TESS camera used for quaternion regressors. Auto checks CSV metadata, the recorded TPF name/path, and a nearby source TPF; select 1-4 only if those routes cannot infer it.",
     "dt_quaternion_min_samples": "Minimum number of raw 2-second quaternion samples required within each light-curve cadence.",
     "dt_quaternion_clip_sigma": "Sigma threshold for iterative QLP-style outlier rejection during the quaternion regression.",
     "dt_quaternion_clip_iters": "Maximum number of QLP-style sigma-clipping iterations.",
@@ -651,6 +653,18 @@ def quote_cmd(cmd: list[str]) -> str:
     if os.name == "nt":
         return subprocess.list2cmdline([str(x) for x in cmd])
     return shlex.join([str(x) for x in cmd])
+
+
+def saturated_clipping_messages(process_output: str) -> list[str]:
+    """Extract unique, user-facing clipped-bleed explanations from a run log."""
+    messages = []
+    for line in str(process_output).splitlines():
+        text = line.strip()
+        if "Saturated bleed is clipped at" not in text:
+            continue
+        if text not in messages:
+            messages.append(text)
+    return messages
 
 
 class ToolTip:
@@ -765,10 +779,11 @@ class TESSGui(tk.Tk):
 
         # Queue items carry the originating process so a delayed completion
         # event can never clear the state of a newer job.
-        self.log_queue: queue.Queue[tuple[str, object, str]] = queue.Queue()
+        self.log_queue: queue.Queue[tuple[str, object, object]] = queue.Queue()
         self.current_process: subprocess.Popen | None = None
         self.current_job_name: str | None = None
         self.current_output_dir: Path | None = None
+        self.current_job_output: list[str] = []
         self.preview_image = None
 
         self._build_vars()
@@ -825,27 +840,29 @@ class TESSGui(tk.Tk):
         aliases = {
             "ex_pure_sum": "ex_full_region_sum",
             "ex_matlab_sat_mode": "ex_saturated_systematics",
-            "ex_matlab_ap_thresh": "ex_saturated_aperture_threshold",
         }
         for old, new in aliases.items():
             if new not in migrated and old in migrated:
                 migrated[new] = migrated[old]
 
-        # Older releases saved the bundled orbital table as a bare relative
-        # filename. Promote only that known default to the new script-relative
-        # absolute path; user-selected replacement paths remain untouched.
-        for key in ("ex_orbtable", "dt_orbtable"):
-            if str(migrated.get(key, "")).strip() == "tess_sector_orbfreq_midpoints.csv":
-                migrated[key] = DEFAULT_ORBITAL_TABLE
         if "ex_extraction_approach" not in migrated:
             old_saturated = bool(migrated.get("ex_matlab_pure_single_sat", False))
             migrated["ex_extraction_approach"] = (
                 SATURATED_APPROACH if old_saturated else STANDARD_APPROACH
             )
-        elif migrated["ex_extraction_approach"] in {"standard", "saturation_optimized"}:
+        elif migrated["ex_extraction_approach"] in {
+            "standard",
+            "saturation_optimized",
+            PREVIOUS_SATURATED_APPROACH,
+            LEGACY_SATURATED_APPROACH,
+        }:
             migrated["ex_extraction_approach"] = (
                 SATURATED_APPROACH
-                if migrated["ex_extraction_approach"] == "saturation_optimized"
+                if migrated["ex_extraction_approach"] in {
+                    "saturation_optimized",
+                    PREVIOUS_SATURATED_APPROACH,
+                    LEGACY_SATURATED_APPROACH,
+                }
                 else STANDARD_APPROACH
             )
 
@@ -939,8 +956,8 @@ class TESSGui(tk.Tk):
 
     def _build_vars(self):
         self.interface_mode = tk.StringVar(value="basic")
-        self.extractor_script = tk.StringVar(value=str(SCRIPT_DIR / "tess_watershed_extractor.py"))
-        self.detrender_script = tk.StringVar(value=str(SCRIPT_DIR / "tess_lightcurve_detrend.py"))
+        self.extractor_script = tk.StringVar(value=str(DEFAULT_EXTRACTOR_SCRIPT))
+        self.detrender_script = tk.StringVar(value=str(DEFAULT_DETRENDER_SCRIPT))
 
         self.ex_input_mode = tk.StringVar(value="directory")
         self.ex_tpf_dir = tk.StringVar(value=".")
@@ -962,7 +979,6 @@ class TESSGui(tk.Tk):
         self.ex_saturated_systematics = tk.BooleanVar(value=False)
         self.ex_extraction_approach = tk.StringVar(value=STANDARD_APPROACH)
         self.ex_external_mask_file = tk.StringVar(value="")
-        self.ex_orbtable = tk.StringVar(value=DEFAULT_ORBITAL_TABLE)
         self.ex_aperture_fom = tk.StringVar(value="stddiff")
         self.ex_simple_aperture_mode = tk.StringVar(value="auto")
 
@@ -1001,9 +1017,6 @@ class TESSGui(tk.Tk):
         self.ex_sat_thresh = tk.DoubleVar(value=1e5)
         self.ex_sat_min_npix = tk.IntVar(value=20)
         self.ex_back_nfaint = tk.IntVar(value=20)
-        self.ex_phase_bin = tk.DoubleVar(value=0.01)
-        self.ex_saturated_aperture_threshold = tk.DoubleVar(value=3000.0)
-
         self.ex_command_preview = tk.StringVar(value="")
 
         self.dt_lightcurve_dir = tk.StringVar(value="LC_products_multi")
@@ -1033,9 +1046,6 @@ class TESSGui(tk.Tk):
         self.dt_clip_residuals_sigma = tk.DoubleVar(value=5.0)
         self.dt_clip_residuals_iters = tk.IntVar(value=1)
         self.dt_save_pickled_figures = tk.BooleanVar(value=False)
-        self.dt_apply_orbital_phase_template = tk.BooleanVar(value=False)
-        self.dt_orbtable = tk.StringVar(value=DEFAULT_ORBITAL_TABLE)
-        self.dt_phase_bin = tk.DoubleVar(value=0.01)
 
         self.dt_use_quaternion_regression = tk.BooleanVar(value=False)
         self.dt_quaternion_source = tk.StringVar(value="")
@@ -1270,7 +1280,12 @@ class TESSGui(tk.Tk):
         )
         ttk.Label(
             self.ex_basic_settings_frame,
-            text="Saturation-optimized extraction is a single-target approach and does not run Gaia, jump/core, or PRF photometry.",
+            text=(
+                "Saturated extraction is a single-target approach and does not run Gaia, "
+                "jump/core, or PRF photometry. RAW_CNTS is preferred; a TESSCut product "
+                "uses calibrated FLUX geometry only when RAW_CNTS is unusable. If the bleed "
+                "trail leaves the stamp, it saves a diagnostic and no light curve."
+            ),
             wraplength=980,
         ).grid(row=2, column=0, columnspan=4, sticky="w", padx=6, pady=(2, 6))
         self.ex_basic_warning_label = ttk.Label(
@@ -1301,7 +1316,7 @@ class TESSGui(tk.Tk):
                         tooltip_key="ex_save_pickled_figures", row=2, column=3, sticky="w", padx=6, pady=4)
         self._make_checkbutton(
             main_frame,
-            text="Saturated-target systematics correction",
+            text="Saturated background + motion correction",
             variable=self.ex_saturated_systematics,
             command=self._update_extractor_state,
             tooltip_key="ex_saturated_systematics",
@@ -1354,9 +1369,6 @@ class TESSGui(tk.Tk):
         self._entry(saturated, "Saturation threshold", self.ex_sat_thresh, 0, 0, tooltip_key="ex_sat_thresh")
         self._spin(saturated, "Minimum saturated pixels", self.ex_sat_min_npix, 1, 10000, 0, 2, tooltip_key="ex_sat_min_npix")
         self._spin(saturated, "Faint background pixels", self.ex_back_nfaint, 1, 1000, 1, 0, tooltip_key="ex_back_nfaint")
-        self._entry(saturated, "Orbital phase bin", self.ex_phase_bin, 1, 2, tooltip_key="ex_phase_bin")
-        self._entry(saturated, "Initial saturated-aperture threshold", self.ex_saturated_aperture_threshold, 2, 0, tooltip_key="ex_saturated_aperture_threshold")
-        self._entry(saturated, "Orbital table CSV", self.ex_orbtable, 3, 0, browse="file", tooltip_key="ex_orbtable")
 
         extras = ttk.LabelFrame(adv, text="Additional extractor options")
         extras.grid(row=3, column=0, columnspan=4, sticky="ew", padx=6, pady=6)
@@ -1581,10 +1593,6 @@ class TESSGui(tk.Tk):
         self._entry(opts, "Residual clip sigma", self.dt_clip_residuals_sigma, 6, 2, tooltip_key="dt_clip_residuals_sigma")
         self._spin(opts, "Residual clip iters", self.dt_clip_residuals_iters, 1, 99, 7, 0, tooltip_key="dt_clip_residuals_iters")
         self._make_checkbutton(opts, text="Save pickled figures", variable=self.dt_save_pickled_figures, command=self._update_detrender_command_preview, tooltip_key="dt_save_pickled_figures", row=7, column=2, sticky="w", padx=6, pady=4)
-        self._make_checkbutton(opts, text="Apply orbital phase template", variable=self.dt_apply_orbital_phase_template, command=self._update_detrender_command_preview, tooltip_key="dt_apply_orbital_phase_template", row=8, column=0, sticky="w", padx=6, pady=4)
-        self._entry(opts, "Orbtable CSV", self.dt_orbtable, 8, 2, browse="file", tooltip_key="dt_orbtable")
-        self._entry(opts, "Orbital phase bin", self.dt_phase_bin, 9, 0, tooltip_key="dt_phase_bin")
-
         quat = ttk.LabelFrame(root, text="Expert quaternion controls")
         self.dt_expert_quaternion_frame = quat
         quat.grid(row=4, column=0, sticky="ew", padx=8, pady=6)
@@ -1910,9 +1918,9 @@ class TESSGui(tk.Tk):
             self.ex_min_pixels, self.ex_amp_q_lo, self.ex_amp_q_hi, self.ex_amp_min_frac,
             self.ex_max_radius_pix, self.ex_max_components, self.ex_min_seed_frac,
             self.ex_min_new_pixels, self.ex_core_npix, self.ex_core_min_frac,
-            self.ex_sat_thresh, self.ex_sat_min_npix, self.ex_back_nfaint, self.ex_phase_bin,
-            self.ex_saturated_aperture_threshold, self.ex_external_mask_file,
-            self.ex_orbtable, self.ex_aperture_fom, self.ex_simple_aperture_mode,
+            self.ex_sat_thresh, self.ex_sat_min_npix, self.ex_back_nfaint,
+            self.ex_external_mask_file,
+            self.ex_aperture_fom, self.ex_simple_aperture_mode,
             self.ex_prf_photometry, self.ex_prf_backend, self.ex_prf_motion_source,
             self.ex_prf_scene_mode, self.ex_prf_neighbor_treatment, self.ex_prf_source_output,
             self.ex_prf_neighbor_dmag, self.ex_prf_neighbor_margin,
@@ -1930,7 +1938,7 @@ class TESSGui(tk.Tk):
             self.dt_output_dir, self.dt_pattern, self.dt_recursive, self.dt_prefix,
             self.dt_skip_existing, self.dt_use_background, self.dt_use_pchip, self.dt_skip_xybg,
             self.dt_combine_sectors, self.dt_knot_spacing, self.dt_robust_iters,
-            self.dt_huber_k, self.dt_pchip_knot_spacing, self.dt_pre_model_pchip, self.dt_pre_model_bin_days, self.dt_pre_model_stat, self.dt_pre_model_min_points, self.dt_pre_model_sigma_clip, self.dt_pre_model_sigma_iters, self.dt_clip_residuals_before_detrend, self.dt_clip_residuals_sigma, self.dt_clip_residuals_iters, self.dt_save_pickled_figures, self.dt_apply_orbital_phase_template, self.dt_orbtable, self.dt_phase_bin,
+            self.dt_huber_k, self.dt_pchip_knot_spacing, self.dt_pre_model_pchip, self.dt_pre_model_bin_days, self.dt_pre_model_stat, self.dt_pre_model_min_points, self.dt_pre_model_sigma_clip, self.dt_pre_model_sigma_iters, self.dt_clip_residuals_before_detrend, self.dt_clip_residuals_sigma, self.dt_clip_residuals_iters, self.dt_save_pickled_figures,
             self.dt_use_quaternion_regression, self.dt_quaternion_source,
             self.dt_quaternion_auto_download, self.dt_tessvectors_cache_dir,
             self.dt_quaternion_camera, self.dt_quaternion_min_samples, self.dt_quaternion_clip_sigma,
@@ -1972,16 +1980,12 @@ class TESSGui(tk.Tk):
         warning = []
         if self.ex_no_gaia.get() and self.ex_n_targets.get() != 1:
             warning.append("No-Gaia mode requires n-targets = 1.")
-        if self.ex_saturated_systematics.get() and not self.ex_orbtable.get().strip():
-            warning.append("Saturated-target systematics correction requires an orbital table.")
-        if self.ex_saturated_systematics.get() and saturation_optimized:
-            warning.append("Saturation-optimized extraction bypasses the separate saturated-target correction.")
         if self.ex_full_region_sum.get() and saturation_optimized:
-            warning.append("Saturation-optimized extraction bypasses the full-region sum setting.")
+            warning.append("Saturated extraction bypasses the full-region sum setting.")
         if self.ex_gaia_region_sum.get() and saturation_optimized:
-            warning.append("Saturation-optimized extraction bypasses the Gaia-region sum setting.")
+            warning.append("Saturated extraction bypasses the Gaia-region sum setting.")
         if self.ex_external_mask_file.get().strip() and saturation_optimized:
-            warning.append("Saturation-optimized extraction bypasses the external aperture mask.")
+            warning.append("Saturated extraction bypasses the external aperture mask.")
         if external_mask_selected and self.ex_full_region_sum.get():
             warning.append("External aperture mask and full-region sum are alternative aperture definitions; select only one.")
         if external_mask_selected and self.ex_gaia_region_sum.get():
@@ -2065,16 +2069,15 @@ class TESSGui(tk.Tk):
         approach = self.ex_extraction_approach.get()
         if approach not in {STANDARD_APPROACH, SATURATED_APPROACH}:
             raise ValueError(f"Unknown extraction approach: {approach!r}")
+        saturation_optimized = approach == SATURATED_APPROACH
         if int(self.ex_n_targets.get()) < 1:
             raise ValueError("N targets must be at least 1.")
-        if approach == SATURATED_APPROACH and int(self.ex_n_targets.get()) != 1:
-            raise ValueError("Saturation-optimized aperture extraction requires exactly one target.")
+        if saturation_optimized and int(self.ex_n_targets.get()) != 1:
+            raise ValueError("Saturated aperture extraction requires exactly one target.")
         if self.ex_no_gaia.get() and int(self.ex_n_targets.get()) != 1:
             raise ValueError("No-Gaia extraction requires exactly one target.")
-        if self.ex_saturated_systematics.get() and not self.ex_orbtable.get().strip():
-            raise ValueError("Saturated-target systematics correction requires an orbital table.")
         external_mask = self.ex_external_mask_file.get().strip()
-        if external_mask:
+        if external_mask and not saturation_optimized:
             if int(self.ex_n_targets.get()) != 1:
                 raise ValueError("External aperture masks require exactly one target.")
             if not Path(external_mask).expanduser().is_file():
@@ -2083,14 +2086,11 @@ class TESSGui(tk.Tk):
                 raise ValueError(
                     "External aperture mask cannot be combined with full-region or Gaia-region summation."
                 )
-        if self.ex_saturated_systematics.get():
-            orbital_table = self.ex_orbtable.get().strip()
-            if not Path(orbital_table).expanduser().is_file():
-                raise ValueError(f"Orbital table file not found: {orbital_table}")
-        q_lo = float(self.ex_amp_q_lo.get())
-        q_hi = float(self.ex_amp_q_hi.get())
-        if not (0.0 <= q_lo < q_hi <= 100.0):
-            raise ValueError("Amplitude percentiles must satisfy 0 <= low < high <= 100.")
+        if not saturation_optimized:
+            q_lo = float(self.ex_amp_q_lo.get())
+            q_hi = float(self.ex_amp_q_hi.get())
+            if not (0.0 <= q_lo < q_hi <= 100.0):
+                raise ValueError("Amplitude percentiles must satisfy 0 <= low < high <= 100.")
 
     def _validate_detrender_values(self) -> None:
         """Validate GUI values before constructing a detrender command."""
@@ -2100,12 +2100,6 @@ class TESSGui(tk.Tk):
             raise ValueError("PCHIP knot spacing must be positive.")
         if self.dt_pre_model_pchip.get() and float(self.dt_pre_model_bin_days.get()) <= 0:
             raise ValueError("Pre-model PCHIP bin size must be positive.")
-        if self.dt_apply_orbital_phase_template.get():
-            orbital_table = self.dt_orbtable.get().strip()
-            if not orbital_table:
-                raise ValueError("Orbital phase-template correction requires an orbital table.")
-            if not Path(orbital_table).expanduser().is_file():
-                raise ValueError(f"Orbital table file not found: {orbital_table}")
 
     def _append_prf_extractor_args(self, cmd: list[str]) -> None:
         if not self.ex_prf_photometry.get():
@@ -2135,15 +2129,36 @@ class TESSGui(tk.Tk):
         script = self.extractor_script.get().strip()
         if not script:
             raise ValueError("Extractor script path is empty.")
+        script_path = Path(script).expanduser()
+        if not script_path.is_file():
+            raise ValueError(f"Extractor script not found: {script_path}")
         cmd = [sys.executable, "-u", script]
         script_name = Path(script).name.lower()
         is_simple = ("simple" in script_name) and ("watershed" not in script_name)
         saturation_optimized = self.ex_extraction_approach.get() == SATURATED_APPROACH
 
+        if saturation_optimized:
+            try:
+                extractor_source = script_path.read_text(encoding="utf-8", errors="replace")
+            except OSError as exc:
+                raise ValueError(f"Could not inspect extractor script {script_path}: {exc}") from exc
+            if SATURATED_SUCCESS_PLOT_CAPABILITY not in extractor_source:
+                newer = DEFAULT_EXTRACTOR_SCRIPT
+                hint = ""
+                if newer.is_file() and newer.resolve() != script_path.resolve():
+                    hint = f"\n\nNewest matching extractor beside this GUI:\n{newer}"
+                raise ValueError(
+                    "The selected extractor is an older build and does not contain the "
+                    "publication-style successful saturated-aperture diagnostic.\n\n"
+                    f"Selected extractor:\n{script_path}{hint}\n\n"
+                    "Select the updated tess_watershed_extractor*.py in Expert mode, "
+                    "or place/rename it as tess_watershed_extractor.py beside this GUI."
+                )
+
         if is_simple:
             if self.ex_extraction_approach.get() == SATURATED_APPROACH:
                 raise ValueError(
-                    "Saturation-optimized aperture extraction is available in "
+                    "Saturated aperture extraction is available in "
                     "tess_watershed_extractor.py, not the simple extractor."
                 )
             if self.ex_input_mode.get() == "directory":
@@ -2201,30 +2216,26 @@ class TESSGui(tk.Tk):
             cmd.append("--no-aperture-plots")
         if self.ex_save_pickled_figures.get():
             cmd.append("--save-figure-pickles")
-        if self.ex_saturated_systematics.get() and not saturation_optimized:
+        if self.ex_saturated_systematics.get():
             cmd.append("--saturated-systematics-correction")
-            if self.ex_orbtable.get().strip():
-                cmd += ["--orbtable", self.ex_orbtable.get().strip()]
         if saturation_optimized:
             cmd.append("--saturation-optimized-aperture")
 
-        cmd += ["--min-pixels", str(int(self.ex_min_pixels.get()))]
-        cmd += ["--amp-q-lo", str(float(self.ex_amp_q_lo.get()))]
-        cmd += ["--amp-q-hi", str(float(self.ex_amp_q_hi.get()))]
-        cmd += ["--amp-min-frac", str(float(self.ex_amp_min_frac.get()))]
-        cmd += ["--aperture-fom", self.ex_aperture_fom.get().strip() or "stddiff"]
-        cmd += ["--max-radius-pix", str(self.ex_max_radius_pix.get()).strip() or "inf"]
-        cmd += ["--max-components", str(int(self.ex_max_components.get()))]
-        cmd += ["--min-seed-frac-of-peak", str(float(self.ex_min_seed_frac.get()))]
-        cmd += ["--min-new-pixels-per-component", str(int(self.ex_min_new_pixels.get()))]
-        cmd += ["--core-npix", str(int(self.ex_core_npix.get()))]
-        cmd += ["--core-min-frac-of-peak", str(float(self.ex_core_min_frac.get()))]
         cmd += ["--sat-thresh", str(float(self.ex_sat_thresh.get()))]
         cmd += ["--sat-min-npix", str(int(self.ex_sat_min_npix.get()))]
         cmd += ["--back-nfaint", str(int(self.ex_back_nfaint.get()))]
-        cmd += ["--phase-bin", str(float(self.ex_phase_bin.get()))]
-        cmd += ["--saturated-aperture-threshold", str(float(self.ex_saturated_aperture_threshold.get()))]
         if not saturation_optimized:
+            cmd += ["--min-pixels", str(int(self.ex_min_pixels.get()))]
+            cmd += ["--amp-q-lo", str(float(self.ex_amp_q_lo.get()))]
+            cmd += ["--amp-q-hi", str(float(self.ex_amp_q_hi.get()))]
+            cmd += ["--amp-min-frac", str(float(self.ex_amp_min_frac.get()))]
+            cmd += ["--aperture-fom", self.ex_aperture_fom.get().strip() or "stddiff"]
+            cmd += ["--max-radius-pix", str(self.ex_max_radius_pix.get()).strip() or "inf"]
+            cmd += ["--max-components", str(int(self.ex_max_components.get()))]
+            cmd += ["--min-seed-frac-of-peak", str(float(self.ex_min_seed_frac.get()))]
+            cmd += ["--min-new-pixels-per-component", str(int(self.ex_min_new_pixels.get()))]
+            cmd += ["--core-npix", str(int(self.ex_core_npix.get()))]
+            cmd += ["--core-min-frac-of-peak", str(float(self.ex_core_min_frac.get()))]
             self._append_prf_extractor_args(cmd)
         return cmd
 
@@ -2268,11 +2279,6 @@ class TESSGui(tk.Tk):
         cmd += ["--clip-residuals-iters", str(int(self.dt_clip_residuals_iters.get()))]
         if self.dt_save_pickled_figures.get():
             cmd.append("--save-figure-pickles")
-        if self.dt_apply_orbital_phase_template.get():
-            cmd.append("--apply-orbital-phase-template")
-            if self.dt_orbtable.get().strip():
-                cmd += ["--orbtable", self.dt_orbtable.get().strip()]
-            cmd += ["--phase-bin", str(float(self.dt_phase_bin.get()))]
         if self.dt_use_quaternion_regression.get():
             source = self.dt_quaternion_source.get().strip()
             auto_download = bool(self.dt_quaternion_auto_download.get())
@@ -2330,8 +2336,41 @@ class TESSGui(tk.Tk):
     def _clear_current_process_state(self, status: str = "Ready."):
         self.current_process = None
         self.current_job_name = None
-
         self.status_text.set(status)
+
+    def _handle_process_completion(self, job_name: str, returncode: int, output: str) -> str:
+        """Translate extractor status into a clear GUI result."""
+        clipped_messages = (
+            saturated_clipping_messages(output) if job_name == "Extractor" else []
+        )
+        skipped_markers = str(output).count("[SKIPPED] SATURATED_BLEED_CLIPPED")
+        clipped_count = max(len(clipped_messages), skipped_markers)
+
+        if clipped_count:
+            plural = "target was" if clipped_count == 1 else "targets were"
+            details = "\n\n".join(clipped_messages[:8])
+            if clipped_count > len(clipped_messages[:8]):
+                details += f"\n\n...and {clipped_count - len(clipped_messages[:8])} more."
+            message = (
+                f"{clipped_count} saturated {plural} skipped because the bleed trail "
+                "continues beyond the available pixel stamp. No normal light curve was "
+                "written for the skipped target(s).\n\n"
+            )
+            if details:
+                message += details + "\n\n"
+            message += (
+                f"Diagnostic PNG and failure CSV files were saved in:\n"
+                f"{self.current_output_dir or Path('.')}\n\n"
+                "Use a larger cutout or an FFI-based extraction."
+            )
+            messagebox.showwarning("Saturated bleed clipped", message)
+            if returncode == 0:
+                return f"Extractor completed; {clipped_count} clipped saturated target(s) skipped."
+            return f"Extractor stopped cleanly; {clipped_count} clipped saturated target(s) skipped."
+
+        if returncode == 0:
+            return f"{job_name} completed."
+        return f"{job_name} finished with exit code {returncode}. See the run log."
 
     def _reap_stale_process_if_needed(self) -> bool:
         proc = self.current_process
@@ -2398,6 +2437,7 @@ class TESSGui(tk.Tk):
 
         self.current_job_name = job_name
         self.current_output_dir = output_dir
+        self.current_job_output = []
         self.preview_dir.set(str(output_dir))
         self.status_text.set(f"{job_name} running...")
         self.notebook.select(self.tab_run)
@@ -2434,9 +2474,17 @@ class TESSGui(tk.Tk):
                     for line in proc.stdout:
                         self.log_queue.put(("line", proc, line))
                 rc = proc.wait() if proc else -1
-                self.log_queue.put(("done", proc, f"{job_name} finished with exit code {rc}.\n"))
+                self.log_queue.put(("done", proc, {
+                    "job_name": job_name,
+                    "returncode": int(rc),
+                    "message": f"{job_name} finished with exit code {rc}.\n",
+                }))
             except Exception as exc:
-                self.log_queue.put(("done", proc, f"{job_name} failed: {exc}\n"))
+                self.log_queue.put(("done", proc, {
+                    "job_name": job_name,
+                    "returncode": -1,
+                    "message": f"{job_name} failed: {exc}\n",
+                }))
 
         threading.Thread(target=reader_thread, daemon=True).start()
 
@@ -2456,13 +2504,26 @@ class TESSGui(tk.Tk):
             while True:
                 kind, event_proc, payload = self.log_queue.get_nowait()
                 if kind == "line":
-                    self.log_text.insert("end", payload)
-                    self.log_text.see("end")
-                elif kind == "done":
-                    self.log_text.insert("end", "\n" + payload + "\n")
+                    line = str(payload)
+                    self.log_text.insert("end", line)
                     self.log_text.see("end")
                     if self.current_process is event_proc:
-                        self._clear_current_process_state("Ready.")
+                        self.current_job_output.append(line)
+                elif kind == "done":
+                    result = payload if isinstance(payload, dict) else {
+                        "job_name": self.current_job_name or "Process",
+                        "returncode": -1,
+                        "message": str(payload),
+                    }
+                    self.log_text.insert("end", "\n" + str(result["message"]) + "\n")
+                    self.log_text.see("end")
+                    if self.current_process is event_proc:
+                        status = self._handle_process_completion(
+                            str(result["job_name"]),
+                            int(result["returncode"]),
+                            "".join(self.current_job_output),
+                        )
+                        self._clear_current_process_state(status)
                         self._refresh_preview_list()
         except queue.Empty:
             pass
@@ -2611,7 +2672,6 @@ class TESSGui(tk.Tk):
             "ex_save_aperture_plots": self.ex_save_aperture_plots.get(),
             "ex_saturated_systematics": self.ex_saturated_systematics.get(),
             "ex_extraction_approach": self.ex_extraction_approach.get(),
-            "ex_orbtable": self.ex_orbtable.get(),
             "ex_min_pixels": self.ex_min_pixels.get(),
             "ex_amp_q_lo": self.ex_amp_q_lo.get(),
             "ex_amp_q_hi": self.ex_amp_q_hi.get(),
@@ -2625,8 +2685,6 @@ class TESSGui(tk.Tk):
             "ex_sat_thresh": self.ex_sat_thresh.get(),
             "ex_sat_min_npix": self.ex_sat_min_npix.get(),
             "ex_back_nfaint": self.ex_back_nfaint.get(),
-            "ex_phase_bin": self.ex_phase_bin.get(),
-            "ex_saturated_aperture_threshold": self.ex_saturated_aperture_threshold.get(),
             "ex_prf_photometry": self.ex_prf_photometry.get(),
             "ex_prf_backend": self.ex_prf_backend.get(),
             "ex_prf_motion_source": self.ex_prf_motion_source.get(),
@@ -2669,9 +2727,6 @@ class TESSGui(tk.Tk):
             "dt_clip_residuals_sigma": self.dt_clip_residuals_sigma.get(),
             "dt_clip_residuals_iters": self.dt_clip_residuals_iters.get(),
             "dt_save_pickled_figures": self.dt_save_pickled_figures.get(),
-            "dt_apply_orbital_phase_template": self.dt_apply_orbital_phase_template.get(),
-            "dt_orbtable": self.dt_orbtable.get(),
-            "dt_phase_bin": self.dt_phase_bin.get(),
             "dt_use_quaternion_regression": self.dt_use_quaternion_regression.get(),
             "dt_quaternion_source": self.dt_quaternion_source.get(),
             "dt_quaternion_auto_download": self.dt_quaternion_auto_download.get(),

@@ -27,6 +27,7 @@ from scipy.ndimage import gaussian_filter
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 
 import astropy.units as u
 from astropy.coordinates import SkyCoord
@@ -66,7 +67,8 @@ except Exception:
 
 APERTURE_FOM_MODE = "stddiff"
 SAVE_FIGURE_PICKLES = False
-DEFAULT_ORBITAL_TABLE = Path(__file__).resolve().with_name("tess_sector_orbfreq_midpoints.csv")
+# Capability marker read by the GUI.  Do not remove without updating the GUI.
+SATURATED_SUCCESS_PLOT_STYLE_V2 = True
 
 
 # =============================================================================
@@ -160,13 +162,258 @@ def load_external_aperture_mask(
     return mask, metadata
 
 # =============================================================================
-# Saturation-optimized single-target aperture extraction
+# RAW_CNTS saturated single-target aperture extraction
 # =============================================================================
 
+# These fixed, target-independent geometry settings were validated against
+# contained and clipped saturated TESS target-pixel files.  They intentionally
+# do not depend on a known stellar period, SPOC aperture, variability amplitude,
+# pointing correlation, or calibrated-flux scatter minimization.
+SAT_RAW_STRONG_FRACTION = 0.50
+SAT_RAW_WEAK_FRACTION = 0.02
+SAT_RAW_RUN_FRACTION = 0.20
+SAT_RAW_MIN_RUN_LENGTH = 5
+SAT_RAW_COLUMN_GUARD = 0
+SAT_CLIP_EDGE_BAND_PIXELS = 3
+SAT_CLIP_EDGE_FRACTION_OF_PEAK = 0.08
+SAT_CLIP_EDGE_MIN_SIGMA = 8.0
+
+
+class SaturatedBleedClippedError(RuntimeError):
+    """Raised when saturated charge demonstrably leaves the available stamp."""
+
+    def __init__(self, message, *, metadata, raw_image, mean_image, aperture_mask):
+        super().__init__(message)
+        self.metadata = dict(metadata)
+        self.raw_image = np.asarray(raw_image, float)
+        self.mean_image = np.asarray(mean_image, float)
+        self.aperture_mask = np.asarray(aperture_mask, bool)
+
+
+class SaturatedGeometryUnavailableError(RuntimeError):
+    """Raised when neither RAW_CNTS nor an allowed fallback has usable geometry."""
+
+    def __init__(self, message, *, metadata, raw_image, mean_image):
+        super().__init__(message)
+        self.metadata = dict(metadata)
+        self.raw_image = np.asarray(raw_image, float)
+        self.mean_image = np.asarray(mean_image, float)
+
+
+def _target_connected_component(mask, anchor):
+    """Return the four-connected component of ``mask`` containing ``anchor``."""
+    mask = np.asarray(mask, bool)
+    out = np.zeros_like(mask)
+    stack = [tuple(map(int, anchor))]
+    while stack:
+        row, col = stack.pop()
+        if (
+            row < 0 or col < 0 or row >= mask.shape[0] or col >= mask.shape[1]
+            or out[row, col] or not mask[row, col]
+        ):
+            continue
+        out[row, col] = True
+        stack.extend(((row - 1, col), (row + 1, col),
+                      (row, col - 1), (row, col + 1)))
+    return out
+
+
+def _longest_true_run(values):
+    best = run = 0
+    for value in np.asarray(values, bool):
+        run = run + 1 if value else 0
+        best = max(best, run)
+    return int(best)
+
+
+def build_raw_counts_saturated_mask(
+    raw_cube,
+    *,
+    source_label="RAW_CNTS",
+    strong_fraction=SAT_RAW_STRONG_FRACTION,
+    weak_fraction=SAT_RAW_WEAK_FRACTION,
+    run_fraction=SAT_RAW_RUN_FRACTION,
+    column_guard=SAT_RAW_COLUMN_GUARD,
+    min_run_length=SAT_RAW_MIN_RUN_LENGTH,
+):
+    """Construct a saturated aperture from a target-connected geometry cube.
+
+    Long detector-aligned saturated runs identify the bleed coordinates.  The
+    selected coordinates span the complete axial dimension of the available
+    stamp, and the target-connected weak component adds the central bulb and
+    wings. The preferred input is RAW_CNTS; calibrated FLUX may be supplied for
+    a TESSCut fallback. The returned diagnostics independently test whether
+    target signal remains significant at either axial stamp boundary.
+    """
+    source_label = str(source_label).strip() or "geometry cube"
+    raw_cube = np.asarray(raw_cube)
+    if raw_cube.ndim != 3:
+        raise ValueError(
+            f"Expected {source_label} cube with ndim=3, got {raw_cube.shape}"
+        )
+    if not np.isfinite(raw_cube).any():
+        raise ValueError(f"{source_label} cube contains no finite values.")
+
+    raw_image = np.nanmedian(raw_cube, axis=0)
+    finite = raw_image[np.isfinite(raw_image)]
+    if finite.size == 0:
+        raise ValueError(f"Median {source_label} image is all-NaN.")
+
+    lower_limit = np.nanpercentile(finite, 60)
+    lower = finite[finite <= lower_limit]
+    background = float(np.nanmedian(lower))
+    background_mad = float(np.nanmedian(np.abs(lower - background)))
+    background_sigma = 1.4826 * background_mad
+    if not np.isfinite(background_sigma) or background_sigma <= 0:
+        background_sigma = float(np.nanstd(lower))
+    if not np.isfinite(background_sigma):
+        background_sigma = 0.0
+
+    excess = np.maximum(raw_image - background, 0.0)
+    peak = tuple(map(int, np.unravel_index(np.nanargmax(excess), excess.shape)))
+    peak_excess = float(excess[peak])
+    if not np.isfinite(peak_excess) or peak_excess <= 0:
+        raise ValueError(
+            f"{source_label} target peak is not positive above background; "
+            "the median geometry image is constant or null-filled."
+        )
+
+    strong_all = excess >= float(strong_fraction) * peak_excess
+    weak_all = excess >= float(weak_fraction) * peak_excess
+    strong = _target_connected_component(strong_all, peak)
+    weak = _target_connected_component(weak_all, peak)
+    if not np.any(strong):
+        strong[peak] = True
+    if not np.any(weak):
+        weak[peak] = True
+
+    rows, cols = np.where(strong)
+    bleed_axis = 0 if (np.ptp(rows) + 1) >= (np.ptp(cols) + 1) else 1
+    oriented = strong if bleed_axis == 0 else strong.T
+    runs = np.array(
+        [_longest_true_run(oriented[:, j]) for j in range(oriented.shape[1])],
+        dtype=int,
+    )
+    anchor = int(np.argmax(runs))
+    threshold = max(int(min_run_length), int(np.ceil(float(run_fraction) * runs[anchor])))
+    eligible = runs >= threshold
+    low = high = anchor
+    while low > 0 and eligible[low - 1]:
+        low -= 1
+    while high < len(eligible) - 1 and eligible[high + 1]:
+        high += 1
+    low = max(0, low - int(column_guard))
+    high = min(len(eligible) - 1, high + int(column_guard))
+
+    oriented_stripe = np.zeros_like(oriented, dtype=bool)
+    oriented_stripe[:, low:high + 1] = True
+    stripe = oriented_stripe if bleed_axis == 0 else oriented_stripe.T
+    aperture_mask = stripe | weak
+
+    selected_excess = excess[:, low:high + 1] if bleed_axis == 0 else excess[low:high + 1, :]
+    axial_profile = np.nanmax(selected_excess, axis=1 if bleed_axis == 0 else 0)
+    axial_profile_fraction = axial_profile / peak_excess
+    edge_band = min(int(SAT_CLIP_EDGE_BAND_PIXELS), len(axial_profile))
+    edge_low_excess = float(np.nanmax(axial_profile[:edge_band]))
+    edge_high_excess = float(np.nanmax(axial_profile[-edge_band:]))
+    edge_low_fraction = edge_low_excess / peak_excess
+    edge_high_fraction = edge_high_excess / peak_excess
+    significance_floor = float(SAT_CLIP_EDGE_MIN_SIGMA) * background_sigma
+    clipped_low = (
+        edge_low_fraction >= SAT_CLIP_EDGE_FRACTION_OF_PEAK
+        and edge_low_excess > significance_floor
+    )
+    clipped_high = (
+        edge_high_fraction >= SAT_CLIP_EDGE_FRACTION_OF_PEAK
+        and edge_high_excess > significance_floor
+    )
+    clipped_edges = (
+        "both" if clipped_low and clipped_high else
+        "low" if clipped_low else
+        "high" if clipped_high else
+        "none"
+    )
+
+    diagnostics = {
+        "raw_image": raw_image,
+        "geometry_image": raw_image,
+        "geometry_source": source_label,
+        "background": background,
+        "background_sigma": background_sigma,
+        "peak": peak,
+        "peak_excess": peak_excess,
+        "strong_component": strong,
+        "weak_component": weak,
+        "bleed_axis": int(bleed_axis),
+        "bleed_axis_name": "rows" if bleed_axis == 0 else "columns",
+        "runs": runs,
+        "cross_bounds": (int(low), int(high)),
+        "axial_profile_fraction": axial_profile_fraction,
+        "edge_low_fraction_of_peak": float(edge_low_fraction),
+        "edge_high_fraction_of_peak": float(edge_high_fraction),
+        "edge_max_fraction_of_peak": float(max(edge_low_fraction, edge_high_fraction)),
+        "clipped_low": bool(clipped_low),
+        "clipped_high": bool(clipped_high),
+        "clipped_edges": clipped_edges,
+        "is_clipped": bool(clipped_low or clipped_high),
+    }
+    return aperture_mask, diagnostics
+
+
+def select_saturated_geometry_cube(raw_cube, flux_cube, *, allow_flux_fallback=False):
+    """Choose an informative cube for the fixed saturated-bleed geometry.
+
+    RAW_CNTS remains the preferred source. Some TESSCut products contain a
+    RAW_CNTS column that is present and correctly shaped but entirely filled
+    with a null/constant value. For those products only, calibrated FLUX is an
+    allowed geometry fallback. Aperture photometry itself still uses FLUX in
+    both cases.
+    """
+    failures = []
+    try:
+        aperture_mask, diagnostics = build_raw_counts_saturated_mask(
+            raw_cube, source_label="RAW_CNTS"
+        )
+        diagnostics.update({
+            "geometry_source": "RAW_CNTS",
+            "geometry_fallback_used": False,
+            "raw_counts_geometry_failure": "",
+        })
+        return aperture_mask, diagnostics
+    except ValueError as exc:
+        failures.append(f"RAW_CNTS: {exc}")
+        raw_failure = str(exc)
+
+    if allow_flux_fallback:
+        try:
+            aperture_mask, diagnostics = build_raw_counts_saturated_mask(
+                flux_cube, source_label="FLUX"
+            )
+            diagnostics.update({
+                "geometry_source": "FLUX",
+                "geometry_fallback_used": True,
+                "raw_counts_geometry_failure": raw_failure,
+            })
+            return aperture_mask, diagnostics
+        except ValueError as exc:
+            failures.append(f"FLUX: {exc}")
+
+    fallback_text = (
+        " Calibrated-FLUX fallback was attempted because this is a TESSCut product."
+        if allow_flux_fallback else
+        " Calibrated-FLUX fallback is restricted to TESSCut products."
+    )
+    raise ValueError(
+        "No usable saturated-aperture geometry cube. "
+        + " | ".join(failures)
+        + fallback_text
+    )
+
 def read_tpf_arrays_for_saturated_aperture(path: Path):
-    """Read cadence arrays needed by the saturation-optimized extractor."""
+    """Read calibrated and raw cadence arrays for saturated extraction."""
     with fits.open(path, memmap=True) as hdul:
-        data = hdul[1].data
+        pixel_hdu = next((h for h in hdul if h.name.upper() == "PIXELS"), hdul[1])
+        data = pixel_hdu.data
         names = set(data.names)
 
         time = np.array(data["TIME"], dtype=float)
@@ -180,11 +427,29 @@ def read_tpf_arrays_for_saturated_aperture(path: Path):
         flux = np.array(data["FLUX"], dtype=float)
         if flux.ndim != 3:
             raise ValueError(f"Expected FLUX to have ndim=3, got shape {flux.shape} in {path.name}")
+        if "RAW_CNTS" in names:
+            raw = np.array(data["RAW_CNTS"], dtype=float)
+            if raw.shape != flux.shape:
+                raise ValueError(
+                    f"RAW_CNTS shape {raw.shape} does not match FLUX shape "
+                    f"{flux.shape} in {path.name}"
+                )
+            raw_column_number = list(data.names).index("RAW_CNTS") + 1
+            raw_null = pixel_hdu.header.get(f"TNULL{raw_column_number}")
+            if raw_null is not None:
+                try:
+                    raw[raw == float(raw_null)] = np.nan
+                except (TypeError, ValueError):
+                    pass
+        else:
+            # A NaN placeholder lets the geometry selector produce one clear,
+            # source-specific diagnostic and use FLUX only for TESSCut inputs.
+            raw = np.full(flux.shape, np.nan, dtype=float)
 
         _, nrow, ncol = flux.shape
         flux2d = flux.reshape(flux.shape[0], nrow * ncol)
 
-    return time, flux2d, quality, nrow, ncol
+    return time, flux2d, raw, quality, nrow, ncol
 
 
 def extract_saturation_optimized_aperture(
@@ -194,15 +459,14 @@ def extract_saturation_optimized_aperture(
     filter_quality: bool = True,
     verbose: bool = True,
 ):
-    """Build a single-target aperture by minimizing high-frequency scatter.
+    """Extract a saturated target using RAW_CNTS bleed geometry.
 
-    Pixels above ``threshold`` seed the aperture.  Remaining positive pixels
-    are then tested one at a time, and the candidate with the lowest
-    first-difference figure of merit is appended.  The best intermediate
-    aperture is selected after the full growth sequence.  This unrestricted
-    image geometry works for arbitrary TPF and TESSCut stamp dimensions.
+    ``threshold`` remains in the signature only for compatibility with older
+    callers and is ignored.  Aperture selection contains no calibrated-flux
+    scatter optimizer and no positive-mean pixel-growth rule.
     """
-    time, flux, quality, nrow, ncol = read_tpf_arrays_for_saturated_aperture(path)
+    del threshold
+    time, flux, raw, quality, nrow, ncol = read_tpf_arrays_for_saturated_aperture(path)
     npix = nrow * ncol
 
     keep = np.isfinite(time)
@@ -214,6 +478,7 @@ def extract_saturation_optimized_aperture(
             print("  [WARN] No QUALITY==0 cadences; retaining finite-time cadences instead.")
     time = time[keep]
     flux = flux[keep, :]
+    raw = raw[keep, :, :]
 
     if len(time) < 3:
         raise ValueError(f"Not enough valid cadences after filtering in {path.name}")
@@ -227,73 +492,121 @@ def extract_saturation_optimized_aperture(
     back_idx = idx_sorted[:nback]
     back = np.nanmean(flux[:, back_idx], axis=1)
 
-    els = np.where(np.isfinite(mean_image) & (mean_image > threshold))[0]
-    if len(els) == 0:
-        brightest = int(np.nanargmax(mean_image))
-        els = np.array([brightest], dtype=int)
+    flux_cube = flux.reshape(len(time), nrow, ncol)
+    allow_flux_fallback = is_tesscut_product(path)
+    try:
+        best_mask_2d, geometry = select_saturated_geometry_cube(
+            raw,
+            flux_cube,
+            allow_flux_fallback=allow_flux_fallback,
+        )
+    except ValueError as exc:
+        try:
+            raw_float = np.asarray(raw, float)
+            raw_image = (
+                np.nanmedian(raw_float, axis=0)
+                if np.isfinite(raw_float).any() else
+                np.full((nrow, ncol), np.nan, dtype=float)
+            )
+        except Exception:
+            raw_image = np.full((nrow, ncol), np.nan, dtype=float)
+        failure_meta = {
+            "file": str(path),
+            "sector": infer_sector_from_tpf(path),
+            "nrow": nrow,
+            "ncol": ncol,
+            "npix": npix,
+            "n_cadences_used": len(time),
+            "algorithm": "target_connected_saturated_bleed_geometry",
+            "geometry_source": "none",
+            "geometry_fallback_allowed": bool(allow_flux_fallback),
+            "geometry_fallback_used": False,
+            "geometry_failure_reason": str(exc),
+            "status": "SATURATED_GEOMETRY_UNAVAILABLE",
+        }
+        raise SaturatedGeometryUnavailableError(
+            str(exc),
+            metadata=failure_meta,
+            raw_image=raw_image,
+            mean_image=mean_image.reshape(nrow, ncol),
+        ) from exc
 
-    flag = np.zeros(npix, dtype=int)
-    flag[els] = 1
+    geometry_source = str(geometry.get("geometry_source", "RAW_CNTS"))
+    geometry_fallback_used = bool(geometry.get("geometry_fallback_used", False))
+    if geometry_fallback_used:
+        print(
+            "  [WARN] RAW_CNTS has no usable spatial signal; using calibrated "
+            "FLUX for saturated-aperture geometry."
+        )
+    meta = {
+        "file": str(path),
+        "sector": infer_sector_from_tpf(path),
+        "nrow": nrow,
+        "ncol": ncol,
+        "npix": npix,
+        "n_cadences_used": len(time),
+        "n_pixels_in_best_curve": int(np.count_nonzero(best_mask_2d)),
+        "nback": int(nback),
+        "algorithm": (
+            "raw_counts_target_connected_bleed_geometry"
+            if geometry_source == "RAW_CNTS" else
+            "calibrated_flux_target_connected_bleed_geometry"
+        ),
+        "aperture_geometry": "full_axial_bleed_coordinates_plus_weak_component",
+        "geometry_source": geometry_source,
+        "geometry_fallback_allowed": bool(allow_flux_fallback),
+        "geometry_fallback_used": geometry_fallback_used,
+        "raw_counts_geometry_failure": geometry.get("raw_counts_geometry_failure", ""),
+        "geometry_background": geometry["background"],
+        "geometry_background_sigma": geometry["background_sigma"],
+        "geometry_peak_excess": geometry["peak_excess"],
+        "raw_strong_fraction": SAT_RAW_STRONG_FRACTION,
+        "raw_weak_fraction": SAT_RAW_WEAK_FRACTION,
+        "raw_run_fraction": SAT_RAW_RUN_FRACTION,
+        "raw_min_run_length": SAT_RAW_MIN_RUN_LENGTH,
+        "raw_column_guard": SAT_RAW_COLUMN_GUARD,
+        "bleed_axis": geometry["bleed_axis_name"],
+        "cross_axis_low": geometry["cross_bounds"][0],
+        "cross_axis_high": geometry["cross_bounds"][1],
+        "raw_background": geometry["background"] if geometry_source == "RAW_CNTS" else np.nan,
+        "raw_background_sigma": (
+            geometry["background_sigma"] if geometry_source == "RAW_CNTS" else np.nan
+        ),
+        "raw_peak_excess": geometry["peak_excess"] if geometry_source == "RAW_CNTS" else np.nan,
+        "edge_low_fraction_of_peak": geometry["edge_low_fraction_of_peak"],
+        "edge_high_fraction_of_peak": geometry["edge_high_fraction_of_peak"],
+        "edge_max_fraction_of_peak": geometry["edge_max_fraction_of_peak"],
+        "raw_charge_reaches_axial_edge": geometry["is_clipped"],
+        "geometry_charge_reaches_axial_edge": geometry["is_clipped"],
+        "clipped_edges": geometry["clipped_edges"],
+        "status": "SATURATED_BLEED_CLIPPED" if geometry["is_clipped"] else "ok",
+    }
 
-    ts_flux = [np.nansum(flux[:, els], axis=1)]
-    ts_pixels = list(els.astype(int))
-    ts_diff = []
+    if geometry["is_clipped"]:
+        side = geometry["clipped_edges"]
+        message = (
+            f"Saturated bleed is clipped at the {side} axial edge of {path.name}: "
+            f"edge signal is {100.0 * geometry['edge_max_fraction_of_peak']:.2f}% "
+            f"of the target {geometry_source} peak. The available pixel stamp does not contain "
+            "the complete stellar flux or variability amplitude. Use a larger cutout "
+            "or an FFI-based extraction."
+        )
+        raise SaturatedBleedClippedError(
+            message,
+            metadata=meta,
+            raw_image=geometry["raw_image"],
+            mean_image=mean_image.reshape(nrow, ncol),
+            aperture_mask=best_mask_2d,
+        )
 
-    pixel_means = np.nanmean(flux, axis=0)
-
-    cur = ts_flux[0]
-    denom = np.nansum(cur)
-    if denom == 0 or not np.isfinite(denom):
-        raise ValueError(f"Initial aperture flux sum is invalid for {path.name}")
-    fom0 = np.nansum(np.abs(np.diff(cur))) / denom
-    ts_diff.append(fom0)
-
-    for _ in range(npix):
-        test_fom = np.full(npix, np.nan, dtype=float)
-
-        for ii in range(npix):
-            if flag[ii] == 0 and np.isfinite(pixel_means[ii]) and pixel_means[ii] > 0:
-                temp_flux = ts_flux[-1] + flux[:, ii]
-                denom = np.nansum(temp_flux)
-                if denom != 0 and np.isfinite(denom):
-                    test_fom[ii] = np.nansum(np.abs(np.diff(temp_flux))) / denom
-
-        if not np.isfinite(test_fom).any():
-            break
-
-        bb = int(np.nanargmin(test_fom))
-        aa = float(test_fom[bb])
-
-        flag[bb] = 1
-        ts_flux.append(ts_flux[-1] + flux[:, bb])
-        ts_diff.append(aa)
-        ts_pixels.append(bb)
-
-    fom = []
-    for arr in ts_flux:
-        mu = np.nanmean(arr)
-        if mu == 0 or not np.isfinite(mu):
-            fom.append(np.nan)
-        else:
-            fom.append(np.nanstd(np.diff(arr)) / mu)
-    fom = np.array(fom, dtype=float)
-
-    if not np.isfinite(fom).any():
-        raise ValueError(f"No finite FOM values for {path.name}")
-
-    best_idx = int(np.nanargmin(fom))
-    best_flux = np.array(ts_flux[best_idx], dtype=float)
+    best_mask = best_mask_2d.ravel()
+    best_flux = np.nansum(flux[:, best_mask], axis=1)
 
     med = np.nanmedian(best_flux)
     if med == 0 or not np.isfinite(med):
         raise ValueError(f"Median best flux invalid for {path.name}")
 
     rel_flux = best_flux / med
-
-    best_pixels_linear = np.array(ts_pixels[: best_idx + 1], dtype=int)
-    best_mask = np.zeros(npix, dtype=bool)
-    best_mask[best_pixels_linear] = True
-    best_mask_2d = best_mask.reshape(nrow, ncol)
 
     # Flux-weighted aperture center-of-light series. For saturated targets this is
     # best interpreted as a motion/systematics proxy rather than a precise astrometric centroid.
@@ -306,32 +619,30 @@ def extract_saturation_optimized_aperture(
     crow = np.nansum(f_ap * ypix, axis=1) / denom
     ccol = np.nansum(f_ap * xpix, axis=1) / denom
 
-    meta = {
-        "file": str(path),
-        "sector": infer_sector_from_tpf(path),
-        "nrow": nrow,
-        "ncol": ncol,
-        "npix": npix,
-        "n_cadences_used": len(time),
-        "n_initial_pixels": len(els),
-        "n_pixels_in_best_curve": best_idx + 1,
-        "best_fom": float(fom[best_idx]),
-        "threshold": float(threshold),
-        "nback": int(nback),
-        "aperture_geometry": "unrestricted",
-    }
-
     if verbose:
         print(
-            f"  Saturation-optimized aperture: shape={nrow}x{ncol}, cadences={len(time)}, "
-            f"best_pixels={best_idx + 1}, best_fom={fom[best_idx]:.6g}"
+            f"  {geometry_source} saturated aperture geometry: "
+            f"shape={nrow}x{ncol}, cadences={len(time)}, "
+            f"pixels={int(np.count_nonzero(best_mask_2d))}, "
+            f"bleed_axis={geometry['bleed_axis_name']}, "
+            f"cross_bounds={geometry['cross_bounds'][0]}:{geometry['cross_bounds'][1]}"
         )
 
     # Mission-specific time naming belongs in ``main``, where the input has
     # already been classified as TESS, Kepler, or K2. Keeping this internal
     # table neutral avoids accidentally labeling native BKJD values as BTJD.
     out = pd.DataFrame({"time_native": time, "flux_detrended_rel": rel_flux})
-    return out, meta, mean_image.reshape(nrow, ncol), best_mask_2d, back, keep, crow, ccol
+    return (
+        out,
+        meta,
+        mean_image.reshape(nrow, ncol),
+        best_mask_2d,
+        back,
+        keep,
+        crow,
+        ccol,
+        geometry,
+    )
 
 
 def save_figure_with_optional_pickle(fig, outpng: Path, **savefig_kwargs):
@@ -358,6 +669,213 @@ def save_aperture_plot(mean_image_2d, ap_mask_2d, outpng: Path, title: str):
     fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="Mean Flux")
     fig.tight_layout()
     save_figure_with_optional_pickle(fig, outpng, dpi=150)
+    plt.close(fig)
+
+
+def _closed_mask_contour(ax, mask, *, color, linewidth=1.5, linestyle="-"):
+    """Draw a mask boundary that closes cleanly when the mask touches an edge."""
+    mask = np.asarray(mask, bool)
+    if not np.any(mask):
+        return
+    nrow, ncol = mask.shape
+    padded = np.pad(mask.astype(float), 1, mode="constant", constant_values=0.0)
+    xcoords = np.arange(-1, ncol + 1, dtype=float)
+    ycoords = np.arange(-1, nrow + 1, dtype=float)
+    ax.contour(
+        xcoords,
+        ycoords,
+        padded,
+        levels=[0.5],
+        colors=[color],
+        linewidths=float(linewidth),
+        linestyles=linestyle,
+    )
+
+
+def save_saturated_aperture_success_diagnostic(
+    geometry,
+    ap_mask_2d,
+    outpng: Path,
+    title: str,
+    *,
+    catalog_position=None,
+):
+    """Save the publication-style diagnostic for a contained saturated bleed."""
+    image = np.asarray(geometry["geometry_image"], float)
+    aperture = np.asarray(ap_mask_2d, bool)
+    strong = np.asarray(geometry.get("strong_component", np.zeros_like(aperture)), bool)
+    background = float(geometry.get("background", 0.0))
+    peak_excess = float(geometry.get("peak_excess", np.nan))
+    excess = np.maximum(image - background, 0.0)
+    if not np.isfinite(peak_excess) or peak_excess <= 0:
+        peak_excess = float(np.nanmax(excess))
+    normalized = excess / peak_excess if np.isfinite(peak_excess) and peak_excess > 0 else excess
+    display_image = np.log10(np.clip(normalized, 1e-4, 1.0))
+
+    nrow, ncol = aperture.shape
+    if nrow >= 2 * ncol:
+        figsize = (7.4, 9.4)
+    elif ncol >= 2 * nrow:
+        figsize = (11.0, 6.3)
+    else:
+        figsize = (8.0, 7.2)
+
+    fig, ax = plt.subplots(figsize=figsize)
+    im = ax.imshow(
+        display_image,
+        origin="lower",
+        aspect="auto",
+        cmap="cividis",
+        interpolation="nearest",
+        vmin=-4.0,
+        vmax=0.0,
+    )
+    _closed_mask_contour(ax, aperture, color="#D55E00", linewidth=1.8)
+    _closed_mask_contour(ax, strong, color="white", linewidth=1.35)
+
+    legend_handles = [
+        Line2D([0], [0], color="#D55E00", lw=2.0, label="Saturated aperture"),
+        Line2D([0], [0], color="white", lw=2.0, label="Strong saturated component"),
+    ]
+    if catalog_position is not None:
+        try:
+            row, col = map(float, catalog_position)
+            if np.isfinite(row) and np.isfinite(col):
+                ax.plot(
+                    col, row, marker="*", ms=15, mfc="#F0E442", mec="black",
+                    mew=1.2, linestyle="none", zorder=8,
+                )
+                legend_handles.append(Line2D(
+                    [0], [0], marker="*", ms=12, mfc="#F0E442", mec="black",
+                    mew=1.0, linestyle="none", label="Target catalog position",
+                ))
+        except Exception:
+            pass
+
+    edge_fraction = float(geometry.get("edge_max_fraction_of_peak", np.nan))
+    edge_text = f"{100.0 * edge_fraction:.2f}%" if np.isfinite(edge_fraction) else "unknown"
+    info = (
+        f"stamp: {nrow} × {ncol} pixels\n"
+        f"mask: {int(np.count_nonzero(aperture))} pixels\n"
+        f"max. edge signal: {edge_text} of peak\n"
+        f"geometry: {geometry.get('geometry_source', 'RAW_CNTS')}"
+    )
+    ax.text(
+        0.018, 0.018, info,
+        transform=ax.transAxes, ha="left", va="bottom", fontsize=9.5,
+        bbox=dict(boxstyle="round,pad=0.35", facecolor="#D9D9D9",
+                  edgecolor="0.35", alpha=0.94),
+        zorder=10,
+    )
+    ax.set(
+        title=title + "\nSaturated bleed contained",
+        xlabel="Local pixel column",
+        ylabel="Local pixel row",
+        xlim=(-0.5, ncol - 0.5),
+        ylim=(-0.5, nrow - 0.5),
+    )
+    colorbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    colorbar.set_label(r"$\log_{10}$ peak-normalized excess signal")
+    legend = ax.legend(
+        handles=legend_handles,
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.105),
+        ncol=min(3, len(legend_handles)),
+        frameon=True,
+        framealpha=1.0,
+        facecolor="#D0D0D0",
+        edgecolor="0.35",
+        fontsize=9.0,
+    )
+    legend.set_zorder(12)
+    fig.subplots_adjust(left=0.13, right=0.87, top=0.90, bottom=0.19)
+    save_figure_with_optional_pickle(fig, Path(outpng), dpi=240, bbox_inches="tight")
+    plt.close(fig)
+
+
+def save_saturated_clipping_diagnostic(
+    raw_image_2d,
+    ap_mask_2d,
+    outpng: Path,
+    title: str,
+    *,
+    clipped_edges: str,
+    edge_fraction_of_peak: float,
+    geometry_source: str = "RAW_CNTS",
+):
+    """Save the diagnostic even though no normal light curve is written."""
+    raw_image_2d = np.asarray(raw_image_2d, float)
+    ap_mask_2d = np.asarray(ap_mask_2d, bool)
+    finite = raw_image_2d[np.isfinite(raw_image_2d)]
+    floor = float(np.nanpercentile(finite, 1)) if finite.size else 0.0
+    display_image = np.log10(np.maximum(raw_image_2d - floor, 0.0) + 1.0)
+
+    fig, ax = plt.subplots(figsize=(6.5, 6.0))
+    im = ax.imshow(
+        display_image,
+        origin="lower",
+        aspect="auto",
+        cmap="cividis",
+        interpolation="nearest",
+    )
+    if np.any(ap_mask_2d):
+        ax.contour(ap_mask_2d.astype(float), levels=[0.5], colors=["#D55E00"], linewidths=1.5)
+    ax.set_title(
+        title
+        + "\nSATURATED BLEED CLIPPED — no light curve written"
+        + f"\nedge={clipped_edges}; edge signal={100.0 * edge_fraction_of_peak:.2f}% of peak"
+    )
+    ax.set_xlabel("Column")
+    ax.set_ylabel("Row")
+    fig.colorbar(
+        im,
+        ax=ax,
+        fraction=0.046,
+        pad=0.04,
+        label=f"log10 {geometry_source} excess",
+    )
+    fig.tight_layout()
+    save_figure_with_optional_pickle(fig, Path(outpng), dpi=170)
+    plt.close(fig)
+
+
+def save_saturated_geometry_failure_diagnostic(
+    raw_image_2d,
+    mean_flux_image_2d,
+    outpng: Path,
+    title: str,
+    *,
+    failure_reason: str,
+):
+    """Show the unusable RAW image beside calibrated FLUX for diagnosis."""
+    raw_image_2d = np.asarray(raw_image_2d, float)
+    mean_flux_image_2d = np.asarray(mean_flux_image_2d, float)
+
+    fig, axes = plt.subplots(1, 2, figsize=(11.0, 5.2))
+    for ax, image, panel_title, colorbar_label in (
+        (axes[0], raw_image_2d, "Median RAW_CNTS", "RAW_CNTS"),
+        (axes[1], mean_flux_image_2d, "Mean calibrated FLUX", "FLUX"),
+    ):
+        im = ax.imshow(
+            image,
+            origin="lower",
+            aspect="auto",
+            cmap="cividis",
+            interpolation="nearest",
+        )
+        ax.set_title(panel_title)
+        ax.set_xlabel("Column")
+        ax.set_ylabel("Row")
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label=colorbar_label)
+
+    fig.suptitle(
+        title
+        + "\nSATURATED GEOMETRY UNAVAILABLE — no light curve written"
+        + f"\n{failure_reason}",
+        fontsize=10,
+    )
+    fig.tight_layout()
+    save_figure_with_optional_pickle(fig, Path(outpng), dpi=170, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -400,6 +918,168 @@ def robust_wls(X, y, n_iter: int = 8, huber_k: float = 1.5):
             break
         beta = beta_new
     return beta
+
+
+def detrend_saturated_background_motion(
+    time_values,
+    flux_rel,
+    background,
+    centroid_row,
+    centroid_col,
+    *,
+    n_iter: int = 8,
+    huber_k: float = 1.5,
+    artifact_sigma: float = 5.0,
+    artifact_window_days: float = 1.0,
+):
+    """Remove saturated-target systematics without a time-dependent template.
+
+    The fixed, target-independent model is an iterative-Huber regression on
+    background, flux-weighted row/column motion, their squares, and pairwise
+    products. A time-local robust flag identifies large residual artifacts but
+    does not delete or interpolate them.
+    """
+    t = np.asarray(time_values, float)
+    f = np.asarray(flux_rel, float)
+    back = np.asarray(background, float)
+    crow = np.asarray(centroid_row, float)
+    ccol = np.asarray(centroid_col, float)
+    n = len(t)
+    if any(len(values) != n for values in (f, back, crow, ccol)):
+        raise ValueError("Saturated detrending arrays must have identical lengths.")
+    if not np.isfinite(artifact_sigma) or float(artifact_sigma) <= 0:
+        raise ValueError("artifact_sigma must be positive.")
+    if not np.isfinite(artifact_window_days) or float(artifact_window_days) <= 0:
+        raise ValueError("artifact_window_days must be positive.")
+
+    def robust_standardize(values):
+        med = float(np.nanmedian(values))
+        scale = 1.4826 * float(np.nanmedian(np.abs(values - med)))
+        if not np.isfinite(scale) or scale <= 0:
+            scale = float(np.nanstd(values))
+        if not np.isfinite(scale) or scale <= 0:
+            return np.zeros_like(values, dtype=float)
+        return (values - med) / scale
+
+    b = robust_standardize(back)
+    x = robust_standardize(ccol)
+    y = robust_standardize(crow)
+    design = np.column_stack([
+        np.ones(n, dtype=float),
+        b, x, y,
+        b**2, x**2, y**2,
+        b * x, b * y, x * y,
+    ])
+    target = f - 1.0
+    finite = np.isfinite(target) & np.all(np.isfinite(design), axis=1)
+    if np.count_nonzero(finite) < max(100, design.shape[1] * 5):
+        raise ValueError(
+            "Too few finite cadences for saturated background/motion regression."
+        )
+    beta = robust_wls(
+        design[finite], target[finite], n_iter=int(n_iter), huber_k=float(huber_k)
+    )
+    fitted = design @ beta
+    corrected = f - fitted + float(np.nanmedian(fitted[finite]))
+    corrected /= float(np.nanmedian(corrected[finite]))
+
+    # Use a time-based rolling median so the diagnostic is cadence-independent.
+    order = np.argsort(t)
+    sorted_time = t[order]
+    sorted_flux = corrected[order]
+    time_index = pd.to_timedelta(sorted_time - sorted_time[0], unit="D")
+    local_sorted = (
+        pd.Series(sorted_flux, index=time_index)
+        .rolling(f"{float(artifact_window_days)}D", center=True, min_periods=3)
+        .median()
+        .to_numpy(float)
+    )
+    local_median = np.full(n, np.nan, dtype=float)
+    local_median[order] = local_sorted
+    missing_local = ~np.isfinite(local_median)
+    local_median[missing_local] = corrected[missing_local]
+
+    dt = np.diff(sorted_time)
+    df = np.diff(sorted_flux)
+    if len(dt):
+        cadence = float(np.nanmedian(dt[dt > 0])) if np.any(dt > 0) else np.nan
+        contiguous = np.isfinite(df)
+        if np.isfinite(cadence) and cadence > 0:
+            contiguous &= dt < 2.0 * cadence
+        use_diff = df[contiguous]
+    else:
+        use_diff = np.array([], dtype=float)
+    diff_center = float(np.nanmedian(use_diff)) if len(use_diff) else 0.0
+    cadence_noise = (
+        1.4826 * float(np.nanmedian(np.abs(use_diff - diff_center))) / np.sqrt(2.0)
+        if len(use_diff) else np.nan
+    )
+    if not np.isfinite(cadence_noise) or cadence_noise <= 0:
+        cadence_noise = 1.4826 * float(
+            np.nanmedian(np.abs(corrected - np.nanmedian(corrected)))
+        )
+    keep = (
+        finite
+        & np.isfinite(local_median)
+        & (np.abs(corrected - local_median) <= float(artifact_sigma) * cadence_noise)
+    )
+    if np.any(keep):
+        corrected /= float(np.nanmedian(corrected[keep]))
+
+    model_rel = fitted - float(np.nanmedian(fitted[finite])) + 1.0
+    diagnostics = {
+        "method": "global_robust_background_motion_regression",
+        "n_model_terms": int(design.shape[1]),
+        "robust_iterations": int(n_iter),
+        "huber_k": float(huber_k),
+        "artifact_sigma": float(artifact_sigma),
+        "artifact_window_days": float(artifact_window_days),
+        "cadence_noise_ppm": float(cadence_noise * 1e6),
+        "n_artifacts_flagged": int(np.count_nonzero(~keep)),
+        "n_cadences_retained": int(np.count_nonzero(keep)),
+    }
+    return corrected, model_rel, keep, diagnostics
+
+
+def save_saturated_detrending_plot(
+    time_values,
+    raw_flux_rel,
+    corrected_flux_rel,
+    systematics_model_rel,
+    keep,
+    outpng: Path,
+    title: str,
+    time_label: str = "Time [BTJD]",
+):
+    """Save a before/after diagnostic for saturated-target correction."""
+    t = np.asarray(time_values, float)
+    raw = np.asarray(raw_flux_rel, float)
+    corrected = np.asarray(corrected_flux_rel, float)
+    model = np.asarray(systematics_model_rel, float)
+    keep = np.asarray(keep, bool)
+    fig, axes = plt.subplots(2, 1, figsize=(10.0, 6.4), sharex=True)
+    axes[0].plot(t, raw, ".", ms=2.3, color="#0072B2", alpha=0.85,
+                 label="Raw saturated-aperture extraction")
+    axes[0].plot(t, model, "-", lw=1.2, color="#D55E00", alpha=0.9,
+                 label="Background + motion model")
+    axes[0].set_ylabel("Relative Flux")
+    axes[0].legend(loc="best", fontsize=8)
+    axes[0].grid(alpha=0.22)
+
+    ppm = (corrected - 1.0) * 1e6
+    axes[1].plot(t[keep], ppm[keep], ".", ms=2.3, color="#0072B2", alpha=0.88,
+                 label="Retained cadences")
+    axes[1].plot(t[~keep], ppm[~keep], "x", ms=3.5, mew=0.9,
+                 color="#D55E00", alpha=0.9, label="Flagged artifacts")
+    axes[1].axhline(0.0, color="0.25", lw=0.8)
+    axes[1].set_ylabel("Detrended Flux [ppm]")
+    axes[1].set_xlabel(str(time_label))
+    axes[1].legend(loc="best", fontsize=8)
+    axes[1].grid(alpha=0.22)
+    fig.suptitle(title, fontsize=10)
+    fig.tight_layout()
+    save_figure_with_optional_pickle(fig, Path(outpng), dpi=180, bbox_inches="tight")
+    plt.close(fig)
 
 
 def build_design_matrix(t, x, y, knot_spacing_days: float = 1.0, psf_sigma=None):
@@ -445,77 +1125,6 @@ def build_design_matrix(t, x, y, knot_spacing_days: float = 1.0, psf_sigma=None)
 
     return np.vstack(cols).T
 
-
-
-# =============================================================================
-# Sector orbital-frequency helpers for saturated-target systematics correction
-# =============================================================================
-
-def load_sector_orbtable(csv_path: str | Path):
-    """Load sector midpoint time + orbital frequency table.
-
-    Preferred columns (as in the bundled table):
-      - sector (int)
-      - mid_btjd (sector midpoint in BJD - 2457000 days)
-      - freq_cyc_per_day (positive orbital frequency in cycles/day)
-
-    The historical ``mid_tjd`` and ``freq_cyc/day`` headings remain accepted
-    so existing user tables continue to work.
-
-    Returns a dict: sector -> (mid_btjd, freq_cyc_per_day)
-    """
-    p = Path(csv_path).expanduser()
-    if not p.exists():
-        raise FileNotFoundError(f"Orbital-frequency table not found: {p}")
-    df = pd.read_csv(p)
-    # Strip surrounding whitespace while retaining the user's original labels
-    # for clear error messages.
-    cols = {c.strip(): c for c in df.columns}
-    mid_key = "mid_btjd" if "mid_btjd" in cols else "mid_tjd" if "mid_tjd" in cols else None
-    freq_key = (
-        "freq_cyc_per_day"
-        if "freq_cyc_per_day" in cols
-        else "freq_cyc/day"
-        if "freq_cyc/day" in cols
-        else None
-    )
-    missing = []
-    if "sector" not in cols:
-        missing.append("sector")
-    if mid_key is None:
-        missing.append("mid_btjd (or legacy mid_tjd)")
-    if freq_key is None:
-        missing.append("freq_cyc_per_day (or legacy freq_cyc/day)")
-    if missing:
-        raise ValueError(f"Orbital-frequency table missing columns: {missing}. Found: {list(df.columns)}")
-
-    out = {}
-    invalid_rows = []
-    for row_index, r in df.iterrows():
-        try:
-            sec = int(r[cols["sector"]])
-            mid_btjd = float(r[cols[mid_key]])
-            freq = float(r[cols[freq_key]])
-        except Exception as exc:
-            invalid_rows.append(f"row {int(row_index) + 2}: {type(exc).__name__}")
-            continue
-        if sec < 1 or not np.isfinite(mid_btjd) or not np.isfinite(freq) or freq <= 0:
-            invalid_rows.append(
-                f"row {int(row_index) + 2}: sector={sec}, mid_btjd={mid_btjd}, frequency={freq}"
-            )
-            continue
-        if sec in out:
-            raise ValueError(f"Orbital-frequency table contains duplicate sector {sec}: {p}")
-        out[sec] = (mid_btjd, freq)
-
-    if invalid_rows:
-        preview = "; ".join(invalid_rows[:5])
-        if len(invalid_rows) > 5:
-            preview += f"; plus {len(invalid_rows) - 5} more"
-        raise ValueError(f"Orbital-frequency table contains invalid rows ({preview}): {p}")
-    if not out:
-        raise ValueError(f"Orbital-frequency table loaded but no valid rows found: {p}")
-    return out
 
 
 def infer_sector_from_tpf(tpf_path: Path, tpf_obj=None):
@@ -571,83 +1180,6 @@ def estimate_background_faint_pixels(flux_cube, n_faint: int = 20):
     back = np.nanmean(np.where(np.isfinite(part), part, np.nan), axis=1)
     return back
 
-
-def optimize_background_scale(lc_raw, back, k_max_factor: float = 2.0, n_grid: int = 200):
-    """Choose scalar k to minimize HF metric of (lc_raw - k*back)."""
-    lc = np.asarray(lc_raw, float)
-    b = np.asarray(back, float)
-    good = np.isfinite(lc) & np.isfinite(b)
-    if good.sum() < 100:
-        return 0.0
-    med_lc = np.nanmedian(lc[good])
-    med_b = np.nanmedian(b[good])
-    if not np.isfinite(med_lc) or not np.isfinite(med_b) or med_b == 0:
-        return 0.0
-    scale = med_lc / med_b
-    # Search around 0..k_max_factor*scale
-    ks = np.linspace(0.0, float(k_max_factor) * float(scale), int(n_grid))
-    best_k = 0.0
-    best_m = np.inf
-    for k in ks:
-        temp = lc - k * b
-        med = np.nanmedian(temp[good])
-        temp_rel = temp / med if np.isfinite(med) and med != 0 else temp
-        m = hf_metric_from_flux(temp_rel)
-        if np.isfinite(m) and m < best_m:
-            best_m = m
-            best_k = float(k)
-    return best_k
-
-
-def phase_template_detrend(flux, time_btjd, freq_cyc_per_day, phase_bin: float = 0.01):
-    """Detrend flux by subtracting a phase-binned PCHIP template."""
-    f = np.asarray(flux, float)
-    t = np.asarray(time_btjd, float)
-    ph = (t * float(freq_cyc_per_day)) % 1.0
-
-    # Bin edges/centers
-    binw = float(phase_bin)
-    edges = np.arange(0.0, 1.0 + binw, binw)
-    centers = edges[:-1] + 0.5 * binw
-
-    # Assign to bins
-    idx = np.digitize(ph, edges) - 1
-    b = np.full_like(centers, np.nan, dtype=float)
-    for i in range(len(centers)):
-        m = idx == i
-        if np.any(m):
-            b[i] = np.nanmean(f[m])
-
-    # Fill gaps by interpolation on the circle:
-    # Do a simple fill: linear interp across valid centers, then PCHIP.
-    ok = np.isfinite(b)
-    if ok.sum() < 4:
-        # Too few points for a meaningful template
-        return f.copy(), ph, None
-
-    x = centers[ok]
-    y = b[ok]
-    # Ensure periodic continuity by duplicating around 0/1 if needed
-    x2 = np.concatenate([x - 1.0, x, x + 1.0])
-    y2 = np.concatenate([y, y, y])
-    o = np.argsort(x2)
-    x2, y2 = x2[o], y2[o]
-
-    pchip = PchipInterpolator(x2, y2, extrapolate=True)
-    trend = pchip(ph)
-    med = np.nanmedian(f)
-    f_det = (f - trend) + med
-    return f_det, ph, trend
-
-
-def build_design_matrix_with_back(t, x, y, back, knot_spacing_days: float = 1.0, psf_sigma=None):
-    """Design matrix including background regressor (and quadratic term)."""
-    X = build_design_matrix(t, x, y, knot_spacing_days=knot_spacing_days, psf_sigma=psf_sigma)
-    b = np.asarray(back, float)
-    b0 = np.nanmedian(b)
-    bb = b - b0
-    # Append background terms
-    return np.hstack([X, bb[:, None], (bb**2)[:, None]])
 
 # =============================================================================
 # Metrics + helpers
@@ -1890,6 +2422,97 @@ def infer_header_target_coord(tpf):
         return None
 
 
+def infer_catalog_local_pixel(tpf, image_shape=None):
+    """Return the header catalog position as ``(local row, local column)``."""
+    target_coord = infer_header_target_coord(tpf)
+    if target_coord is None:
+        return None
+    try:
+        column, row = tpf.wcs.world_to_pixel(target_coord)
+        row, column = float(row), float(column)
+    except Exception:
+        try:
+            coords = tpf.get_coordinates(cadence=0)
+            if not isinstance(coords, SkyCoord):
+                ra_grid, dec_grid = coords
+                coords = SkyCoord(
+                    ra=np.asarray(ra_grid, float) * u.deg,
+                    dec=np.asarray(dec_grid, float) * u.deg,
+                )
+            row, column = nearest_pixel_to_coord(coords, target_coord)
+            row, column = float(row), float(column)
+        except Exception:
+            return None
+    if not (np.isfinite(row) and np.isfinite(column)):
+        return None
+    if image_shape is not None:
+        nrow, ncol = map(int, image_shape)
+        if not (-0.75 <= row <= nrow - 0.25 and -0.75 <= column <= ncol - 0.25):
+            return None
+    return row, column
+
+
+def infer_tess_detector_metadata(tpf_path: Path, tpf=None):
+    """Infer TESS camera and CCD from object metadata, FITS headers, or name."""
+    camera = ccd = None
+
+    def accept(value, allowed):
+        try:
+            parsed = int(float(value))
+        except (TypeError, ValueError):
+            return None
+        return parsed if parsed in allowed else None
+
+    if tpf is not None and hasattr(tpf, "meta"):
+        meta = tpf.meta
+        for key in ("CAMERA", "CAM", "CAMERA_NUM", "CAMERANUM"):
+            if key in meta:
+                camera = accept(meta.get(key), {1, 2, 3, 4})
+                if camera is not None:
+                    break
+        for key in ("CCD", "CCDNUM", "CCD_NUM", "DETECTOR"):
+            if key in meta:
+                ccd = accept(meta.get(key), {1, 2, 3, 4})
+                if ccd is not None:
+                    break
+
+    if camera is None or ccd is None:
+        try:
+            with fits.open(tpf_path, memmap=True) as hdul:
+                for hdu in hdul:
+                    header = hdu.header
+                    if camera is None:
+                        for key in ("CAMERA", "CAM", "CAMERA_NUM", "CAMERANUM"):
+                            if key in header:
+                                camera = accept(header.get(key), {1, 2, 3, 4})
+                                if camera is not None:
+                                    break
+                    if ccd is None:
+                        for key in ("CCD", "CCDNUM", "CCD_NUM", "DETECTOR"):
+                            if key in header:
+                                ccd = accept(header.get(key), {1, 2, 3, 4})
+                                if ccd is not None:
+                                    break
+                    if camera is not None and ccd is not None:
+                        break
+        except Exception:
+            pass
+
+    # Astrocut names encode tess-sSSSS-camera-ccd_... .
+    if camera is None or ccd is None:
+        match = re.search(
+            r"tess-s\d{4}-([1-4])-([1-4])(?:_|-)",
+            Path(tpf_path).name,
+            flags=re.IGNORECASE,
+        )
+        if match:
+            if camera is None:
+                camera = int(match.group(1))
+            if ccd is None:
+                ccd = int(match.group(2))
+    return camera, ccd
+
+
 def prioritize_tesscut_center_source(gaia_in, tpf, image_shape):
     """Place the Gaia source nearest the requested TESSCut centre first.
 
@@ -2230,13 +2853,17 @@ def parse_args(argv=None):
         help="Figure of merit used during jump/core aperture growth.",
     )
 
-    # Saturated-target workflows.  The first augments standard aperture
-    # extraction; the second is a separate, single-target extraction approach.
+    # Saturated-target workflows. The correction is target-independent and
+    # uses measured background and image motion; no orbital table or known
+    # stellar period enters the model.
     p.add_argument(
         "--saturated-systematics-correction",
         dest="saturated_systematics_correction",
         action="store_true",
-        help="Apply the saturated-target background, orbital-phase, and split-sector systematics correction.",
+        help=(
+            "Apply global robust background/centroid regression and flag large "
+            "residual artifacts for a heavily saturated single target."
+        ),
     )
     p.add_argument(
         "--matlab-sat-mode",
@@ -2245,24 +2872,18 @@ def parse_args(argv=None):
         default=argparse.SUPPRESS,
         help=argparse.SUPPRESS,
     )
-    p.add_argument(
-        "--orbtable",
-        type=str,
-        default=str(DEFAULT_ORBITAL_TABLE),
-        help=(
-            "Sector orbital-frequency/midpoint CSV used by saturated-target systematics correction. "
-            "The bundled tess_sector_orbfreq_midpoints.csv is used by default."
-        ),
-    )
     p.add_argument("--sat-thresh", type=float, default=1e5, help="Mean-image threshold to consider a pixel saturated (counts).")
     p.add_argument("--sat-min-npix", type=int, default=20, help="Minimum number of pixels above --sat-thresh to treat target as heavily saturated.")
     p.add_argument("--back-nfaint", type=int, default=20, help="Number of faintest pixels to use for per-cadence background estimate.")
-    p.add_argument("--phase-bin", type=float, default=0.01, help="Phase bin width for orbital-phase template subtraction.")
     p.add_argument(
         "--saturation-optimized-aperture",
         dest="saturation_optimized_aperture",
         action="store_true",
-        help="For one heavily saturated source, bypass Gaia and jump/core growth and use scatter-optimized aperture growth.",
+        help=(
+            "For one heavily saturated source, bypass Gaia and jump/core growth and "
+            "use target-connected RAW_CNTS bleed geometry. Extraction is skipped if "
+            "the saturated bleed reaches an axial stamp boundary."
+        ),
     )
     p.add_argument(
         "--matlab-pure-single-sat",
@@ -2276,7 +2897,10 @@ def parse_args(argv=None):
         dest="saturated_aperture_threshold",
         type=float,
         default=3000.0,
-        help="Initial mean-image threshold for the saturation-optimized aperture seed.",
+        help=(
+            "Deprecated compatibility option; accepted but ignored by the RAW_CNTS "
+            "saturated-aperture algorithm."
+        ),
     )
     p.add_argument(
         "--matlab-ap-thresh",
@@ -2303,8 +2927,6 @@ def validate_args(args) -> None:
             incompatible.append("--gaia-region-sum")
         if getattr(args, "external_mask_file", ""):
             incompatible.append("--external-mask-file")
-        if args.saturated_systematics_correction:
-            incompatible.append("--saturated-systematics-correction")
         if args.prf_photometry:
             incompatible.append("--prf-photometry")
         if incompatible:
@@ -2326,8 +2948,6 @@ def validate_args(args) -> None:
         raise ValueError("Aperture sizes and component counts must be positive.")
     if int(args.sat_min_npix) < 1 or int(args.back_nfaint) < 1:
         raise ValueError("Saturation/background pixel counts must be positive.")
-    if not (0.0 < float(args.phase_bin) <= 1.0):
-        raise ValueError("--phase-bin must be in the interval (0, 1].")
     if float(args.prf_fit_radius) <= 0 or float(args.prf_max_shift) <= 0:
         raise ValueError("PRF fit radius and maximum shift must be positive.")
 
@@ -2385,17 +3005,6 @@ def main(argv=None):
             f"Npix={external_mask_metadata['selected_pixels']}"
         )
 
-    # Optional: load sector orbital-frequency table once
-    sector_orb = None
-    if args.saturated_systematics_correction and not args.saturation_optimized_aperture:
-        if not args.orbtable:
-            raise ValueError(
-                "--saturated-systematics-correction requires --orbtable "
-                "unless --saturation-optimized-aperture is used"
-            )
-        args.orbtable = str(Path(args.orbtable).expanduser().resolve())
-        sector_orb = load_sector_orbtable(args.orbtable)
-
     output_root = Path(args.output_root).expanduser().resolve()
     output_root.mkdir(parents=True, exist_ok=True)
     # Flat output structure: all products go directly into --output-root.
@@ -2436,6 +3045,8 @@ def main(argv=None):
         methods_to_run = ["full_region_sum"]
     else:
         methods_to_run = [args.method] if args.method in ("jump", "core") else ["jump", "core"]
+
+    saturated_failures = []
 
     for tpf_path in tpf_paths:
         print("\n" + "#" * 80)
@@ -2492,21 +3103,19 @@ def main(argv=None):
         mission = infer_mission(tpf_path, tpf)
         tesscut_product = is_tesscut_product(tpf_path, tpf)
         time_system = infer_native_time_system(tpf_path, tpf, mission)
+        camera_number, ccd_number = infer_tess_detector_metadata(tpf_path, tpf)
         print(f"  Mission: {mission}; native time: {time_system}; observation: {infer_observation_tag(tpf_path, tpf)}")
+        if mission == "TESS":
+            print(
+                "  Detector metadata: "
+                f"camera={camera_number if camera_number is not None else 'unknown'}, "
+                f"ccd={ccd_number if ccd_number is not None else 'unknown'}"
+            )
         if getattr(args, "prf_photometry", False) and mission in {"KEPLER", "K2"}:
             print(
                 f"  [WARN] {mission} target-pixel data detected: the PRF module is TESS-only "
                 "and will be skipped. Aperture extraction will continue normally."
             )
-        # Sector inference is needed by the optional orbital-phase correction.
-        sector_num = infer_sector_from_tpf(tpf_path, tpf)
-        if args.saturated_systematics_correction and sector_num is None:
-            print(
-                "  [WARN] Saturated-target systematics correction requested, but "
-                "SECTOR could not be inferred; using the standard correction."
-            )
-
-
         # Cadence selection
         native_time = np.asarray(tpf.time.value, float)
         finite_time = np.isfinite(native_time)
@@ -2539,14 +3148,120 @@ def main(argv=None):
                 raise ValueError("--saturation-optimized-aperture requires --n-targets=1.")
             sat_ok, sat_npix = is_heavily_saturated(mean_img, thresh=args.sat_thresh, min_npix=args.sat_min_npix)
             if sat_ok:
-                print(f"  Using saturation-optimized aperture extraction (npix_above_thresh={sat_npix})")
-                lc_df, meta, mean_image_2d, ap_mask_2d, back_series, keep_mask, crow, ccol = extract_saturation_optimized_aperture(
-                    tpf_path,
-                    threshold=args.saturated_aperture_threshold,
-                    nback=args.back_nfaint,
-                    filter_quality=(not args.no_quality0),
-                    verbose=True,
-                )
+                print(f"  Using saturated aperture extraction (npix_above_thresh={sat_npix})")
+                try:
+                    (
+                        lc_df,
+                        meta,
+                        mean_image_2d,
+                        ap_mask_2d,
+                        back_series,
+                        keep_mask,
+                        crow,
+                        ccol,
+                        saturated_geometry,
+                    ) = extract_saturation_optimized_aperture(
+                        tpf_path,
+                        threshold=args.saturated_aperture_threshold,
+                        nback=args.back_nfaint,
+                        filter_quality=(not args.no_quality0),
+                        verbose=True,
+                    )
+                except SaturatedBleedClippedError as exc:
+                    sector_tag = infer_sector_tag(tpf_path, tpf)
+                    try:
+                        target_label, _, _ = infer_single_target_label(
+                            tpf,
+                            mean_image_2d=exc.mean_image,
+                            gaia_radius_arcmin=max(float(args.gaia_radius_arcmin), 12.0),
+                            allow_catalog=(not args.no_gaia),
+                        )
+                    except Exception:
+                        target_label = fast_object_label_from_fits(tpf_path)
+                    failure_stem = build_output_stem(
+                        sector_tag, target_label, 1, "saturated_aperture_failed"
+                    )
+                    failure_record = dict(exc.metadata)
+                    failure_record.update({
+                        "status": "SATURATED_BLEED_CLIPPED",
+                        "failure_reason": str(exc),
+                        "recommended_action": "Use a larger pixel cutout or an FFI-based extraction.",
+                        "normal_light_curve_written": False,
+                        "target_label": target_label,
+                        "target_index": 1,
+                        "tpf_name": tpf_path.name,
+                        "tpf_path": str(tpf_path),
+                        "camera": camera_number,
+                        "ccd": ccd_number,
+                    })
+                    status_path = outdir / f"saturated_aperture_failure_{failure_stem}.csv"
+                    pd.DataFrame([failure_record]).to_csv(status_path, index=False)
+                    diagnostic_path = outdir / f"saturated_aperture_failure_{failure_stem}.png"
+                    save_saturated_clipping_diagnostic(
+                        exc.raw_image,
+                        exc.aperture_mask,
+                        diagnostic_path,
+                        f"{tpf_path.stem} — {target_label} / target1",
+                        clipped_edges=str(exc.metadata.get("clipped_edges", "unknown")),
+                        edge_fraction_of_peak=float(
+                            exc.metadata.get("edge_max_fraction_of_peak", np.nan)
+                        ),
+                        geometry_source=str(
+                            exc.metadata.get("geometry_source", "RAW_CNTS")
+                        ),
+                    )
+                    saturated_failures.append(failure_record)
+                    print("  [SKIPPED] SATURATED_BLEED_CLIPPED")
+                    print(f"  {exc}")
+                    print(f"  Failure record: {status_path.name}")
+                    print(f"  Diagnostic: {diagnostic_path.name}")
+                    continue
+                except SaturatedGeometryUnavailableError as exc:
+                    sector_tag = infer_sector_tag(tpf_path, tpf)
+                    try:
+                        target_label, _, _ = infer_single_target_label(
+                            tpf,
+                            mean_image_2d=exc.mean_image,
+                            gaia_radius_arcmin=max(float(args.gaia_radius_arcmin), 12.0),
+                            allow_catalog=(not args.no_gaia),
+                        )
+                    except Exception:
+                        target_label = fast_object_label_from_fits(tpf_path)
+                    failure_stem = build_output_stem(
+                        sector_tag, target_label, 1, "saturated_aperture_failed"
+                    )
+                    failure_record = dict(exc.metadata)
+                    failure_record.update({
+                        "status": "SATURATED_GEOMETRY_UNAVAILABLE",
+                        "failure_reason": str(exc),
+                        "recommended_action": (
+                            "Verify that the TESSCut FLUX cube contains a spatially "
+                            "resolved saturated signal or regenerate the cutout."
+                        ),
+                        "normal_light_curve_written": False,
+                        "target_label": target_label,
+                        "target_index": 1,
+                        "tpf_name": tpf_path.name,
+                        "tpf_path": str(tpf_path),
+                        "camera": camera_number,
+                        "ccd": ccd_number,
+                    })
+                    status_path = outdir / f"saturated_aperture_failure_{failure_stem}.csv"
+                    pd.DataFrame([failure_record]).to_csv(status_path, index=False)
+                    diagnostic_path = outdir / f"saturated_aperture_failure_{failure_stem}.png"
+                    save_saturated_geometry_failure_diagnostic(
+                        exc.raw_image,
+                        exc.mean_image,
+                        diagnostic_path,
+                        f"{tpf_path.stem} — {target_label} / target1",
+                        failure_reason=str(exc),
+                    )
+                    saturated_failures.append(failure_record)
+                    print("  [SKIPPED] SATURATED_GEOMETRY_UNAVAILABLE")
+                    print(f"  {exc}")
+                    print(f"  Failure record: {status_path.name}")
+                    print(f"  Diagnostic: {diagnostic_path.name}")
+                    continue
                 sector_tag = infer_sector_tag(tpf_path, tpf)
                 target_label, target_gaia_id, target_gaia_g = infer_single_target_label(
                     tpf,
@@ -2565,28 +3280,97 @@ def main(argv=None):
                 # native BKJD and gain the exact compatible BTJD conversion;
                 # TESS retains its native BTJD values directly.
                 native_sat_time = lc_df["time_native"].to_numpy(float)
-                lc_df = make_lightcurve_dataframe(
-                    native_sat_time,
-                    lc_df["flux_detrended_rel"].to_numpy(float),
-                    mission,
-                    time_system,
-                    "flux_rel",
+                raw_sat_flux = lc_df["flux_detrended_rel"].to_numpy(float)
+                if args.saturated_systematics_correction:
+                    corrected_sat_flux, saturated_model, detrend_keep, detrend_meta = (
+                        detrend_saturated_background_motion(
+                            native_sat_time,
+                            raw_sat_flux,
+                            back_series,
+                            crow,
+                            ccol,
+                            n_iter=args.robust_iters,
+                            huber_k=args.huber_k,
+                        )
+                    )
+                    lc_df = make_lightcurve_dataframe(
+                        native_sat_time,
+                        corrected_sat_flux,
+                        mission,
+                        time_system,
+                        "flux_detrended_rel",
+                    )
+                    lc_df["flux_rel"] = raw_sat_flux
+                    lc_df["systematics_model_rel"] = saturated_model
+                    lc_df["detrend_keep"] = detrend_keep
+                    np.save(
+                        outdir / f"saturated_systematics_model_{output_stem}.npy",
+                        np.asarray(saturated_model, float),
+                    )
+                    np.save(
+                        outdir / f"detrend_keep_{output_stem}.npy",
+                        np.asarray(detrend_keep, bool),
+                    )
+                    meta.update({
+                        "saturated_systematics_correction": True,
+                        **{
+                            f"saturated_detrend_{key}": value
+                            for key, value in detrend_meta.items()
+                        },
+                    })
+                    print(
+                        "  Saturated background/motion correction: "
+                        f"retained={int(np.count_nonzero(detrend_keep))}/{len(detrend_keep)}, "
+                        f"robust cadence noise={detrend_meta['cadence_noise_ppm']:.1f} ppm"
+                    )
+                else:
+                    corrected_sat_flux = raw_sat_flux
+                    saturated_model = np.ones(len(raw_sat_flux), dtype=float)
+                    detrend_keep = np.ones(len(raw_sat_flux), dtype=bool)
+                    lc_df = make_lightcurve_dataframe(
+                        native_sat_time,
+                        raw_sat_flux,
+                        mission,
+                        time_system,
+                        "flux_rel",
+                    )
+                    meta["saturated_systematics_correction"] = False
+                lc_df["saturated_systematics_correction"] = bool(
+                    args.saturated_systematics_correction
                 )
                 lc_df["target_label"] = target_label
                 lc_df["target_index"] = 1
                 lc_df["method"] = "saturated_aperture"
                 lc_df["sector"] = sector_tag
                 lc_df["tpf_name"] = tpf_path.name
+                lc_df["tpf_path"] = str(tpf_path)
+                lc_df["camera"] = camera_number if camera_number is not None else np.nan
+                lc_df["ccd"] = ccd_number if ccd_number is not None else np.nan
                 lc_df["gaia_source_id"] = target_gaia_id if target_gaia_id is not None else ""
                 lc_df["gaia_g_mag"] = target_gaia_g
+                meta["camera"] = camera_number
+                meta["ccd"] = ccd_number
+                meta["tpf_path"] = str(tpf_path)
                 lc_df.to_csv(raw_csv_path, index=False)
-                save_lightcurve_plot(
-                    native_sat_time,
-                    lc_df["flux_rel"].to_numpy(float),
-                    outdir / f"preferred_lc_{output_stem}.png",
-                    f"{tpf_path.stem} — {target_label} / target1 (saturated_aperture)",
-                    time_label=mission_time_axis_label(time_system),
-                )
+                if args.saturated_systematics_correction:
+                    save_saturated_detrending_plot(
+                        native_sat_time,
+                        raw_sat_flux,
+                        corrected_sat_flux,
+                        saturated_model,
+                        detrend_keep,
+                        outdir / f"preferred_lc_{output_stem}.png",
+                        f"{tpf_path.stem} — {target_label} / target1 (saturated_aperture)",
+                        time_label=mission_time_axis_label(time_system),
+                    )
+                else:
+                    save_lightcurve_plot(
+                        native_sat_time,
+                        raw_sat_flux,
+                        outdir / f"preferred_lc_{output_stem}.png",
+                        f"{tpf_path.stem} — {target_label} / target1 (saturated_aperture)",
+                        time_label=mission_time_axis_label(time_system),
+                    )
                 pd.DataFrame([meta]).to_csv(outdir / f"saturated_aperture_meta_{output_stem}.csv", index=False)
                 np.save(outdir / f"aperture_mask_{output_stem}.npy", np.asarray(ap_mask_2d, bool))
                 np.save(outdir / f"background_{output_stem}.npy", np.asarray(back_series, float))
@@ -2594,11 +3378,15 @@ def main(argv=None):
                 np.save(outdir / f"centroid_row_{output_stem}.npy", np.asarray(crow, float))
                 np.save(outdir / f"centroid_col_{output_stem}.npy", np.asarray(ccol, float))
                 if not args.no_aperture_plots:
-                    save_aperture_plot(
-                        mean_image_2d,
+                    print("  Aperture diagnostic: publication-style saturated success plot (v2)")
+                    save_saturated_aperture_success_diagnostic(
+                        saturated_geometry,
                         ap_mask_2d,
                         outdir / f"aperture_{output_stem}.png",
                         f"{tpf_path.stem} — {target_label} / target1 (saturated_aperture)",
+                        catalog_position=infer_catalog_local_pixel(
+                            tpf, image_shape=ap_mask_2d.shape
+                        ),
                     )
                 print(
                     f"  Wrote {target_label} / target1 (saturated_aperture): {raw_csv_path.name}"
@@ -3057,12 +3845,11 @@ def main(argv=None):
                 psf_sig = None
                 if args.psf_proxy:
                     psf_sig = psf_width_sigma(flux, ap, crow, ccol)
-                # Saturated-target correction is gated on both morphology and
-                # a valid sector entry so an unsuitable request falls back to
-                # the standard correction without discarding the extraction.
+                # Saturated-target correction is gated on morphology only. It
+                # uses measured background and image motion, not sector-specific
+                # orbital information.
                 use_saturated_correction = bool(
                     args.saturated_systematics_correction
-                    and sector_orb is not None
                     and n_use == 1
                 )
                 if use_saturated_correction:
@@ -3073,65 +3860,43 @@ def main(argv=None):
                             f"saturation gate failed (npix_above_thresh={sat_npix}); using the standard correction."
                         )
                         use_saturated_correction = False
-                if use_saturated_correction:
-                    if sector_num not in sector_orb:
-                        print(
-                            f"  [WARN] Sector {sector_num} is absent from the orbital table; "
-                            "using the standard correction."
-                        )
-                        use_saturated_correction = False
-
-                # Build per-cadence background from faint pixels (if needed)
+                # Build per-cadence background and apply the same physical
+                # correction used by the saturated-aperture path.
                 back = None
-                orbital_phase = None
-                orbital_trend = None
-                background_scale = None
+                saturated_model = None
+                detrend_keep = None
+                saturated_detrend_meta = None
                 if use_saturated_correction:
                     back = estimate_background_faint_pixels(flux, n_faint=args.back_nfaint)
-                    # Optimize background scaling and subtract
-                    background_scale = optimize_background_scale(lc_raw, back)
-                    lc_raw2 = lc_raw - background_scale * back
-                    med2 = np.nanmedian(lc_raw2)
-                    lc_rel2 = lc_raw2 / med2 if np.isfinite(med2) and med2 != 0 else lc_raw2
-                    # Orbit-phase template detrend
-                    mid_btjd, freq_cpd = sector_orb[sector_num]
-                    lc_rel2_det, orbital_phase, orbital_trend = phase_template_detrend(
-                        lc_rel2, t_g, freq_cpd, phase_bin=args.phase_bin
+                    lc_work, saturated_model, detrend_keep, saturated_detrend_meta = (
+                        detrend_saturated_background_motion(
+                            t_g,
+                            lc_rel,
+                            back,
+                            crow,
+                            ccol,
+                            n_iter=args.robust_iters,
+                            huber_k=args.huber_k,
+                        )
                     )
-                    lc_work = lc_rel2_det
+                    print(
+                        "  Saturated background/motion correction: "
+                        f"retained={int(np.count_nonzero(detrend_keep))}/{len(detrend_keep)}, "
+                        f"robust cadence noise={saturated_detrend_meta['cadence_noise_ppm']:.1f} ppm"
+                    )
                 else:
                     lc_work = lc_rel
 
                 # -----------------------------------------------------------------
-                # Decorrelation (standard or split-at-mid-sector with background term)
+                # Standard position/time decorrelation remains unchanged for
+                # non-saturated workflows. The saturated correction above is
+                # already complete and is not followed by a second fit.
                 # -----------------------------------------------------------------
                 if args.full_region_sum:
                     lc_xy = lc_work.copy()
                 else:
                     if use_saturated_correction:
-                        mid_btjd, freq_cpd = sector_orb[sector_num]
-                        # Split at mid-sector (downlink break proxy)
-                        m1 = t_g < mid_btjd
-                        m2 = ~m1
                         lc_xy = lc_work.copy()
-
-                        for mask in (m1, m2):
-                            if mask.sum() < 200:
-                                continue
-                            # Design matrix with background term
-                            X = build_design_matrix_with_back(
-                                t_g[mask],
-                                ccol[mask],
-                                crow[mask],
-                                back[mask] if back is not None else np.zeros(mask.sum()),
-                                knot_spacing_days=args.knot_spacing_days,
-                                psf_sigma=(psf_sig[mask] if psf_sig is not None else None),
-                            )
-                            yseg = lc_work[mask] - np.nanmedian(lc_work[mask])
-                            good = np.isfinite(yseg) & np.all(np.isfinite(X), axis=1)
-                            if good.sum() > 300:
-                                beta = robust_wls(X[good], yseg[good], n_iter=args.robust_iters, huber_k=args.huber_k)
-                                lc_xy[mask] = (yseg - (X @ beta)) + np.nanmedian(lc_work[mask])
                     else:
                         X = build_design_matrix(
                             t_g,
@@ -3154,6 +3919,11 @@ def main(argv=None):
                 output_df = make_lightcurve_dataframe(
                     t_g, lc_xy, mission, time_system, "flux_detrended_rel"
                 )
+                output_df["sector"] = sector_tag
+                output_df["tpf_name"] = tpf_path.name
+                output_df["tpf_path"] = str(tpf_path)
+                output_df["camera"] = camera_number if camera_number is not None else np.nan
+                output_df["ccd"] = ccd_number if ccd_number is not None else np.nan
                 output_df["saturated_systematics_correction"] = bool(use_saturated_correction)
                 if active_external_metadata is not None:
                     # Repeated identity columns keep the CSV self-describing;
@@ -3164,19 +3934,40 @@ def main(argv=None):
                     output_df["external_mask_sha256"] = active_external_metadata["sha256"]
                 if use_saturated_correction:
                     output_df["background"] = np.asarray(back, float)
-                    output_df["background_scale"] = float(background_scale)
-                    output_df["orbital_phase"] = np.asarray(orbital_phase, float)
-                    if orbital_trend is not None:
-                        output_df["orbital_phase_trend"] = np.asarray(orbital_trend, float)
+                    output_df["flux_rel"] = np.asarray(lc_rel, float)
+                    output_df["systematics_model_rel"] = np.asarray(saturated_model, float)
+                    output_df["detrend_keep"] = np.asarray(detrend_keep, bool)
+                    for key, value in saturated_detrend_meta.items():
+                        output_df[f"saturated_detrend_{key}"] = value
                     np.save(outdir / f"background_{output_stem}.npy", np.asarray(back, float))
+                    np.save(
+                        outdir / f"saturated_systematics_model_{output_stem}.npy",
+                        np.asarray(saturated_model, float),
+                    )
+                    np.save(
+                        outdir / f"detrend_keep_{output_stem}.npy",
+                        np.asarray(detrend_keep, bool),
+                    )
                 output_df.to_csv(outdir / f"preferred_lc_{output_stem}.csv", index=False)
-                save_lightcurve_plot(
-                    t_g,
-                    lc_xy,
-                    outdir / f"preferred_lc_{output_stem}.png",
-                    f"{tpf_path.stem} — {source_label} / target{k+1} ({meth_tag})",
-                    time_label=mission_time_axis_label(time_system),
-                )
+                if use_saturated_correction:
+                    save_saturated_detrending_plot(
+                        t_g,
+                        lc_rel,
+                        lc_xy,
+                        saturated_model,
+                        detrend_keep,
+                        outdir / f"preferred_lc_{output_stem}.png",
+                        f"{tpf_path.stem} — {source_label} / target{k+1} ({meth_tag})",
+                        time_label=mission_time_axis_label(time_system),
+                    )
+                else:
+                    save_lightcurve_plot(
+                        t_g,
+                        lc_xy,
+                        outdir / f"preferred_lc_{output_stem}.png",
+                        f"{tpf_path.stem} — {source_label} / target{k+1} ({meth_tag})",
+                        time_label=mission_time_axis_label(time_system),
+                    )
                 np.save(outdir / f"aperture_mask_{output_stem}.npy", ap_mask.astype(bool))
                 np.save(outdir / f"centroid_row_{output_stem}.npy", np.asarray(crow, float))
                 np.save(outdir / f"centroid_col_{output_stem}.npy", np.asarray(ccol, float))
@@ -3224,6 +4015,16 @@ def main(argv=None):
                     f"  Wrote {tag} ({meth_tag}): preferred_lc_{output_stem}.csv"
                     f"  Npix={int(np.count_nonzero(ap_mask))}"
                 )
+
+    if saturated_failures:
+        failure_summary = output_root / "saturated_aperture_failures.csv"
+        pd.DataFrame(saturated_failures).to_csv(failure_summary, index=False)
+        print(
+            f"\nCompleted with {len(saturated_failures)} clipped saturated "
+            f"target(s) skipped. Summary: {failure_summary}"
+        )
+        if len(tpf_paths) == 1 or len(saturated_failures) == len(tpf_paths):
+            return 2
 
     print("\nDone.")
     return 0
