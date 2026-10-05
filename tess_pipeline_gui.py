@@ -81,6 +81,8 @@ EXPERT_DEFAULTS = {
     "detrender_script": str(DEFAULT_DETRENDER_SCRIPT),
     "ex_gaia_radius": 6.0,
     "ex_no_gaia": False,
+    "ex_no_simbad": False,
+    "ex_force_filename_names": False,
     "ex_gaia_fallback": False,
     "ex_no_quality0": False,
     "ex_full_region_sum": False,
@@ -235,7 +237,7 @@ N targets
   brightness order. In no-Gaia modes this should usually be 1.
 
 Method
-  --method {jump, core, both}
+  --method {jump, core, both, quick}
   jump:
     Multi-component aperture growth.
   core:
@@ -249,6 +251,13 @@ Gaia radius [arcmin]
 
 No Gaia
   --no-gaia
+    Disable Gaia source queries only; SIMBAD naming is independent.
+
+  --no-simbad
+    Disable SIMBAD name lookups only.
+
+  --force-filename-names
+    Force labels from the input filename; skip naming lookups.
   Skip Gaia queries and define the target from image pixels instead.
   Normally appropriate only for single-target workflows.
 
@@ -557,9 +566,11 @@ TOOLTIPS = {
     "ex_recursive": "Search subdirectories under the chosen TPF directory.",
     "ex_output_root": "Directory passed as --output-root. Extracted CSVs, NPYs, and PNGs are written here.",
     "ex_n_targets": "Number of targets to extract per stamp. TESSCut target 1 is nearest the requested cutout centre; otherwise targets are ordered by Gaia brightness.",
-    "ex_method": "Aperture-growth method: jump, core, or both.",
+    "ex_method": "Aperture method: jump/core growth, both, or quick (fixed 2.5-pixel radius, median sky in a 5--7-pixel annulus; no extraction decorrelation).",
     "ex_gaia_radius": "Cone-search radius used for Gaia target lookup.",
-    "ex_no_gaia": "Skip Gaia queries and define the target from image pixels instead. Best for single-target runs.",
+    "ex_no_gaia": "Skip Gaia source queries and define a single target from image pixels. SIMBAD naming is controlled separately.",
+    "ex_no_simbad": "Skip SIMBAD name lookups without disabling Gaia source identification.",
+    "ex_force_filename_names": "Use the input filename for output labels, regardless of catalogs or header names. A leading HD/HIP/TIC/KIC/EPIC ID is retained; otherwise the full stem is used. Gaia source discovery is unaffected.",
     "ex_gaia_fallback": "If Gaia fails, fall back to no-Gaia single-target mode.",
     "ex_no_quality0": "Do not restrict to QUALITY==0 cadences.",
     "ex_full_region_sum": "Use the full allowed target region without optimizing a smaller aperture.",
@@ -970,6 +981,8 @@ class TESSGui(tk.Tk):
         self.ex_gaia_radius = tk.DoubleVar(value=6.0)
 
         self.ex_no_gaia = tk.BooleanVar(value=False)
+        self.ex_no_simbad = tk.BooleanVar(value=False)
+        self.ex_force_filename_names = tk.BooleanVar(value=False)
         self.ex_gaia_fallback = tk.BooleanVar(value=False)
         self.ex_no_quality0 = tk.BooleanVar(value=False)
         self.ex_full_region_sum = tk.BooleanVar(value=False)
@@ -1276,7 +1289,7 @@ class TESSGui(tk.Tk):
         )
         self.ex_method_combo = self._combo(
             self.ex_basic_settings_frame, "Aperture method", self.ex_method,
-            ["jump", "core", "both"], 1, 2, tooltip_key="ex_method",
+            ["jump", "core", "both", "quick"], 1, 2, tooltip_key="ex_method",
         )
         ttk.Label(
             self.ex_basic_settings_frame,
@@ -1328,8 +1341,14 @@ class TESSGui(tk.Tk):
             pady=4,
         )
 
+        self._make_checkbutton(main_frame, text="No SIMBAD", variable=self.ex_no_simbad,
+                               command=self._update_extractor_command_preview, tooltip_key="ex_no_simbad",
+                               row=4, column=0, sticky="w", padx=6, pady=4)
+        self._make_checkbutton(main_frame, text="Name from input filename", variable=self.ex_force_filename_names,
+                               command=self._update_extractor_command_preview, tooltip_key="ex_force_filename_names",
+                               row=4, column=1, columnspan=3, sticky="w", padx=6, pady=4)
         self.ex_warning_label = ttk.Label(main_frame, text="", foreground="firebrick")
-        self.ex_warning_label.grid(row=4, column=0, columnspan=4, sticky="w", padx=6, pady=(4, 0))
+        self.ex_warning_label.grid(row=5, column=0, columnspan=4, sticky="w", padx=6, pady=(4, 0))
 
         adv = ttk.LabelFrame(root, text="Expert numerical controls")
         self.ex_advanced_frame = adv
@@ -1911,7 +1930,7 @@ class TESSGui(tk.Tk):
         vars_to_trace = [
             self.extractor_script, self.ex_input_mode, self.ex_tpf_dir, self.ex_single_file,
             self.ex_recursive, self.ex_output_root, self.ex_n_targets, self.ex_method,
-            self.ex_gaia_radius, self.ex_no_gaia, self.ex_gaia_fallback, self.ex_no_quality0,
+            self.ex_gaia_radius, self.ex_no_gaia, self.ex_no_simbad, self.ex_force_filename_names, self.ex_gaia_fallback, self.ex_no_quality0,
             self.ex_full_region_sum, self.ex_gaia_region_sum, self.ex_save_aperture_plots,
             self.ex_save_pickled_figures, self.ex_saturated_systematics,
             self.ex_extraction_approach,
@@ -2202,6 +2221,10 @@ class TESSGui(tk.Tk):
 
         if self.ex_no_gaia.get():
             cmd.append("--no-gaia")
+        if self.ex_no_simbad.get():
+            cmd.append("--no-simbad")
+        if self.ex_force_filename_names.get():
+            cmd.append("--force-filename-names")
         if self.ex_gaia_fallback.get():
             cmd.append("--gaia-fallback")
         if self.ex_no_quality0.get():
@@ -2661,6 +2684,8 @@ class TESSGui(tk.Tk):
             "ex_method": self.ex_method.get(),
             "ex_gaia_radius": self.ex_gaia_radius.get(),
             "ex_no_gaia": self.ex_no_gaia.get(),
+            "ex_no_simbad": self.ex_no_simbad.get(),
+            "ex_force_filename_names": self.ex_force_filename_names.get(),
             "ex_gaia_fallback": self.ex_gaia_fallback.get(),
             "ex_no_quality0": self.ex_no_quality0.get(),
             "ex_full_region_sum": self.ex_full_region_sum.get(),

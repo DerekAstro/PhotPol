@@ -51,18 +51,50 @@ except Exception as _prf_import_error:
     _HAVE_PRF_MODULE = False
     _PRF_IMPORT_ERROR = _prf_import_error
 
-try:
-    from astroquery.simbad import Simbad
-except Exception:
-    Simbad = None
+# Catalog imports and network calls run only in a disposable worker.
+# This bounds astroquery/TAP polling even when its HTTP timeouts do not.
+CATALOG_TIMEOUT_SECONDS = 30.0
+_CATALOG_FAILURES = {}
+_SIMBAD_ENABLED = True
+_FORCE_FILENAME_NAMES = False
+_CURRENT_INPUT_LABEL = "unknown_target"
 
-try:
-    from astroquery.gaia import Gaia
-except Exception:
-    # Gaia is optional for explicit single-target/no-Gaia workflows.  Keeping
-    # the import optional also lets users inspect --help without installing
-    # astroquery; a clear error is raised only if a Gaia query is requested.
-    Gaia = None
+
+def query_catalog_with_deadline(service, coordinate, radius):
+    import subprocess
+    import sys
+    import tempfile
+
+    if service in _CATALOG_FAILURES:
+        raise RuntimeError(f"{service} disabled for this run after: {_CATALOG_FAILURES[service]}")
+    worker = Path(__file__).with_name("photpol_catalog_query.py")
+    if not worker.is_file():
+        raise FileNotFoundError(f"Catalog worker missing: {worker}. Install it beside this extractor.")
+    seconds = float(CATALOG_TIMEOUT_SECONDS)
+    print(f"  [{service.upper()}] Query started; wall-clock limit {seconds:g} s", flush=True)
+    with tempfile.TemporaryDirectory(prefix="photpol_catalog_") as temporary:
+        output = Path(temporary) / "result.pkl"
+        command = [sys.executable, str(worker), service,
+                   str(float(coordinate.ra.deg)), str(float(coordinate.dec.deg)),
+                   str(float(radius)), str(output)]
+        try:
+            completed = subprocess.run(command, capture_output=True, text=True, timeout=seconds)
+            if completed.returncode:
+                detail = (completed.stderr or completed.stdout).strip()[-1500:]
+                raise RuntimeError(f"{service} worker failed: {detail}")
+            with output.open("rb") as stream:
+                table = pickle.load(stream)
+        except subprocess.TimeoutExpired:
+            reason = f"wall-clock deadline of {seconds:g} s exceeded; worker terminated"
+            _CATALOG_FAILURES[service] = reason
+            print(f"  [WARN] {service.upper()}: {reason}", flush=True)
+            raise TimeoutError(f"{service}: {reason}") from None
+        except Exception as exc:
+            _CATALOG_FAILURES[service] = str(exc)
+            print(f"  [WARN] {service.upper()} query failed; further attempts disabled for this run", flush=True)
+            raise
+    print(f"  [{service.upper()}] Query finished", flush=True)
+    return table
 
 
 APERTURE_FOM_MODE = "stddiff"
@@ -1166,6 +1198,76 @@ def is_heavily_saturated(mean_img, thresh: float, min_npix: int):
     return n >= int(min_npix), n
 
 
+def quick_annular_photometry(flux_cube, row, column):
+    """Earlier quick extraction: radius 2.5, median sky at radii 5--7 pixels."""
+    flux = np.asarray(flux_cube, float)
+    yy, xx = np.indices(flux.shape[1:])
+    radius = np.hypot(yy-float(row), xx-float(column))
+    aperture = radius <= 2.5
+    sky_mask = (radius >= 5.0) & (radius <= 7.0)
+    if not aperture.any() or sky_mask.sum() < 5:
+        raise ValueError("Quick extraction needs an aperture and at least five pixels in the 5--7 pixel annulus; use a larger cutout.")
+    # A cut-off aperture changes the method and its throughput: require room.
+    ny, nx = flux.shape[1:]
+    if row-2.5 < -0.5 or row+2.5 > ny-0.5 or column-2.5 < -0.5 or column+2.5 > nx-0.5:
+        raise ValueError("Quick extraction's 2.5-pixel aperture crosses the cutout edge; use a larger cutout.")
+    sky = np.nanmedian(flux[:,sky_mask],axis=1)
+    sky_count = np.sum(np.isfinite(flux[:,sky_mask]),axis=1)
+    ap_count = np.sum(np.isfinite(flux[:,aperture]),axis=1)
+    # Exactly the original formula on fully finite data; flag incomplete
+    # apertures rather than silently changing throughput between cadences.
+    lightcurve = np.nansum(flux[:,aperture],axis=1)-sky*int(aperture.sum())
+    lightcurve[(sky_count < 5) | (ap_count != aperture.sum()) | ~np.isfinite(sky)] = np.nan
+    return lightcurve, aperture, sky_mask, sky, sky_count
+
+
+def aperture_background_mask(flux_cube, seeds, source_sigma=5.0, dilation=2):
+    """Fixed blank-sky mask from a representative image, without catalog access."""
+    from scipy.ndimage import binary_dilation
+    flux = np.asarray(flux_cube, float)
+    indices = np.unique(np.linspace(0, len(flux)-1, min(len(flux), 2048)).astype(int))
+    image = np.nanmedian(flux[indices], axis=0)
+    finite = np.isfinite(image)
+    values = image[finite]
+    if not values.size:
+        raise ValueError("No finite pixels available for aperture background estimation.")
+    # The lower half reduces stellar influence on the sky-level/noise estimate.
+    lower = values[values <= np.nanmedian(values)]
+    center = float(np.nanmedian(lower))
+    scatter = 1.4826 * float(np.nanmedian(np.abs(lower-center)))
+    threshold = center + float(source_sigma) * max(scatter, np.finfo(float).eps*max(1,abs(center)))
+    sources = finite & (image > threshold)
+    if dilation:
+        sources = binary_dilation(sources, iterations=int(dilation))
+    yy, xx = np.indices(image.shape)
+    for row, col in seeds:
+        sources |= (yy-float(row))**2 + (xx-float(col))**2 <= 5.0**2
+    return finite & ~sources
+
+
+def measure_aperture_background(flux_cube, mask, min_pixels=20):
+    """Symmetrically sigma-clipped median on a fixed mask at each cadence."""
+    flux = np.asarray(flux_cube, float)
+    mask = np.asarray(mask, bool)
+    if np.count_nonzero(mask) < int(min_pixels):
+        raise ValueError(
+            f"Only {np.count_nonzero(mask)} blank-sky pixels remain; need {min_pixels}. "
+            "Use a larger cutout or explicitly select --aperture-background none."
+        )
+    sky = flux[:, mask].copy()
+    for _ in range(3):
+        median = np.nanmedian(sky, axis=1)
+        sigma = 1.4826*np.nanmedian(np.abs(sky-median[:,None]), axis=1)
+        sigma = np.maximum(sigma, np.finfo(float).eps*np.maximum(1, np.abs(median)))
+        sky[np.abs(sky-median[:,None]) > 3.0*sigma[:,None]] = np.nan
+    count = np.sum(np.isfinite(sky), axis=1)
+    background = np.nanmedian(sky, axis=1)
+    background[count < int(min_pixels)] = np.nan
+    if not np.isfinite(background).any():
+        raise ValueError("No cadence has enough usable blank-sky pixels for background subtraction.")
+    return background, count
+
+
 def estimate_background_faint_pixels(flux_cube, n_faint: int = 20):
     """Per-cadence background estimate = mean of faintest n_faint pixels."""
     f = np.asarray(flux_cube, float)
@@ -1257,12 +1359,6 @@ def pixel_radius_from_seed(seed_pix, iy: int, ix: int):
 # =============================================================================
 
 def gaia_brightest_sources_near(tpf, radius_arcmin: float = 6.0):
-    if Gaia is None:
-        raise ImportError(
-            "Gaia target discovery requires astroquery. Install astroquery, "
-            "or use --no-gaia for a single-target image-based extraction."
-        )
-
     ra0 = dec0 = None
     for k in ("RA_OBJ", "RA", "ra"):
         if hasattr(tpf, "meta") and k in tpf.meta:
@@ -1291,14 +1387,7 @@ def gaia_brightest_sources_near(tpf, radius_arcmin: float = 6.0):
         dec0 = np.nanmedian(cg.dec.deg)
 
     center = SkyCoord(ra=ra0 * u.deg, dec=dec0 * u.deg)
-    radius = float(radius_arcmin) * u.arcmin
-
-    # Make sure astroquery does not silently truncate the Gaia result set.
-    Gaia.ROW_LIMIT = -1
-
-    # Use keyword args (astroquery signature changed across versions)
-    job = Gaia.cone_search_async(coordinate=center, radius=radius)
-    tab = job.get_results()
+    tab = query_catalog_with_deadline("gaia", center, float(radius_arcmin))
     print(f"  Gaia cone search returned {len(tab)} rows before inside-stamp filtering")
     if "phot_g_mean_mag" not in tab.colnames:
         raise RuntimeError("Gaia result missing phot_g_mean_mag")
@@ -1773,22 +1862,31 @@ def grow_aperture_bright_core_preseed(
 
 def find_tpfs(search_dir: Path, recursive: bool = False):
     pats = [
-        # TESS SPOC/TESS-SPOC target-pixel products and TESSCut/Astrocut files.
-        "*tp.fits", "*tpf.fits", "*tp.fits.gz", "*tpf.fits.gz",
-        "*_astrocut.fits", "*_astrocut.fits.gz",
-        # Kepler and K2 long-/short-cadence target-pixel products.
-        "*_lpd-targ.fits", "*_spd-targ.fits",
-        "*_lpd-targ.fits.gz", "*_spd-targ.fits.gz",
+        # Standard/native TESS naming
+        "*tp.fits",
+        "*tpf.fits",
+        "*tp.fits.gz",
+        "*tpf.fits.gz",
+        "*_astrocut.fits",
+        "*_astrocut.fits.gz",
+
+        # Herbig pixel-product download notebook naming
+        "*_SPOC_TPF_*.fits",
+        "*_SPOC_TPF_*.fits.gz",
+        "*_TESSCut_FFI_*.fits",
+        "*_TESSCut_FFI_*.fits.gz",
     ]
+
     out = []
+
     if recursive:
         for pat in pats:
             out.extend(search_dir.rglob(pat))
     else:
         for pat in pats:
             out.extend(search_dir.glob(pat))
-    return sorted({p.resolve() for p in out})
 
+    return sorted({p.resolve() for p in out})
 
 def _first_tpf_metadata_value(tpf, keys):
     """Return the first non-empty value from Lightkurve metadata/FITS headers."""
@@ -1999,6 +2097,15 @@ def is_catalog_like_name(name: str) -> bool:
     return n.startswith(prefixes)
 
 
+def target_label_from_input_filename(tpf_path):
+    """Stable local label; leading catalog ID preferred to a product suffix."""
+    stem = Path(tpf_path).stem
+    match = re.match(r"^(HD|HIP|TIC|KIC|EPIC)[ _-]*(\d+)(?=$|[ _-])", stem, re.IGNORECASE)
+    if match:
+        return sanitize_token(f"{match.group(1).upper()}_{int(match.group(2))}")
+    return sanitize_token(stem) or "input_target"
+
+
 def normalize_simbad_main_id(name: str) -> str:
     """Turn SIMBAD-style MAIN_ID values into stable filename-safe labels.
 
@@ -2033,14 +2140,11 @@ def resolve_target_label(target_coord: SkyCoord, gaia_source_id: str | None = No
         return _SIMBAD_CACHE[cache_key]
 
     fallback = sanitize_token(f"GaiaDR3_{gaia_source_id}" if gaia_source_id else "unknown_target")
-    if Simbad is None:
-        _SIMBAD_CACHE[cache_key] = fallback
+    if not _SIMBAD_ENABLED:
         return fallback
 
     try:
-        sim = Simbad()
-        sim.add_votable_fields("ids")
-        tab = sim.query_region(target_coord, radius=5 * u.arcsec)
+        tab = query_catalog_with_deadline("simbad", target_coord, 5.0)
     except Exception:
         _SIMBAD_CACHE[cache_key] = fallback
         return fallback
@@ -2209,7 +2313,7 @@ def build_prf_scene_output_label(source, *, is_primary: bool) -> str:
     """
     label = sanitize_token(getattr(source, "label", "") or "unknown_source")
     source_id = str(getattr(source, "source_id", "") or "").strip()
-    if is_primary or not source_id:
+    if _FORCE_FILENAME_NAMES or is_primary or not source_id:
         return label
     gaia_label = sanitize_token(f"GaiaDR3_{source_id}")
     if label.lower() == gaia_label.lower() or label.lower().startswith("gaiadr3_"):
@@ -2231,11 +2335,14 @@ def resolve_prf_scene_output_names(tpf, prf_result, source_indices):
         if j <= 0 or j >= len(prf_result.sources):
             continue
         source = prf_result.sources[j]
-        try:
-            coord = tpf.wcs.pixel_to_world(float(source.column), float(source.row))
-            resolved = resolve_target_label(coord, source.source_id)
-        except Exception:
-            resolved = source.label
+        if _FORCE_FILENAME_NAMES:
+            resolved = f"{_CURRENT_INPUT_LABEL}_scene{j+1}"
+        else:
+            try:
+                coord = tpf.wcs.pixel_to_world(float(source.column), float(source.row))
+                resolved = resolve_target_label(coord, source.source_id)
+            except Exception:
+                resolved = source.label
         if resolved:
             source.label = sanitize_token(resolved)
         if j < len(scene_rows):
@@ -2244,6 +2351,8 @@ def resolve_prf_scene_output_names(tpf, prf_result, source_indices):
             positions[j]["label"] = source.label
 
 def fast_object_label_from_fits(tpf_path: Path) -> str:
+    if _FORCE_FILENAME_NAMES:
+        return target_label_from_input_filename(tpf_path)
     try:
         with fits.open(tpf_path, memmap=True) as hdul:
             for hdu in hdul[:2]:
@@ -2555,6 +2664,7 @@ def infer_single_target_label(
     mean_image_2d=None,
     gaia_radius_arcmin: float = 12.0,
     allow_catalog: bool = True,
+    allow_gaia: bool = True,
 ):
     """Infer a human-friendly label for a single-target or saturated-target run.
 
@@ -2568,10 +2678,12 @@ def infer_single_target_label(
 
     Returns (label, gaia_source_id_or_none, gaia_g_mag_or_nan).
 
-    ``allow_catalog=False`` honors an explicit no-Gaia/offline workflow by
-    skipping SIMBAD and Gaia network lookups while retaining local FITS
-    metadata choices.
+    ``allow_catalog=False`` suppresses both services for explicit offline use.
+    ``allow_gaia=False`` suppresses Gaia only; SIMBAD follows its independent
+    --no-simbad setting. Forced filename naming bypasses naming lookups.
     """
+    if _FORCE_FILENAME_NAMES:
+        return _CURRENT_INPUT_LABEL, None, np.nan
     # First choice: useful human-friendly metadata if present.
     # Reject purely catalog-like values here so that SIMBAD/common-name
     # resolution gets a chance before we fall back to TIC/Gaia-style labels.
@@ -2592,7 +2704,7 @@ def infer_single_target_label(
     # Second choice: resolve the intended target coordinate from header metadata.
     # This is the right thing for saturated single-target files, where the
     # brightest pixel can be displaced from the stellar photocenter.
-    if allow_catalog:
+    if allow_catalog and _SIMBAD_ENABLED:
         try:
             tc_hdr = infer_header_target_coord(tpf)
             if tc_hdr is not None:
@@ -2605,7 +2717,7 @@ def infer_single_target_label(
     # Third choice: resolve the brightest pixel position directly through SIMBAD.
     # This is only a fallback when there is no useful target coordinate in the
     # header or that lookup fails.
-    if allow_catalog:
+    if allow_catalog and _SIMBAD_ENABLED:
         try:
             if mean_image_2d is None:
                 mean_image_2d = np.nanmean(np.asarray(tpf.flux, float), axis=0)
@@ -2631,7 +2743,7 @@ def infer_single_target_label(
             pass
 
     # Fifth choice: brightest Gaia source actually inside the stamp.
-    if allow_catalog:
+    if allow_catalog and allow_gaia:
         try:
             gaia_tab = gaia_brightest_sources_near(tpf, radius_arcmin=max(float(gaia_radius_arcmin), 6.0))
             gaia_in, _ = sources_inside_stamp(tpf, gaia_tab, cadence_idx=0)
@@ -2686,9 +2798,9 @@ def parse_args(argv=None):
     )
     p.add_argument(
         "--method",
-        choices=["jump", "core", "both"],
+        choices=["jump", "core", "both", "quick"],
         default="jump",
-        help="Aperture-growth method to run.",
+        help="Aperture method: jump/core growth, both, or quick fixed radius 2.5 with a median 5--7 pixel sky annulus.",
     )
 
     p.add_argument(
@@ -2706,10 +2818,18 @@ def parse_args(argv=None):
     )
 
 
+    p.add_argument("--no-simbad", action="store_true",
+                   help="Skip SIMBAD name resolution independently of Gaia source discovery.")
+    p.add_argument("--force-filename-names", action="store_true",
+                   help="Force output labels from the input filename (leading HD/HIP/TIC/KIC/EPIC ID, otherwise full stem). Naming lookups are skipped; Gaia source discovery is unaffected.")
     p.add_argument(
         "--no-gaia",
         action="store_true",
         help="Do not query the Gaia Archive. Intended for single-target runs (e.g., saturated stars) or when Gaia is unavailable.",
+    )
+    p.add_argument(
+        "--catalog-timeout", type=float, default=30.0,
+        help="Hard wall-clock deadline in seconds for each catalog service, including imports and TAP polling (default: 30). Failed services are not retried in this run.",
     )
     p.add_argument(
         "--gaia-fallback",
@@ -2874,6 +2994,9 @@ def parse_args(argv=None):
     )
     p.add_argument("--sat-thresh", type=float, default=1e5, help="Mean-image threshold to consider a pixel saturated (counts).")
     p.add_argument("--sat-min-npix", type=int, default=20, help="Minimum number of pixels above --sat-thresh to treat target as heavily saturated.")
+    p.add_argument("--aperture-background", choices=["median", "none"], default="median",
+                   help="Core/jump background: fixed source-excluded sky mask and per-cadence clipped median (default), or none.")
+    p.add_argument("--aperture-background-min-pixels", type=int, default=20)
     p.add_argument("--back-nfaint", type=int, default=20, help="Number of faintest pixels to use for per-cadence background estimate.")
     p.add_argument(
         "--saturation-optimized-aperture",
@@ -2983,9 +3106,19 @@ def write_run_configuration(
 
 
 def main(argv=None):
-    global APERTURE_FOM_MODE, SAVE_FIGURE_PICKLES
+    global APERTURE_FOM_MODE, SAVE_FIGURE_PICKLES, CATALOG_TIMEOUT_SECONDS
+    global _SIMBAD_ENABLED, _FORCE_FILENAME_NAMES, _CURRENT_INPUT_LABEL
     args = parse_args(argv)
     validate_args(args)
+    if not np.isfinite(args.catalog_timeout) or args.catalog_timeout <= 0:
+        raise ValueError("--catalog-timeout must be finite and greater than zero.")
+    if args.aperture_background_min_pixels < 3:
+        raise ValueError("--aperture-background-min-pixels must be at least 3.")
+    CATALOG_TIMEOUT_SECONDS = float(args.catalog_timeout)
+    _SIMBAD_ENABLED = not args.no_simbad
+    _FORCE_FILENAME_NAMES = bool(args.force_filename_names)
+    _CATALOG_FAILURES.clear()
+    _SIMBAD_CACHE.clear()
     APERTURE_FOM_MODE = str(getattr(args, "aperture_fom", "stddiff")).strip().lower()
     SAVE_FIGURE_PICKLES = bool(getattr(args, "save_figure_pickles", False))
 
@@ -3044,11 +3177,12 @@ def main(argv=None):
     elif args.full_region_sum:
         methods_to_run = ["full_region_sum"]
     else:
-        methods_to_run = [args.method] if args.method in ("jump", "core") else ["jump", "core"]
+        methods_to_run = [args.method] if args.method in ("jump", "core", "quick") else ["jump", "core"]
 
     saturated_failures = []
 
     for tpf_path in tpf_paths:
+        _CURRENT_INPUT_LABEL = target_label_from_input_filename(tpf_path)
         print("\n" + "#" * 80)
         print("TPF:", tpf_path)
 
@@ -3174,7 +3308,7 @@ def main(argv=None):
                             tpf,
                             mean_image_2d=exc.mean_image,
                             gaia_radius_arcmin=max(float(args.gaia_radius_arcmin), 12.0),
-                            allow_catalog=(not args.no_gaia),
+                            allow_gaia=(not args.no_gaia),
                         )
                     except Exception:
                         target_label = fast_object_label_from_fits(tpf_path)
@@ -3223,7 +3357,7 @@ def main(argv=None):
                             tpf,
                             mean_image_2d=exc.mean_image,
                             gaia_radius_arcmin=max(float(args.gaia_radius_arcmin), 12.0),
-                            allow_catalog=(not args.no_gaia),
+                            allow_gaia=(not args.no_gaia),
                         )
                     except Exception:
                         target_label = fast_object_label_from_fits(tpf_path)
@@ -3267,7 +3401,7 @@ def main(argv=None):
                     tpf,
                     mean_image_2d=mean_image_2d,
                     gaia_radius_arcmin=max(float(args.gaia_radius_arcmin), 12.0),
-                    allow_catalog=(not args.no_gaia),
+                    allow_gaia=(not args.no_gaia),
                 )
                 output_stem = build_output_stem(sector_tag, target_label, 1, "saturated_aperture")
                 raw_csv_path = outdir / f"preferred_lc_{output_stem}.csv"
@@ -3487,7 +3621,8 @@ def main(argv=None):
             ]
             gmag = [float(m) for m in gaia_use["phot_g_mean_mag"]]
             sid = [str(s) for s in gaia_use["source_id"]]
-            source_labels = [resolve_target_label(tc, gs) for tc, gs in zip(target_coords, sid)]
+            source_labels = ([_CURRENT_INPUT_LABEL]*n_use if _FORCE_FILENAME_NAMES else
+                             [resolve_target_label(tc, gs) for tc, gs in zip(target_coords, sid)])
 
             # For a genuine single-target TPF, prefer the stable human-readable
             # OBJECT/TARGNAME label recorded in the file when the selected Gaia
@@ -3502,6 +3637,7 @@ def main(argv=None):
                         tpf,
                         mean_img,
                         gaia_radius_arcmin=float(args.gaia_radius_arcmin),
+                        allow_gaia=(not args.no_gaia),
                     )
                     header_coord = infer_header_target_coord(tpf)
                     selected_matches_header = False
@@ -3549,11 +3685,11 @@ def main(argv=None):
                     tpf,
                     mean_img,
                     gaia_radius_arcmin=float(args.gaia_radius_arcmin),
-                    allow_catalog=(not args.no_gaia),
+                    allow_gaia=(not args.no_gaia),
                 )
                 source_labels = [single_label if single_label else sanitize_token("unknown_target")]
             except Exception:
-                source_labels = [sanitize_token("unknown_target")]
+                source_labels = [_CURRENT_INPUT_LABEL if _FORCE_FILENAME_NAMES else sanitize_token("unknown_target")]
 
             if external_aperture_mask is not None:
                 print("  External aperture defines a fixed pixel-selected single target")
@@ -3764,6 +3900,14 @@ def main(argv=None):
                             f"({type(exc).__name__}: {exc}); continuing with aperture extraction."
                         )
 
+        # Estimate once from original pixels; PRF fitting above is independent.
+        sky_mask_initial = None
+        sky_initial = None
+        if args.aperture_background == "median" and any(m in {"core", "jump"} for m in methods_to_run):
+            sky_mask_initial = aperture_background_mask(flux, seeds)
+            sky_initial, _ = measure_aperture_background(flux, sky_mask_initial, args.aperture_background_min_pixels)
+            print(f"  Aperture background: source-excluded clipped median; {int(sky_mask_initial.sum())} sky pixels", flush=True)
+
         # Per-target processing
         for k in range(n_use):
             tag = f"target{k+1}"
@@ -3774,9 +3918,39 @@ def main(argv=None):
                 continue
 
             for meth in methods_to_run:
+                aperture_back = None
+                aperture_back_count = None
+                aperture_sky_mask = None
+                photometry_flux = flux
+                if meth in {"core", "jump"} and sky_initial is not None:
+                    photometry_flux = flux - sky_initial[:,None,None]
                 crow = ccol = None
                 active_external_metadata = None
-                if meth == "external_aperture":
+                quick_metadata = None
+                if meth == "quick":
+                    coordinate = infer_header_target_coord(tpf) if n_use == 1 else None
+                    center_source = "header_coordinate"
+                    if coordinate is None and target_coords is not None:
+                        coordinate = target_coords[k]
+                        center_source = "selected_source_coordinate"
+                    row, col = map(float, seeds[k])
+                    if coordinate is not None:
+                        col, row = map(float, tpf.wcs.world_to_pixel(coordinate))
+                    else:
+                        center_source = "pixel_seed"
+                        print(f"  [WARN] Quick target{k+1}: no sky coordinate; centering on pixel seed {seeds[k]}", flush=True)
+                    if not np.isfinite([row,col]).all():
+                        raise ValueError("Quick aperture center is not finite.")
+                    lc_raw, ap_mask, aperture_sky_mask, aperture_back, aperture_back_count = quick_annular_photometry(flux,row,col)
+                    photometry_flux = flux-aperture_back[:,None,None]
+                    t_g = time
+                    meth_tag = "quick"
+                    quick_metadata = {"method":"annulus_median", "aperture_radius_pixels":2.5,
+                                      "annulus_inner_pixels":5.0, "annulus_outer_pixels":7.0,
+                                      "center_row":row, "center_column":col, "center_source":center_source,
+                                      "extraction_decorrelation":False, "min_pixels":5}
+                    print(f"  Quick aperture: center=({row:.4f}, {col:.4f}); {ap_mask.sum()} aperture pixels, {aperture_sky_mask.sum()} annulus pixels",flush=True)
+                elif meth == "external_aperture":
                     # Validate against the actual post-read image shape. The
                     # selected pixels deliberately ignore the watershed owner
                     # map: the user's text matrix is the complete aperture.
@@ -3800,7 +3974,7 @@ def main(argv=None):
                     meth_tag = "full_region_sum"
                 elif meth == "jump":
                     t_g, lc_raw, ap_mask, *_ = grow_aperture_multi_component_in_region(
-                        flux,
+                        photometry_flux,
                         time,
                         seed_pix=seeds[k],
                         allowed_mask=allowed,
@@ -3816,7 +3990,7 @@ def main(argv=None):
                     meth_tag = "jump"
                 else:
                     t_g, lc_raw, ap_mask, *_ = grow_aperture_bright_core_preseed(
-                        flux,
+                        photometry_flux,
                         time,
                         seed_pix=seeds[k],
                         allowed_mask=allowed,
@@ -3830,6 +4004,18 @@ def main(argv=None):
                     )
                     meth_tag = "core"
 
+                if meth in {"core", "jump"} and sky_initial is not None:
+                    from scipy.ndimage import binary_dilation
+                    aperture_sky_mask = sky_mask_initial & ~binary_dilation(ap_mask, iterations=2)
+                    aperture_back, aperture_back_count = measure_aperture_background(
+                        flux, aperture_sky_mask, args.aperture_background_min_pixels)
+                    # Final mask cannot overlap the grown aperture or its margin.
+                    # Recompute the sum directly; don't apply a second subtraction.
+                    photometry_flux = flux - aperture_back[:,None,None]
+                    lc_raw = np.nansum(photometry_flux[:, ap_mask], axis=1)
+                    valid_ap = np.sum(np.isfinite(flux[:,ap_mask]), axis=1)
+                    lc_raw[(valid_ap == 0) | ~np.isfinite(aperture_back)] = np.nan
+
                 # Median-normalize raw
                 med = np.nanmedian(lc_raw)
                 lc_rel = lc_raw / med if np.isfinite(med) and med != 0 else lc_raw
@@ -3837,20 +4023,24 @@ def main(argv=None):
                 # Flux-weighted centroid in this aperture
                 ap = ap_mask
                 if crow is None or ccol is None:
-                    denom = np.nansum(flux[:, ap], axis=1)
-                    crow = np.nansum(flux[:, ap] * yy[ap][None, :], axis=1) / denom
-                    ccol = np.nansum(flux[:, ap] * xx[ap][None, :], axis=1) / denom
+                    weights = photometry_flux[:,ap]
+                    if aperture_back is not None:
+                        weights = np.maximum(weights, 0.0)
+                    denom = np.nansum(weights, axis=1)
+                    crow = np.divide(np.nansum(weights*yy[ap][None,:],axis=1), denom, out=np.full(len(time),np.nan), where=denom>0)
+                    ccol = np.divide(np.nansum(weights*xx[ap][None,:],axis=1), denom, out=np.full(len(time),np.nan), where=denom>0)
 
                 # Optional PSF-width proxy
                 psf_sig = None
                 if args.psf_proxy:
-                    psf_sig = psf_width_sigma(flux, ap, crow, ccol)
+                    psf_sig = psf_width_sigma(np.maximum(photometry_flux,0) if aperture_back is not None else flux, ap, crow, ccol)
                 # Saturated-target correction is gated on morphology only. It
                 # uses measured background and image motion, not sector-specific
                 # orbital information.
                 use_saturated_correction = bool(
                     args.saturated_systematics_correction
                     and n_use == 1
+                    and meth != "quick"
                 )
                 if use_saturated_correction:
                     sat_ok, sat_npix = is_heavily_saturated(mean_img, thresh=args.sat_thresh, min_npix=args.sat_min_npix)
@@ -3867,7 +4057,7 @@ def main(argv=None):
                 detrend_keep = None
                 saturated_detrend_meta = None
                 if use_saturated_correction:
-                    back = estimate_background_faint_pixels(flux, n_faint=args.back_nfaint)
+                    back = aperture_back if aperture_back is not None else estimate_background_faint_pixels(flux, n_faint=args.back_nfaint)
                     lc_work, saturated_model, detrend_keep, saturated_detrend_meta = (
                         detrend_saturated_background_motion(
                             t_g,
@@ -3892,7 +4082,7 @@ def main(argv=None):
                 # non-saturated workflows. The saturated correction above is
                 # already complete and is not followed by a second fit.
                 # -----------------------------------------------------------------
-                if args.full_region_sum:
+                if args.full_region_sum or meth == "quick":
                     lc_xy = lc_work.copy()
                 else:
                     if use_saturated_correction:
@@ -3925,6 +4115,31 @@ def main(argv=None):
                 output_df["camera"] = camera_number if camera_number is not None else np.nan
                 output_df["ccd"] = ccd_number if ccd_number is not None else np.nan
                 output_df["saturated_systematics_correction"] = bool(use_saturated_correction)
+                output_df["aperture_background_method"] = "annulus_median" if meth == "quick" else ("source_excluded_clipped_median" if aperture_back is not None else "none")
+                if aperture_back is not None:
+                    output_df["background"] = aperture_back
+                    output_df["background_npix"] = aperture_back_count
+                    output_df["flux_background_subtracted"] = lc_raw
+                    output_df["flux_rel"] = lc_rel
+                    np.save(outdir / f"background_{output_stem}.npy", aperture_back)
+                    np.save(outdir / f"background_mask_{output_stem}.npy", aperture_sky_mask)
+                    with (outdir / f"background_{output_stem}_meta.json").open("w") as stream:
+                        background_metadata = quick_metadata if quick_metadata is not None else {
+                            "method":"source_excluded_clipped_median", "source_threshold_sigma":5,
+                            "source_dilation_pixels":2, "target_exclusion_radius_pixels":5,
+                            "aperture_exclusion_dilation_pixels":2, "clip_sigma":3,
+                            "clip_iterations":3, "min_pixels":args.aperture_background_min_pixels}
+                        background_metadata = dict(background_metadata)
+                        background_metadata.update({"mask_pixels":int(aperture_sky_mask.sum()),
+                                                    "invalid_cadences":int(np.sum(~np.isfinite(lc_raw)))})
+                        json.dump(background_metadata,stream,indent=2)
+                if quick_metadata is not None:
+                    output_df["aperture_definition"] = "fixed_circular_annular_background"
+                    output_df["extraction_decorrelation"] = False
+                    output_df["aperture_center_row"] = quick_metadata["center_row"]
+                    output_df["aperture_center_column"] = quick_metadata["center_column"]
+
+
                 if active_external_metadata is not None:
                     # Repeated identity columns keep the CSV self-describing;
                     # full provenance, orientation, and checksum are also

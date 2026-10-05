@@ -98,6 +98,66 @@ def normalize_lc_stem(stem: str):
         return stem[len("preferred_lc_"):]
     return stem
 
+
+def load_motion_regressors(df, csv_path: Path, diag_root: Path, stem: str,
+                           skip_xybg: bool = False):
+    """Read cadence-aligned PRF motion or legacy aperture centroids.
+
+    PRF shifts and absolute centroids differ by a constant reference position;
+    the design matrix median-centers both, so shifts are valid XY regressors.
+    Never borrow diagnostics from a different extraction method or target.
+    """
+    n = len(df)
+    if skip_xybg:
+        # Retain missing diagnostics as NaN in the output, without masking out
+        # cadences or fabricating motion measurements when XY is disabled.
+        return np.full(n, np.nan), np.full(n, np.nan), "disabled"
+
+    def checked_pair(row, col, source):
+        row, col = np.asarray(row, float), np.asarray(col, float)
+        if row.shape != (n,) or col.shape != (n,):
+            raise ValueError(
+                f"Motion diagnostics from {source} must have one value per CSV "
+                f"cadence ({n}); got row {row.shape}, column {col.shape}."
+            )
+        return row, col, source
+
+    for row_name, col_name in (("motion_row", "motion_column"),
+                               ("centroid_row", "centroid_col")):
+        if row_name in df.columns and col_name in df.columns:
+            return checked_pair(df[row_name], df[col_name],
+                                f"CSV columns {row_name}/{col_name}")
+
+    row_path = find_matching_file(diag_root, "centroid_row", stem)
+    col_path = find_matching_file(diag_root, "centroid_col", stem)
+    if row_path is not None and col_path is not None:
+        return checked_pair(np.load(row_path), np.load(col_path),
+                            "matching centroid NPY files")
+
+    # Older PRF products also carry motion in this exact companion archive.
+    motion_name = f"{csv_path.stem}_prf_motion.npz"
+    local_motion = csv_path.with_name(motion_name)
+    candidates = ([local_motion] if local_motion.is_file()
+                  else sorted(diag_root.rglob(motion_name)))
+    if len(candidates) > 1:
+        raise ValueError(f"Multiple matching PRF motion archives for {csv_path.name}: {candidates}")
+    if candidates:
+        with np.load(candidates[0], allow_pickle=False) as motion:
+            motion_t = np.asarray(motion["time"], float)
+            csv_t = np.asarray(df["time_btjd"], float)
+            if (motion_t.shape != csv_t.shape or
+                    not np.allclose(motion_t, csv_t, rtol=0, atol=1e-8, equal_nan=True)):
+                raise ValueError(f"PRF motion archive times do not match {csv_path.name}.")
+            return checked_pair(motion["row_shift"], motion["column_shift"],
+                                f"PRF motion archive {candidates[0].name}")
+
+    raise FileNotFoundError(
+        f"Could not find motion diagnostics for {stem} under {diag_root}. "
+        "Expected motion_row/motion_column in the CSV, matching centroid NPY "
+        "files, or the matching PRF motion NPZ archive. "
+        "Use --skip-xybg-decorrelation only if you intend to disable XY/background correction."
+    )
+
 def parse_stem_metadata(stem: str):
     """
     Parse stems like:
@@ -1256,19 +1316,20 @@ def main(argv=None):
         t = np.asarray(df["time_btjd"], float)
         flux = np.asarray(df[flux_col], float)
 
-        crow_file = find_matching_file(diag_root, "centroid_row", stem_core)
-        ccol_file = find_matching_file(diag_root, "centroid_col", stem_core)
-        if crow_file is None or ccol_file is None:
-            raise FileNotFoundError(f"Could not find centroid files for {stem_core} under {diag_root}")
-
-        crow = np.load(crow_file)
-        ccol = np.load(ccol_file)
+        skip_xybg = bool(getattr(args, "skip_xybg_decorrelation", False))
+        crow, ccol, motion_source = load_motion_regressors(
+            df, csv_path, diag_root, stem_core, skip_xybg=skip_xybg,
+        )
+        print(f"  Motion regressors: {motion_source}")
 
         bg = None
-        if args.use_background:
+        if args.use_background and not skip_xybg:
             bg_file = find_matching_file(diag_root, "background", stem_core)
             if bg_file is not None:
                 bg = np.load(bg_file)
+            elif "background_prf" in df.columns:
+                bg = np.asarray(df["background_prf"], float)
+                print("  Background regressor: CSV column background_prf")
 
         n = min(len(t), len(flux), len(crow), len(ccol), len(bg) if bg is not None else 10**12)
         t = t[:n]
@@ -1278,7 +1339,9 @@ def main(argv=None):
         if bg is not None:
             bg = bg[:n]
 
-        mask = np.isfinite(t) & np.isfinite(flux) & np.isfinite(crow) & np.isfinite(ccol)
+        mask = np.isfinite(t) & np.isfinite(flux)
+        if not skip_xybg:
+            mask &= np.isfinite(crow) & np.isfinite(ccol)
         if bg is not None:
             mask &= np.isfinite(bg)
 
