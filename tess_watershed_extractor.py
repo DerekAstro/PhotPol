@@ -13,6 +13,7 @@ import argparse
 from datetime import datetime, timezone
 import hashlib
 import json
+import time
 from pathlib import Path
 import re
 import pickle
@@ -54,7 +55,6 @@ except Exception as _prf_import_error:
 # Catalog imports and network calls run only in a disposable worker.
 # This bounds astroquery/TAP polling even when its HTTP timeouts do not.
 CATALOG_TIMEOUT_SECONDS = 30.0
-_CATALOG_FAILURES = {}
 _SIMBAD_ENABLED = True
 _FORCE_FILENAME_NAMES = False
 _CURRENT_INPUT_LABEL = "unknown_target"
@@ -65,35 +65,35 @@ def query_catalog_with_deadline(service, coordinate, radius):
     import sys
     import tempfile
 
-    if service in _CATALOG_FAILURES:
-        raise RuntimeError(f"{service} disabled for this run after: {_CATALOG_FAILURES[service]}")
     worker = Path(__file__).with_name("photpol_catalog_query.py")
     if not worker.is_file():
         raise FileNotFoundError(f"Catalog worker missing: {worker}. Install it beside this extractor.")
     seconds = float(CATALOG_TIMEOUT_SECONDS)
-    print(f"  [{service.upper()}] Query started; wall-clock limit {seconds:g} s", flush=True)
-    with tempfile.TemporaryDirectory(prefix="photpol_catalog_") as temporary:
-        output = Path(temporary) / "result.pkl"
-        command = [sys.executable, str(worker), service,
-                   str(float(coordinate.ra.deg)), str(float(coordinate.dec.deg)),
-                   str(float(radius)), str(output)]
-        try:
+    start = time.monotonic()
+    print(f"  [{service.upper()}] Query started; individual wall-clock limit {seconds:g} s", flush=True)
+    try:
+        with tempfile.TemporaryDirectory(prefix="photpol_catalog_") as temporary:
+            output = Path(temporary) / "result.pkl"
+            command = [sys.executable, str(worker), service,
+                       str(float(coordinate.ra.deg)), str(float(coordinate.dec.deg)),
+                       str(float(radius)), str(output)]
             completed = subprocess.run(command, capture_output=True, text=True, timeout=seconds)
             if completed.returncode:
                 detail = (completed.stderr or completed.stdout).strip()[-1500:]
                 raise RuntimeError(f"{service} worker failed: {detail}")
             with output.open("rb") as stream:
                 table = pickle.load(stream)
-        except subprocess.TimeoutExpired:
-            reason = f"wall-clock deadline of {seconds:g} s exceeded; worker terminated"
-            _CATALOG_FAILURES[service] = reason
-            print(f"  [WARN] {service.upper()}: {reason}", flush=True)
-            raise TimeoutError(f"{service}: {reason}") from None
-        except Exception as exc:
-            _CATALOG_FAILURES[service] = str(exc)
-            print(f"  [WARN] {service.upper()} query failed; further attempts disabled for this run", flush=True)
-            raise
-    print(f"  [{service.upper()}] Query finished", flush=True)
+    except subprocess.TimeoutExpired:
+        elapsed = time.monotonic() - start
+        reason = f"wall-clock limit {seconds:g} s exceeded (elapsed {elapsed:.1f} s); worker terminated"
+        print(f"  [WARN] {service.upper()}: {reason}; next query will still be attempted", flush=True)
+        raise TimeoutError(f"{service}: {reason}") from None
+    except Exception as exc:
+        elapsed = time.monotonic() - start
+        print(f"  [WARN] {service.upper()} query failed after {elapsed:.1f} s: {exc}; next query will still be attempted", flush=True)
+        raise
+    elapsed = time.monotonic() - start
+    print(f"  [{service.upper()}] Query finished in {elapsed:.1f} s", flush=True)
     return table
 
 
@@ -1571,6 +1571,59 @@ def psf_width_sigma(frames, ap_mask, crow, ccol):
 # Aperture growth methods
 # =============================================================================
 
+def enforce_aperture_minimum(aperture, mean_image, owner, target_index, seed,
+                             min_pixels=4, max_radius_pix=np.inf):
+    """Conservatively add adjacent pixels if optimization left a tiny aperture.
+
+    Never take pixels owned by another target. For unassigned (owner=-1)
+    pixels, reject pixels much brighter than the target's seed above the local
+    image baseline; this reduces the chance of reaching into bright neighbors.
+    A minimum is a goal, not permission to introduce obvious contamination.
+    """
+    aperture = np.asarray(aperture, bool).copy()
+    img = np.asarray(mean_image, float)
+    ownership = np.asarray(owner, int)
+    required = max(1, int(min_pixels))
+    original_count = int(aperture.sum())
+    if original_count >= required:
+        return aperture, "already_sufficient"
+    finite_vals = img[np.isfinite(img)]
+    baseline = float(np.nanmedian(finite_vals)) if finite_vals.size else 0.0
+    sy, sx = map(int, seed)
+    signal = max(float(img[sy, sx]) - baseline, 0.0) if np.isfinite(img[sy, sx]) else 0.0
+    # Any unassigned pixel with substantially more signal than the seed is
+    # likely dominated by a bright neighbor, not the faint target.
+    ceiling = baseline + 3.0 * signal if signal > 0 else baseline
+    ny, nx = img.shape
+    while int(aperture.sum()) < required:
+        candidates = []
+        ys, xs = np.where(aperture)
+        seen = set()
+        for y, x in zip(ys, xs):
+            for yy, xx in ((y-1,x),(y+1,x),(y,x-1),(y,x+1)):
+                if not (0 <= yy < ny and 0 <= xx < nx) or aperture[yy, xx] or (yy,xx) in seen:
+                    continue
+                seen.add((yy,xx))
+                if not np.isfinite(img[yy,xx]) or ownership[yy,xx] not in (-1, target_index):
+                    continue
+                radius = np.hypot(yy-sy, xx-sx)
+                if radius > max_radius_pix:
+                    continue
+                if ownership[yy,xx] == -1 and img[yy,xx] > ceiling:
+                    continue
+                # Favor pixels already owned by target, then compactness,
+                # then larger local flux; all growth is four-connected.
+                candidates.append((ownership[yy,xx] != target_index, radius, -img[yy,xx], yy, xx))
+        if not candidates:
+            break
+        _, _, _, yy, xx = min(candidates)
+        aperture[yy,xx] = True
+    final_count = int(aperture.sum())
+    if final_count < required:
+        return aperture, f"shortfall_{final_count}_of_{required}"
+    return aperture, f"expanded_{original_count}_to_{final_count}"
+
+
 def grow_aperture_in_region(
     flux_good,
     time_good,
@@ -2790,6 +2843,8 @@ def parse_args(argv=None):
         help="If set, process only this one TPF path (overrides directory search).",
     )
 
+    p.add_argument("--skip-existing", action="store_true",
+                   help="Resume: preserve completed light-curve CSV products and skip their extraction.")
     p.add_argument(
         "--output-root",
         type=str,
@@ -2844,6 +2899,8 @@ def parse_args(argv=None):
 
     # Growth knobs
     p.add_argument("--min-pixels", type=int, default=10)
+    p.add_argument("--aperture-min-pixels", type=int, default=4,
+                   help="Minimum desired final Core/Jump aperture size; safely add adjacent pixels when possible.")
     p.add_argument("--amp-q-lo", type=float, default=1.0)
     p.add_argument("--amp-q-hi", type=float, default=99.0)
     p.add_argument("--amp-min-frac", type=float, default=0.01)
@@ -2996,7 +3053,7 @@ def parse_args(argv=None):
     p.add_argument("--sat-min-npix", type=int, default=20, help="Minimum number of pixels above --sat-thresh to treat target as heavily saturated.")
     p.add_argument("--aperture-background", choices=["median", "none"], default="median",
                    help="Core/jump background: fixed source-excluded sky mask and per-cadence clipped median (default), or none.")
-    p.add_argument("--aperture-background-min-pixels", type=int, default=20)
+    p.add_argument("--aperture-background-min-pixels", type=int, default=3)
     p.add_argument("--back-nfaint", type=int, default=20, help="Number of faintest pixels to use for per-cadence background estimate.")
     p.add_argument(
         "--saturation-optimized-aperture",
@@ -3067,7 +3124,7 @@ def validate_args(args) -> None:
         raise ValueError("--no-gaia requires --n-targets=1.")
     if not (0.0 <= float(args.amp_q_lo) < float(args.amp_q_hi) <= 100.0):
         raise ValueError("Aperture amplitude percentiles must satisfy 0 <= low < high <= 100.")
-    if int(args.min_pixels) < 1 or int(args.max_components) < 1:
+    if int(args.min_pixels) < 1 or int(args.aperture_min_pixels) < 1 or int(args.max_components) < 1:
         raise ValueError("Aperture sizes and component counts must be positive.")
     if int(args.sat_min_npix) < 1 or int(args.back_nfaint) < 1:
         raise ValueError("Saturation/background pixel counts must be positive.")
@@ -3117,7 +3174,6 @@ def main(argv=None):
     CATALOG_TIMEOUT_SECONDS = float(args.catalog_timeout)
     _SIMBAD_ENABLED = not args.no_simbad
     _FORCE_FILENAME_NAMES = bool(args.force_filename_names)
-    _CATALOG_FAILURES.clear()
     _SIMBAD_CACHE.clear()
     APERTURE_FOM_MODE = str(getattr(args, "aperture_fom", "stddiff")).strip().lower()
     SAVE_FIGURE_PICKLES = bool(getattr(args, "save_figure_pickles", False))
@@ -3180,458 +3236,544 @@ def main(argv=None):
         methods_to_run = [args.method] if args.method in ("jump", "core", "quick") else ["jump", "core"]
 
     saturated_failures = []
+    batch_failures = []
+
+    # Build a one-time index by exact input path, target index and extraction
+    # method. Reading a single CSV row avoids loading long time series.
+    # A stale file with the same sector/label but a different input is NOT reused.
+    existing_outputs = set()
+    if args.skip_existing:
+        for product in output_root.glob("preferred_lc_*.csv"):
+            try:
+                if product.stat().st_size < 100:
+                    continue
+                row = pd.read_csv(product, nrows=1)
+                if row.empty or "tpf_path" not in row.columns:
+                    continue
+                match = re.search(
+                    r"_target(\d+)_(core|jump|quick|full_region_sum|external_aperture)\.csv$",
+                    product.name,
+                )
+                if match is None:
+                    continue
+                source_path = str(Path(str(row["tpf_path"].iloc[0])).expanduser().resolve())
+                target_index = int(match.group(1))
+                method = match.group(2)
+                existing_outputs.add((source_path, target_index, method))
+            except (OSError, ValueError, KeyError, TypeError, pd.errors.ParserError):
+                continue
+        print(f"[RESUME] Indexed {len(existing_outputs)} existing extracted products")
 
     for tpf_path in tpf_paths:
-        _CURRENT_INPUT_LABEL = target_label_from_input_filename(tpf_path)
-        print("\n" + "#" * 80)
-        print("TPF:", tpf_path)
+        # Fast path avoids repeat Gaia queries, FITS loading, and background
+        # estimation for unambiguously completed files. For partial files the
+        # per-target/method check below skips completed products individually.
+        if args.skip_existing and not args.prf_photometry and not args.saturation_optimized_aperture:
+            requested = [(str(tpf_path.resolve()), k, m)
+                         for k in range(1, int(args.n_targets) + 1)
+                         for m in methods_to_run]
+            if requested and all(item in existing_outputs for item in requested):
+                print(f"[RESUME] Skipping fully completed TPF: {tpf_path.name}", flush=True)
+                continue
+        try:
+            _CURRENT_INPUT_LABEL = target_label_from_input_filename(tpf_path)
+            print("\n" + "#" * 80)
+            print("TPF:", tpf_path)
 
-        outdir = output_root
+            outdir = output_root
 
-        # Fast full-region path: avoid loading the full flux cube through Lightkurve.
-        # When PRF photometry is requested we use the normal path because the PRF
-        # branch needs WCS/metadata and cadence-level motion information.
-        if (
-            args.full_region_sum
-            and not args.prf_photometry
-            and not args.saturated_systematics_correction
-            and not args.saturation_optimized_aperture
-        ):
-            mission = infer_mission(tpf_path, None)
-            time_system = infer_native_time_system(tpf_path, None, mission)
-            sector_tag = infer_sector_tag(tpf_path, None)
-            source_label = fast_object_label_from_fits(tpf_path)
-            t_g, lc_raw, mean_img, ap_mask, crow, ccol, seed = fast_full_region_sum_from_fits(
-                tpf_path,
-                no_quality0=bool(args.no_quality0),
-            )
-            print("  Gaia skipped/unavailable: using pixel-defined single target")
-            print(f"    [1] seed={seed}  (brightest pixel in mean image)")
-
-            med = np.nanmedian(lc_raw)
-            lc_xy = lc_raw / med if np.isfinite(med) and med != 0 else lc_raw
-            output_stem = build_output_stem(sector_tag, source_label, 1, "full_region_sum")
-            make_lightcurve_dataframe(
-                t_g, lc_xy, mission, time_system, "flux_detrended_rel"
-            ).to_csv(outdir / f"preferred_lc_{output_stem}.csv", index=False)
-            save_lightcurve_plot(
-                t_g, lc_xy,
-                outdir / f"preferred_lc_{output_stem}.png",
-                f"{tpf_path.stem} — {source_label} / target1 (full_region_sum)",
-                time_label=mission_time_axis_label(time_system),
-            )
-            np.save(outdir / f"aperture_mask_{output_stem}.npy", ap_mask.astype(bool))
-            np.save(outdir / f"centroid_row_{output_stem}.npy", np.asarray(crow, float))
-            np.save(outdir / f"centroid_col_{output_stem}.npy", np.asarray(ccol, float))
-            if not args.no_aperture_plots:
-                save_aperture_plot(
-                    mean_img,
-                    ap_mask.astype(bool),
-                    outdir / f"aperture_{output_stem}.png",
-                    f"{tpf_path.stem} — {source_label} / target1 (full_region_sum)\nGaia G=NA",
+            # Fast full-region path: avoid loading the full flux cube through Lightkurve.
+            # When PRF photometry is requested we use the normal path because the PRF
+            # branch needs WCS/metadata and cadence-level motion information.
+            if (
+                args.full_region_sum
+                and not args.prf_photometry
+                and not args.saturated_systematics_correction
+                and not args.saturation_optimized_aperture
+            ):
+                mission = infer_mission(tpf_path, None)
+                time_system = infer_native_time_system(tpf_path, None, mission)
+                sector_tag = infer_sector_tag(tpf_path, None)
+                source_label = fast_object_label_from_fits(tpf_path)
+                t_g, lc_raw, mean_img, ap_mask, crow, ccol, seed = fast_full_region_sum_from_fits(
+                    tpf_path,
+                    no_quality0=bool(args.no_quality0),
                 )
-            print(f"  Wrote target1 (full_region_sum): preferred_lc_{output_stem}.csv  Npix={int(np.count_nonzero(ap_mask))}")
-            continue
+                print("  Gaia skipped/unavailable: using pixel-defined single target")
+                print(f"    [1] seed={seed}  (brightest pixel in mean image)")
 
-        tpf = lk.read(str(tpf_path))
-        mission = infer_mission(tpf_path, tpf)
-        tesscut_product = is_tesscut_product(tpf_path, tpf)
-        time_system = infer_native_time_system(tpf_path, tpf, mission)
-        camera_number, ccd_number = infer_tess_detector_metadata(tpf_path, tpf)
-        print(f"  Mission: {mission}; native time: {time_system}; observation: {infer_observation_tag(tpf_path, tpf)}")
-        if mission == "TESS":
-            print(
-                "  Detector metadata: "
-                f"camera={camera_number if camera_number is not None else 'unknown'}, "
-                f"ccd={ccd_number if ccd_number is not None else 'unknown'}"
-            )
-        if getattr(args, "prf_photometry", False) and mission in {"KEPLER", "K2"}:
-            print(
-                f"  [WARN] {mission} target-pixel data detected: the PRF module is TESS-only "
-                "and will be skipped. Aperture extraction will continue normally."
-            )
-        # Cadence selection
-        native_time = np.asarray(tpf.time.value, float)
-        finite_time = np.isfinite(native_time)
-        if args.no_quality0:
-            keep_idx = np.flatnonzero(finite_time)
-        else:
-            try:
-                qual = np.asarray(tpf.quality, int)
-                keep_idx = np.flatnonzero((qual == 0) & finite_time)
-                if keep_idx.size == 0:
-                    print("  [WARN] No finite QUALITY==0 cadences; retaining finite-time cadences instead.")
-                    keep_idx = np.flatnonzero(finite_time)
-            except Exception:
-                keep_idx = np.flatnonzero(finite_time)
-
-        if keep_idx.size == 0:
-            print("  [WARN] No finite cadences; skipping this file.")
-            continue
-
-        mid = int(keep_idx[len(keep_idx) // 2]) if len(keep_idx) else 0
-
-        flux = np.asarray(tpf.flux, float)[keep_idx, :, :]
-        time = native_time[keep_idx]
-        mean_img = np.nanmean(flux, axis=0)
-
-        # This approach is intentionally separate from Gaia and jump/core
-        # extraction because it grows a single aperture over the whole stamp.
-        if args.saturation_optimized_aperture:
-            if int(args.n_targets) != 1:
-                raise ValueError("--saturation-optimized-aperture requires --n-targets=1.")
-            sat_ok, sat_npix = is_heavily_saturated(mean_img, thresh=args.sat_thresh, min_npix=args.sat_min_npix)
-            if sat_ok:
-                print(f"  Using saturated aperture extraction (npix_above_thresh={sat_npix})")
-                try:
-                    (
-                        lc_df,
-                        meta,
-                        mean_image_2d,
-                        ap_mask_2d,
-                        back_series,
-                        keep_mask,
-                        crow,
-                        ccol,
-                        saturated_geometry,
-                    ) = extract_saturation_optimized_aperture(
-                        tpf_path,
-                        threshold=args.saturated_aperture_threshold,
-                        nback=args.back_nfaint,
-                        filter_quality=(not args.no_quality0),
-                        verbose=True,
-                    )
-                except SaturatedBleedClippedError as exc:
-                    sector_tag = infer_sector_tag(tpf_path, tpf)
-                    try:
-                        target_label, _, _ = infer_single_target_label(
-                            tpf,
-                            mean_image_2d=exc.mean_image,
-                            gaia_radius_arcmin=max(float(args.gaia_radius_arcmin), 12.0),
-                            allow_gaia=(not args.no_gaia),
-                        )
-                    except Exception:
-                        target_label = fast_object_label_from_fits(tpf_path)
-                    failure_stem = build_output_stem(
-                        sector_tag, target_label, 1, "saturated_aperture_failed"
-                    )
-                    failure_record = dict(exc.metadata)
-                    failure_record.update({
-                        "status": "SATURATED_BLEED_CLIPPED",
-                        "failure_reason": str(exc),
-                        "recommended_action": "Use a larger pixel cutout or an FFI-based extraction.",
-                        "normal_light_curve_written": False,
-                        "target_label": target_label,
-                        "target_index": 1,
-                        "tpf_name": tpf_path.name,
-                        "tpf_path": str(tpf_path),
-                        "camera": camera_number,
-                        "ccd": ccd_number,
-                    })
-                    status_path = outdir / f"saturated_aperture_failure_{failure_stem}.csv"
-                    pd.DataFrame([failure_record]).to_csv(status_path, index=False)
-                    diagnostic_path = outdir / f"saturated_aperture_failure_{failure_stem}.png"
-                    save_saturated_clipping_diagnostic(
-                        exc.raw_image,
-                        exc.aperture_mask,
-                        diagnostic_path,
-                        f"{tpf_path.stem} — {target_label} / target1",
-                        clipped_edges=str(exc.metadata.get("clipped_edges", "unknown")),
-                        edge_fraction_of_peak=float(
-                            exc.metadata.get("edge_max_fraction_of_peak", np.nan)
-                        ),
-                        geometry_source=str(
-                            exc.metadata.get("geometry_source", "RAW_CNTS")
-                        ),
-                    )
-                    saturated_failures.append(failure_record)
-                    print("  [SKIPPED] SATURATED_BLEED_CLIPPED")
-                    print(f"  {exc}")
-                    print(f"  Failure record: {status_path.name}")
-                    print(f"  Diagnostic: {diagnostic_path.name}")
-                    continue
-                except SaturatedGeometryUnavailableError as exc:
-                    sector_tag = infer_sector_tag(tpf_path, tpf)
-                    try:
-                        target_label, _, _ = infer_single_target_label(
-                            tpf,
-                            mean_image_2d=exc.mean_image,
-                            gaia_radius_arcmin=max(float(args.gaia_radius_arcmin), 12.0),
-                            allow_gaia=(not args.no_gaia),
-                        )
-                    except Exception:
-                        target_label = fast_object_label_from_fits(tpf_path)
-                    failure_stem = build_output_stem(
-                        sector_tag, target_label, 1, "saturated_aperture_failed"
-                    )
-                    failure_record = dict(exc.metadata)
-                    failure_record.update({
-                        "status": "SATURATED_GEOMETRY_UNAVAILABLE",
-                        "failure_reason": str(exc),
-                        "recommended_action": (
-                            "Verify that the TESSCut FLUX cube contains a spatially "
-                            "resolved saturated signal or regenerate the cutout."
-                        ),
-                        "normal_light_curve_written": False,
-                        "target_label": target_label,
-                        "target_index": 1,
-                        "tpf_name": tpf_path.name,
-                        "tpf_path": str(tpf_path),
-                        "camera": camera_number,
-                        "ccd": ccd_number,
-                    })
-                    status_path = outdir / f"saturated_aperture_failure_{failure_stem}.csv"
-                    pd.DataFrame([failure_record]).to_csv(status_path, index=False)
-                    diagnostic_path = outdir / f"saturated_aperture_failure_{failure_stem}.png"
-                    save_saturated_geometry_failure_diagnostic(
-                        exc.raw_image,
-                        exc.mean_image,
-                        diagnostic_path,
-                        f"{tpf_path.stem} — {target_label} / target1",
-                        failure_reason=str(exc),
-                    )
-                    saturated_failures.append(failure_record)
-                    print("  [SKIPPED] SATURATED_GEOMETRY_UNAVAILABLE")
-                    print(f"  {exc}")
-                    print(f"  Failure record: {status_path.name}")
-                    print(f"  Diagnostic: {diagnostic_path.name}")
-                    continue
-                sector_tag = infer_sector_tag(tpf_path, tpf)
-                target_label, target_gaia_id, target_gaia_g = infer_single_target_label(
-                    tpf,
-                    mean_image_2d=mean_image_2d,
-                    gaia_radius_arcmin=max(float(args.gaia_radius_arcmin), 12.0),
-                    allow_gaia=(not args.no_gaia),
+                med = np.nanmedian(lc_raw)
+                lc_xy = lc_raw / med if np.isfinite(med) and med != 0 else lc_raw
+                output_stem = build_output_stem(sector_tag, source_label, 1, "full_region_sum")
+                make_lightcurve_dataframe(
+                    t_g, lc_xy, mission, time_system, "flux_detrended_rel"
+                ).to_csv(outdir / f"preferred_lc_{output_stem}.csv", index=False)
+                save_lightcurve_plot(
+                    t_g, lc_xy,
+                    outdir / f"preferred_lc_{output_stem}.png",
+                    f"{tpf_path.stem} — {source_label} / target1 (full_region_sum)",
+                    time_label=mission_time_axis_label(time_system),
                 )
-                output_stem = build_output_stem(sector_tag, target_label, 1, "saturated_aperture")
-                raw_csv_path = outdir / f"preferred_lc_{output_stem}.csv"
-                # Every product is labeled; never remove unrelated products
-                # that may already exist in a user-selected output directory.
-                np.save(outdir / f"keep_idx_{output_stem}.npy", np.flatnonzero(keep_mask))
-                np.save(outdir / f"mean_image_{output_stem}.npy", np.asarray(mean_image_2d, float))
-
-                # Apply the common mission-aware time schema. Kepler/K2 retain
-                # native BKJD and gain the exact compatible BTJD conversion;
-                # TESS retains its native BTJD values directly.
-                native_sat_time = lc_df["time_native"].to_numpy(float)
-                raw_sat_flux = lc_df["flux_detrended_rel"].to_numpy(float)
-                if args.saturated_systematics_correction:
-                    corrected_sat_flux, saturated_model, detrend_keep, detrend_meta = (
-                        detrend_saturated_background_motion(
-                            native_sat_time,
-                            raw_sat_flux,
-                            back_series,
-                            crow,
-                            ccol,
-                            n_iter=args.robust_iters,
-                            huber_k=args.huber_k,
-                        )
-                    )
-                    lc_df = make_lightcurve_dataframe(
-                        native_sat_time,
-                        corrected_sat_flux,
-                        mission,
-                        time_system,
-                        "flux_detrended_rel",
-                    )
-                    lc_df["flux_rel"] = raw_sat_flux
-                    lc_df["systematics_model_rel"] = saturated_model
-                    lc_df["detrend_keep"] = detrend_keep
-                    np.save(
-                        outdir / f"saturated_systematics_model_{output_stem}.npy",
-                        np.asarray(saturated_model, float),
-                    )
-                    np.save(
-                        outdir / f"detrend_keep_{output_stem}.npy",
-                        np.asarray(detrend_keep, bool),
-                    )
-                    meta.update({
-                        "saturated_systematics_correction": True,
-                        **{
-                            f"saturated_detrend_{key}": value
-                            for key, value in detrend_meta.items()
-                        },
-                    })
-                    print(
-                        "  Saturated background/motion correction: "
-                        f"retained={int(np.count_nonzero(detrend_keep))}/{len(detrend_keep)}, "
-                        f"robust cadence noise={detrend_meta['cadence_noise_ppm']:.1f} ppm"
-                    )
-                else:
-                    corrected_sat_flux = raw_sat_flux
-                    saturated_model = np.ones(len(raw_sat_flux), dtype=float)
-                    detrend_keep = np.ones(len(raw_sat_flux), dtype=bool)
-                    lc_df = make_lightcurve_dataframe(
-                        native_sat_time,
-                        raw_sat_flux,
-                        mission,
-                        time_system,
-                        "flux_rel",
-                    )
-                    meta["saturated_systematics_correction"] = False
-                lc_df["saturated_systematics_correction"] = bool(
-                    args.saturated_systematics_correction
-                )
-                lc_df["target_label"] = target_label
-                lc_df["target_index"] = 1
-                lc_df["method"] = "saturated_aperture"
-                lc_df["sector"] = sector_tag
-                lc_df["tpf_name"] = tpf_path.name
-                lc_df["tpf_path"] = str(tpf_path)
-                lc_df["camera"] = camera_number if camera_number is not None else np.nan
-                lc_df["ccd"] = ccd_number if ccd_number is not None else np.nan
-                lc_df["gaia_source_id"] = target_gaia_id if target_gaia_id is not None else ""
-                lc_df["gaia_g_mag"] = target_gaia_g
-                meta["camera"] = camera_number
-                meta["ccd"] = ccd_number
-                meta["tpf_path"] = str(tpf_path)
-                lc_df.to_csv(raw_csv_path, index=False)
-                if args.saturated_systematics_correction:
-                    save_saturated_detrending_plot(
-                        native_sat_time,
-                        raw_sat_flux,
-                        corrected_sat_flux,
-                        saturated_model,
-                        detrend_keep,
-                        outdir / f"preferred_lc_{output_stem}.png",
-                        f"{tpf_path.stem} — {target_label} / target1 (saturated_aperture)",
-                        time_label=mission_time_axis_label(time_system),
-                    )
-                else:
-                    save_lightcurve_plot(
-                        native_sat_time,
-                        raw_sat_flux,
-                        outdir / f"preferred_lc_{output_stem}.png",
-                        f"{tpf_path.stem} — {target_label} / target1 (saturated_aperture)",
-                        time_label=mission_time_axis_label(time_system),
-                    )
-                pd.DataFrame([meta]).to_csv(outdir / f"saturated_aperture_meta_{output_stem}.csv", index=False)
-                np.save(outdir / f"aperture_mask_{output_stem}.npy", np.asarray(ap_mask_2d, bool))
-                np.save(outdir / f"background_{output_stem}.npy", np.asarray(back_series, float))
-                np.save(outdir / f"keep_mask_{output_stem}.npy", np.asarray(keep_mask, bool))
+                np.save(outdir / f"aperture_mask_{output_stem}.npy", ap_mask.astype(bool))
                 np.save(outdir / f"centroid_row_{output_stem}.npy", np.asarray(crow, float))
                 np.save(outdir / f"centroid_col_{output_stem}.npy", np.asarray(ccol, float))
                 if not args.no_aperture_plots:
-                    print("  Aperture diagnostic: publication-style saturated success plot (v2)")
-                    save_saturated_aperture_success_diagnostic(
-                        saturated_geometry,
-                        ap_mask_2d,
+                    save_aperture_plot(
+                        mean_img,
+                        ap_mask.astype(bool),
                         outdir / f"aperture_{output_stem}.png",
-                        f"{tpf_path.stem} — {target_label} / target1 (saturated_aperture)",
-                        catalog_position=infer_catalog_local_pixel(
-                            tpf, image_shape=ap_mask_2d.shape
-                        ),
+                        f"{tpf_path.stem} — {source_label} / target1 (full_region_sum)\nGaia G=NA",
                     )
-                print(
-                    f"  Wrote {target_label} / target1 (saturated_aperture): {raw_csv_path.name}"
-                    f"  Npix={int(np.count_nonzero(ap_mask_2d))}"
-                )
-                if getattr(args, "prf_photometry", False):
-                    print("  [WARN] PRF photometry skipped for saturation-optimized aperture extraction.")
+                print(f"  Wrote target1 (full_region_sum): preferred_lc_{output_stem}.csv  Npix={int(np.count_nonzero(ap_mask))}")
                 continue
+
+            tpf = lk.read(str(tpf_path))
+            mission = infer_mission(tpf_path, tpf)
+            tesscut_product = is_tesscut_product(tpf_path, tpf)
+            time_system = infer_native_time_system(tpf_path, tpf, mission)
+            camera_number, ccd_number = infer_tess_detector_metadata(tpf_path, tpf)
+            print(f"  Mission: {mission}; native time: {time_system}; observation: {infer_observation_tag(tpf_path, tpf)}")
+            if mission == "TESS":
+                print(
+                    "  Detector metadata: "
+                    f"camera={camera_number if camera_number is not None else 'unknown'}, "
+                    f"ccd={ccd_number if ccd_number is not None else 'unknown'}"
+                )
+            if getattr(args, "prf_photometry", False) and mission in {"KEPLER", "K2"}:
+                print(
+                    f"  [WARN] {mission} target-pixel data detected: the PRF module is TESS-only "
+                    "and will be skipped. Aperture extraction will continue normally."
+                )
+            # Cadence selection
+            native_time = np.asarray(tpf.time.value, float)
+            finite_time = np.isfinite(native_time)
+            if args.no_quality0:
+                keep_idx = np.flatnonzero(finite_time)
             else:
-                print(
-                    "  [INFO] --saturation-optimized-aperture requested but the "
-                    f"saturation gate failed (npix_above_thresh={sat_npix}); using the standard pipeline."
-                )
+                try:
+                    qual = np.asarray(tpf.quality, int)
+                    keep_idx = np.flatnonzero((qual == 0) & finite_time)
+                    if keep_idx.size == 0:
+                        print("  [WARN] No finite QUALITY==0 cadences; retaining finite-time cadences instead.")
+                        keep_idx = np.flatnonzero(finite_time)
+                except Exception:
+                    keep_idx = np.flatnonzero(finite_time)
 
-        # Target definition / Gaia usage
-        use_gaia = not (
-            args.no_gaia
-            or args.full_region_sum
-            or args.saturated_systematics_correction
-            or external_aperture_mask is not None
-        )
-
-        coords_grid = None
-        if use_gaia:
-            # Gaia seed placement needs a sky coordinate at every pixel.  An
-            # explicit no-Gaia run does not, so it remains usable for files
-            # with incomplete or invalid WCS metadata.
-            try:
-                coords_grid, flux, mean_img = coordinate_grid_for_flux(
-                    tpf, mid, flux, mean_img
-                )
-            except Exception as exc:
-                if args.gaia_fallback and int(args.n_targets) == 1:
-                    print(
-                        f"  [WARN] WCS coordinate grid failed ({type(exc).__name__}: {exc}). "
-                        "Falling back to no-Gaia single-target mode."
-                    )
-                    use_gaia = False
-                    coords_grid = None
-                else:
-                    raise
-
-        gaia_tab = None
-        gaia_use = None
-        sid = None
-        gmag = None
-        source_labels = None
-        target_coords = None
-        seeds = None
-        owner = None
-        n_use = 1
-        sector_tag = infer_sector_tag(tpf_path, tpf)
-
-        if use_gaia:
-            try:
-                gaia_tab = gaia_brightest_sources_near(tpf, radius_arcmin=args.gaia_radius_arcmin)
-            except Exception as e:
-                if args.gaia_fallback and int(args.n_targets) == 1:
-                    print(f"  [WARN] Gaia query failed ({type(e).__name__}: {e}). Falling back to no-Gaia single-target mode.")
-                    use_gaia = False
-                else:
-                    raise
-
-        if use_gaia:
-            # Gaia-based multi-/single-target identification (standard behavior)
-            gaia_in, _ = sources_inside_stamp(tpf, gaia_tab, mid)
-            if len(gaia_in) < 1:
-                print("  No Gaia sources inside stamp; skipping.")
+            if keep_idx.size == 0:
+                print("  [WARN] No finite cadences; skipping this file.")
                 continue
 
-            center_separation_arcsec = None
-            if tesscut_product:
-                gaia_in, center_separation_arcsec = prioritize_tesscut_center_source(
-                    gaia_in, tpf, mean_img.shape
-                )
-                if center_separation_arcsec is not None:
+            mid = int(keep_idx[len(keep_idx) // 2]) if len(keep_idx) else 0
+
+            flux = np.asarray(tpf.flux, float)[keep_idx, :, :]
+            time = native_time[keep_idx]
+            mean_img = np.nanmean(flux, axis=0)
+
+            # This approach is intentionally separate from Gaia and jump/core
+            # extraction because it grows a single aperture over the whole stamp.
+            if args.saturation_optimized_aperture:
+                if int(args.n_targets) != 1:
+                    raise ValueError("--saturation-optimized-aperture requires --n-targets=1.")
+                sat_ok, sat_npix = is_heavily_saturated(mean_img, thresh=args.sat_thresh, min_npix=args.sat_min_npix)
+                if sat_ok:
+                    print(f"  Using saturated aperture extraction (npix_above_thresh={sat_npix})")
+                    try:
+                        (
+                            lc_df,
+                            meta,
+                            mean_image_2d,
+                            ap_mask_2d,
+                            back_series,
+                            keep_mask,
+                            crow,
+                            ccol,
+                            saturated_geometry,
+                        ) = extract_saturation_optimized_aperture(
+                            tpf_path,
+                            threshold=args.saturated_aperture_threshold,
+                            nback=args.back_nfaint,
+                            filter_quality=(not args.no_quality0),
+                            verbose=True,
+                        )
+                    except SaturatedBleedClippedError as exc:
+                        sector_tag = infer_sector_tag(tpf_path, tpf)
+                        try:
+                            target_label, _, _ = infer_single_target_label(
+                                tpf,
+                                mean_image_2d=exc.mean_image,
+                                gaia_radius_arcmin=max(float(args.gaia_radius_arcmin), 12.0),
+                                allow_gaia=(not args.no_gaia),
+                            )
+                        except Exception:
+                            target_label = fast_object_label_from_fits(tpf_path)
+                        failure_stem = build_output_stem(
+                            sector_tag, target_label, 1, "saturated_aperture_failed"
+                        )
+                        failure_record = dict(exc.metadata)
+                        failure_record.update({
+                            "status": "SATURATED_BLEED_CLIPPED",
+                            "failure_reason": str(exc),
+                            "recommended_action": "Use a larger pixel cutout or an FFI-based extraction.",
+                            "normal_light_curve_written": False,
+                            "target_label": target_label,
+                            "target_index": 1,
+                            "tpf_name": tpf_path.name,
+                            "tpf_path": str(tpf_path),
+                            "camera": camera_number,
+                            "ccd": ccd_number,
+                        })
+                        status_path = outdir / f"saturated_aperture_failure_{failure_stem}.csv"
+                        pd.DataFrame([failure_record]).to_csv(status_path, index=False)
+                        diagnostic_path = outdir / f"saturated_aperture_failure_{failure_stem}.png"
+                        save_saturated_clipping_diagnostic(
+                            exc.raw_image,
+                            exc.aperture_mask,
+                            diagnostic_path,
+                            f"{tpf_path.stem} — {target_label} / target1",
+                            clipped_edges=str(exc.metadata.get("clipped_edges", "unknown")),
+                            edge_fraction_of_peak=float(
+                                exc.metadata.get("edge_max_fraction_of_peak", np.nan)
+                            ),
+                            geometry_source=str(
+                                exc.metadata.get("geometry_source", "RAW_CNTS")
+                            ),
+                        )
+                        saturated_failures.append(failure_record)
+                        print("  [SKIPPED] SATURATED_BLEED_CLIPPED")
+                        print(f"  {exc}")
+                        print(f"  Failure record: {status_path.name}")
+                        print(f"  Diagnostic: {diagnostic_path.name}")
+                        continue
+                    except SaturatedGeometryUnavailableError as exc:
+                        sector_tag = infer_sector_tag(tpf_path, tpf)
+                        try:
+                            target_label, _, _ = infer_single_target_label(
+                                tpf,
+                                mean_image_2d=exc.mean_image,
+                                gaia_radius_arcmin=max(float(args.gaia_radius_arcmin), 12.0),
+                                allow_gaia=(not args.no_gaia),
+                            )
+                        except Exception:
+                            target_label = fast_object_label_from_fits(tpf_path)
+                        failure_stem = build_output_stem(
+                            sector_tag, target_label, 1, "saturated_aperture_failed"
+                        )
+                        failure_record = dict(exc.metadata)
+                        failure_record.update({
+                            "status": "SATURATED_GEOMETRY_UNAVAILABLE",
+                            "failure_reason": str(exc),
+                            "recommended_action": (
+                                "Verify that the TESSCut FLUX cube contains a spatially "
+                                "resolved saturated signal or regenerate the cutout."
+                            ),
+                            "normal_light_curve_written": False,
+                            "target_label": target_label,
+                            "target_index": 1,
+                            "tpf_name": tpf_path.name,
+                            "tpf_path": str(tpf_path),
+                            "camera": camera_number,
+                            "ccd": ccd_number,
+                        })
+                        status_path = outdir / f"saturated_aperture_failure_{failure_stem}.csv"
+                        pd.DataFrame([failure_record]).to_csv(status_path, index=False)
+                        diagnostic_path = outdir / f"saturated_aperture_failure_{failure_stem}.png"
+                        save_saturated_geometry_failure_diagnostic(
+                            exc.raw_image,
+                            exc.mean_image,
+                            diagnostic_path,
+                            f"{tpf_path.stem} — {target_label} / target1",
+                            failure_reason=str(exc),
+                        )
+                        saturated_failures.append(failure_record)
+                        print("  [SKIPPED] SATURATED_GEOMETRY_UNAVAILABLE")
+                        print(f"  {exc}")
+                        print(f"  Failure record: {status_path.name}")
+                        print(f"  Diagnostic: {diagnostic_path.name}")
+                        continue
+                    sector_tag = infer_sector_tag(tpf_path, tpf)
+                    target_label, target_gaia_id, target_gaia_g = infer_single_target_label(
+                        tpf,
+                        mean_image_2d=mean_image_2d,
+                        gaia_radius_arcmin=max(float(args.gaia_radius_arcmin), 12.0),
+                        allow_gaia=(not args.no_gaia),
+                    )
+                    output_stem = build_output_stem(sector_tag, target_label, 1, "saturated_aperture")
+                    raw_csv_path = outdir / f"preferred_lc_{output_stem}.csv"
+                    # Every product is labeled; never remove unrelated products
+                    # that may already exist in a user-selected output directory.
+                    np.save(outdir / f"keep_idx_{output_stem}.npy", np.flatnonzero(keep_mask))
+                    np.save(outdir / f"mean_image_{output_stem}.npy", np.asarray(mean_image_2d, float))
+
+                    # Apply the common mission-aware time schema. Kepler/K2 retain
+                    # native BKJD and gain the exact compatible BTJD conversion;
+                    # TESS retains its native BTJD values directly.
+                    native_sat_time = lc_df["time_native"].to_numpy(float)
+                    raw_sat_flux = lc_df["flux_detrended_rel"].to_numpy(float)
+                    if args.saturated_systematics_correction:
+                        corrected_sat_flux, saturated_model, detrend_keep, detrend_meta = (
+                            detrend_saturated_background_motion(
+                                native_sat_time,
+                                raw_sat_flux,
+                                back_series,
+                                crow,
+                                ccol,
+                                n_iter=args.robust_iters,
+                                huber_k=args.huber_k,
+                            )
+                        )
+                        lc_df = make_lightcurve_dataframe(
+                            native_sat_time,
+                            corrected_sat_flux,
+                            mission,
+                            time_system,
+                            "flux_detrended_rel",
+                        )
+                        lc_df["flux_rel"] = raw_sat_flux
+                        lc_df["systematics_model_rel"] = saturated_model
+                        lc_df["detrend_keep"] = detrend_keep
+                        np.save(
+                            outdir / f"saturated_systematics_model_{output_stem}.npy",
+                            np.asarray(saturated_model, float),
+                        )
+                        np.save(
+                            outdir / f"detrend_keep_{output_stem}.npy",
+                            np.asarray(detrend_keep, bool),
+                        )
+                        meta.update({
+                            "saturated_systematics_correction": True,
+                            **{
+                                f"saturated_detrend_{key}": value
+                                for key, value in detrend_meta.items()
+                            },
+                        })
+                        print(
+                            "  Saturated background/motion correction: "
+                            f"retained={int(np.count_nonzero(detrend_keep))}/{len(detrend_keep)}, "
+                            f"robust cadence noise={detrend_meta['cadence_noise_ppm']:.1f} ppm"
+                        )
+                    else:
+                        corrected_sat_flux = raw_sat_flux
+                        saturated_model = np.ones(len(raw_sat_flux), dtype=float)
+                        detrend_keep = np.ones(len(raw_sat_flux), dtype=bool)
+                        lc_df = make_lightcurve_dataframe(
+                            native_sat_time,
+                            raw_sat_flux,
+                            mission,
+                            time_system,
+                            "flux_rel",
+                        )
+                        meta["saturated_systematics_correction"] = False
+                    lc_df["saturated_systematics_correction"] = bool(
+                        args.saturated_systematics_correction
+                    )
+                    lc_df["target_label"] = target_label
+                    lc_df["target_index"] = 1
+                    lc_df["method"] = "saturated_aperture"
+                    lc_df["sector"] = sector_tag
+                    lc_df["tpf_name"] = tpf_path.name
+                    lc_df["tpf_path"] = str(tpf_path)
+                    lc_df["camera"] = camera_number if camera_number is not None else np.nan
+                    lc_df["ccd"] = ccd_number if ccd_number is not None else np.nan
+                    lc_df["gaia_source_id"] = target_gaia_id if target_gaia_id is not None else ""
+                    lc_df["gaia_g_mag"] = target_gaia_g
+                    meta["camera"] = camera_number
+                    meta["ccd"] = ccd_number
+                    meta["tpf_path"] = str(tpf_path)
+                    lc_df.to_csv(raw_csv_path, index=False)
+                    if args.saturated_systematics_correction:
+                        save_saturated_detrending_plot(
+                            native_sat_time,
+                            raw_sat_flux,
+                            corrected_sat_flux,
+                            saturated_model,
+                            detrend_keep,
+                            outdir / f"preferred_lc_{output_stem}.png",
+                            f"{tpf_path.stem} — {target_label} / target1 (saturated_aperture)",
+                            time_label=mission_time_axis_label(time_system),
+                        )
+                    else:
+                        save_lightcurve_plot(
+                            native_sat_time,
+                            raw_sat_flux,
+                            outdir / f"preferred_lc_{output_stem}.png",
+                            f"{tpf_path.stem} — {target_label} / target1 (saturated_aperture)",
+                            time_label=mission_time_axis_label(time_system),
+                        )
+                    pd.DataFrame([meta]).to_csv(outdir / f"saturated_aperture_meta_{output_stem}.csv", index=False)
+                    np.save(outdir / f"aperture_mask_{output_stem}.npy", np.asarray(ap_mask_2d, bool))
+                    np.save(outdir / f"background_{output_stem}.npy", np.asarray(back_series, float))
+                    np.save(outdir / f"keep_mask_{output_stem}.npy", np.asarray(keep_mask, bool))
+                    np.save(outdir / f"centroid_row_{output_stem}.npy", np.asarray(crow, float))
+                    np.save(outdir / f"centroid_col_{output_stem}.npy", np.asarray(ccol, float))
+                    if not args.no_aperture_plots:
+                        print("  Aperture diagnostic: publication-style saturated success plot (v2)")
+                        save_saturated_aperture_success_diagnostic(
+                            saturated_geometry,
+                            ap_mask_2d,
+                            outdir / f"aperture_{output_stem}.png",
+                            f"{tpf_path.stem} — {target_label} / target1 (saturated_aperture)",
+                            catalog_position=infer_catalog_local_pixel(
+                                tpf, image_shape=ap_mask_2d.shape
+                            ),
+                        )
                     print(
-                        "  TESSCut target policy: target 1 is the Gaia source nearest "
-                        f"the requested cutout centre ({center_separation_arcsec:.1f} arcsec); "
-                        "remaining targets retain brightness order."
+                        f"  Wrote {target_label} / target1 (saturated_aperture): {raw_csv_path.name}"
+                        f"  Npix={int(np.count_nonzero(ap_mask_2d))}"
+                    )
+                    if getattr(args, "prf_photometry", False):
+                        print("  [WARN] PRF photometry skipped for saturation-optimized aperture extraction.")
+                    continue
+                else:
+                    print(
+                        "  [INFO] --saturation-optimized-aperture requested but the "
+                        f"saturation gate failed (npix_above_thresh={sat_npix}); using the standard pipeline."
                     )
 
-            print("  Gaia sources inside stamp after pixel filter:")
-            for i, row in enumerate(gaia_in[:10], start=1):
-                tc = SkyCoord(float(row["ra"]) * u.deg, float(row["dec"]) * u.deg)
+            # Target definition / Gaia usage
+            use_gaia = not (
+                args.no_gaia
+                or args.full_region_sum
+                or args.saturated_systematics_correction
+                or external_aperture_mask is not None
+            )
+
+            coords_grid = None
+            if use_gaia:
+                # Gaia seed placement needs a sky coordinate at every pixel.  An
+                # explicit no-Gaia run does not, so it remains usable for files
+                # with incomplete or invalid WCS metadata.
                 try:
-                    x, y = tpf.wcs.world_to_pixel(tc)
-                    print(f"    [{i}] source_id={row['source_id']}  G={row['phot_g_mean_mag']:.3f}  x={x:.2f}  y={y:.2f}")
+                    coords_grid, flux, mean_img = coordinate_grid_for_flux(
+                        tpf, mid, flux, mean_img
+                    )
+                except Exception as exc:
+                    if args.gaia_fallback and int(args.n_targets) == 1:
+                        print(
+                            f"  [WARN] WCS coordinate grid failed ({type(exc).__name__}: {exc}). "
+                            "Falling back to no-Gaia single-target mode."
+                        )
+                        use_gaia = False
+                        coords_grid = None
+                    else:
+                        raise
+
+            gaia_tab = None
+            gaia_use = None
+            sid = None
+            gmag = None
+            source_labels = None
+            target_coords = None
+            seeds = None
+            owner = None
+            n_use = 1
+            sector_tag = infer_sector_tag(tpf_path, tpf)
+
+            if use_gaia:
+                try:
+                    gaia_tab = gaia_brightest_sources_near(tpf, radius_arcmin=args.gaia_radius_arcmin)
                 except Exception as e:
-                    print(f"    [{i}] source_id={row['source_id']}  G={row['phot_g_mean_mag']:.3f}  pixel_error={type(e).__name__}: {e}")
+                    if args.gaia_fallback and int(args.n_targets) == 1:
+                        print(f"  [WARN] Gaia query failed ({type(e).__name__}: {e}). Falling back to no-Gaia single-target mode.")
+                        use_gaia = False
+                    else:
+                        raise
 
-            n_use = min(int(args.n_targets), len(gaia_in))
-            gaia_use = gaia_in[:n_use]
+            if use_gaia:
+                # Gaia-based multi-/single-target identification (standard behavior)
+                gaia_in, _ = sources_inside_stamp(tpf, gaia_tab, mid)
+                if len(gaia_in) < 1:
+                    print("  No Gaia sources inside stamp; skipping.")
+                    continue
 
-            target_coords = [
-                SkyCoord(ra=float(r) * u.deg, dec=float(d) * u.deg)
-                for r, d in zip(gaia_use["ra"], gaia_use["dec"])
-            ]
-            gmag = [float(m) for m in gaia_use["phot_g_mean_mag"]]
-            sid = [str(s) for s in gaia_use["source_id"]]
-            source_labels = ([_CURRENT_INPUT_LABEL]*n_use if _FORCE_FILENAME_NAMES else
-                             [resolve_target_label(tc, gs) for tc, gs in zip(target_coords, sid)])
+                center_separation_arcsec = None
+                if tesscut_product:
+                    gaia_in, center_separation_arcsec = prioritize_tesscut_center_source(
+                        gaia_in, tpf, mean_img.shape
+                    )
+                    if center_separation_arcsec is not None:
+                        print(
+                            "  TESSCut target policy: target 1 is the Gaia source nearest "
+                            f"the requested cutout centre ({center_separation_arcsec:.1f} arcsec); "
+                            "remaining targets retain brightness order."
+                        )
 
-            # For a genuine single-target TPF, prefer the stable human-readable
-            # OBJECT/TARGNAME label recorded in the file when the selected Gaia
-            # source matches the intended target coordinate.  This avoids
-            # network-dependent filename changes: a transient SIMBAD failure
-            # should not turn, for example, L_98-59_b into GaiaDR3_<source_id>.
-            # Do not apply this blindly to multi-target stamps, where the TPF
-            # header name may refer to a different source than target k.
-            if n_use == 1:
+                print("  Gaia sources inside stamp after pixel filter:")
+                for i, row in enumerate(gaia_in[:10], start=1):
+                    tc = SkyCoord(float(row["ra"]) * u.deg, float(row["dec"]) * u.deg)
+                    try:
+                        x, y = tpf.wcs.world_to_pixel(tc)
+                        print(f"    [{i}] source_id={row['source_id']}  G={row['phot_g_mean_mag']:.3f}  x={x:.2f}  y={y:.2f}")
+                    except Exception as e:
+                        print(f"    [{i}] source_id={row['source_id']}  G={row['phot_g_mean_mag']:.3f}  pixel_error={type(e).__name__}: {e}")
+
+                n_use = min(int(args.n_targets), len(gaia_in))
+                gaia_use = gaia_in[:n_use]
+
+                target_coords = [
+                    SkyCoord(ra=float(r) * u.deg, dec=float(d) * u.deg)
+                    for r, d in zip(gaia_use["ra"], gaia_use["dec"])
+                ]
+                gmag = [float(m) for m in gaia_use["phot_g_mean_mag"]]
+                sid = [str(s) for s in gaia_use["source_id"]]
+                source_labels = ([_CURRENT_INPUT_LABEL]*n_use if _FORCE_FILENAME_NAMES else
+                                 [resolve_target_label(tc, gs) for tc, gs in zip(target_coords, sid)])
+
+                # For a genuine single-target TPF, prefer the stable human-readable
+                # OBJECT/TARGNAME label recorded in the file when the selected Gaia
+                # source matches the intended target coordinate.  This avoids
+                # network-dependent filename changes: a transient SIMBAD failure
+                # should not turn, for example, L_98-59_b into GaiaDR3_<source_id>.
+                # Do not apply this blindly to multi-target stamps, where the TPF
+                # header name may refer to a different source than target k.
+                if n_use == 1:
+                    try:
+                        single_label, _, _ = infer_single_target_label(
+                            tpf,
+                            mean_img,
+                            gaia_radius_arcmin=float(args.gaia_radius_arcmin),
+                            allow_gaia=(not args.no_gaia),
+                        )
+                        header_coord = infer_header_target_coord(tpf)
+                        selected_matches_header = False
+                        if header_coord is not None and target_coords and target_coords[0] is not None:
+                            sep_arcsec = float(header_coord.separation(target_coords[0]).arcsec)
+                            selected_matches_header = np.isfinite(sep_arcsec) and sep_arcsec <= 45.0
+
+                        force_single_label = bool(
+                            args.saturated_systematics_correction
+                            or getattr(args, "no_gaia", False)
+                            or args.saturation_optimized_aperture
+                        )
+                        if single_label and (selected_matches_header or force_single_label):
+                            source_labels[0] = single_label
+                    except Exception:
+                        pass
+
+                seeds = [nearest_pixel_to_coord(coords_grid, tc) for tc in target_coords]
+                owner = watershed_owner_map(mean_img, seeds)
+
+                if tesscut_product:
+                    print("  Targets (TESSCut centre target first; remaining Gaia sources by brightness):")
+                else:
+                    print("  Targets (brightest Gaia sources in stamp):")
+                for k in range(n_use):
+                    label_txt = source_labels[k] if source_labels is not None else f"target{k+1}"
+                    print(f"    [{k+1}] label={label_txt}  source_id={sid[k]}  G={gmag[k]:.3f}  seed={seeds[k]}")
+
+            else:
+                # No-Gaia single-target mode: define target by pixels (useful for saturated stars / Gaia outages)
+                if int(args.n_targets) != 1:
+                    raise ValueError("No-Gaia mode requires --n-targets=1.")
+                # Seed at the brightest pixel in the mean image
+                flat_idx = int(np.nanargmax(mean_img))
+                ny, nx = mean_img.shape
+                seed = (flat_idx // nx, flat_idx % nx)
+
+                target_coords = [None]
+                seeds = [seed]
+                owner = np.zeros(mean_img.shape, dtype=int)
+                sid = ["pixel_seed"]
+                gmag = [np.nan]
                 try:
                     single_label, _, _ = infer_single_target_label(
                         tpf,
@@ -3639,597 +3781,588 @@ def main(argv=None):
                         gaia_radius_arcmin=float(args.gaia_radius_arcmin),
                         allow_gaia=(not args.no_gaia),
                     )
-                    header_coord = infer_header_target_coord(tpf)
-                    selected_matches_header = False
-                    if header_coord is not None and target_coords and target_coords[0] is not None:
-                        sep_arcsec = float(header_coord.separation(target_coords[0]).arcsec)
-                        selected_matches_header = np.isfinite(sep_arcsec) and sep_arcsec <= 45.0
-
-                    force_single_label = bool(
-                        args.saturated_systematics_correction
-                        or getattr(args, "no_gaia", False)
-                        or args.saturation_optimized_aperture
-                    )
-                    if single_label and (selected_matches_header or force_single_label):
-                        source_labels[0] = single_label
+                    source_labels = [single_label if single_label else sanitize_token("unknown_target")]
                 except Exception:
-                    pass
+                    source_labels = [_CURRENT_INPUT_LABEL if _FORCE_FILENAME_NAMES else sanitize_token("unknown_target")]
 
-            seeds = [nearest_pixel_to_coord(coords_grid, tc) for tc in target_coords]
-            owner = watershed_owner_map(mean_img, seeds)
+                if external_aperture_mask is not None:
+                    print("  External aperture defines a fixed pixel-selected single target")
+                else:
+                    print("  Gaia skipped/unavailable: using pixel-defined single target")
+                print(f"    [1] seed={seed}  (brightest pixel in mean image)")
 
-            if tesscut_product:
-                print("  Targets (TESSCut centre target first; remaining Gaia sources by brightness):")
-            else:
-                print("  Targets (brightest Gaia sources in stamp):")
-            for k in range(n_use):
-                label_txt = source_labels[k] if source_labels is not None else f"target{k+1}"
-                print(f"    [{k+1}] label={label_txt}  source_id={sid[k]}  G={gmag[k]:.3f}  seed={seeds[k]}")
+            yy, xx = np.indices(mean_img.shape)
 
-        else:
-            # No-Gaia single-target mode: define target by pixels (useful for saturated stars / Gaia outages)
-            if int(args.n_targets) != 1:
-                raise ValueError("No-Gaia mode requires --n-targets=1.")
-            # Seed at the brightest pixel in the mean image
-            flat_idx = int(np.nanargmax(mean_img))
-            ny, nx = mean_img.shape
-            seed = (flat_idx // nx, flat_idx % nx)
-
-            target_coords = [None]
-            seeds = [seed]
-            owner = np.zeros(mean_img.shape, dtype=int)
-            sid = ["pixel_seed"]
-            gmag = [np.nan]
-            try:
-                single_label, _, _ = infer_single_target_label(
-                    tpf,
-                    mean_img,
-                    gaia_radius_arcmin=float(args.gaia_radius_arcmin),
-                    allow_gaia=(not args.no_gaia),
-                )
-                source_labels = [single_label if single_label else sanitize_token("unknown_target")]
-            except Exception:
-                source_labels = [_CURRENT_INPUT_LABEL if _FORCE_FILENAME_NAMES else sanitize_token("unknown_target")]
-
-            if external_aperture_mask is not None:
-                print("  External aperture defines a fixed pixel-selected single target")
-            else:
-                print("  Gaia skipped/unavailable: using pixel-defined single target")
-            print(f"    [1] seed={seed}  (brightest pixel in mean image)")
-
-        yy, xx = np.indices(mean_img.shape)
-
-        # -----------------------------------------------------------------
-        # Optional additional jitter-aware PRF extraction.
-        # -----------------------------------------------------------------
-        if getattr(args, "prf_photometry", False) and mission == "TESS":
-            if not _HAVE_PRF_MODULE:
-                print(f"  [WARN] PRF photometry unavailable: {_PRF_IMPORT_ERROR}")
-            else:
-                tessmag = prf_saturation_tessmag(tpf_path, tpf)
-                flux_unit = tpf_flux_unit(tpf)
-                try:
-                    prf_flux_err = np.asarray(tpf.flux_err, float)[keep_idx, :, :]
-                    if prf_flux_err.shape != flux.shape:
-                        prf_flux_err = prf_flux_err[:, : flux.shape[1], : flux.shape[2]]
-                    if prf_flux_err.shape != flux.shape:
+            # -----------------------------------------------------------------
+            # Optional additional jitter-aware PRF extraction.
+            # -----------------------------------------------------------------
+            if getattr(args, "prf_photometry", False) and mission == "TESS":
+                if not _HAVE_PRF_MODULE:
+                    print(f"  [WARN] PRF photometry unavailable: {_PRF_IMPORT_ERROR}")
+                else:
+                    tessmag = prf_saturation_tessmag(tpf_path, tpf)
+                    flux_unit = tpf_flux_unit(tpf)
+                    try:
+                        prf_flux_err = np.asarray(tpf.flux_err, float)[keep_idx, :, :]
+                        if prf_flux_err.shape != flux.shape:
+                            prf_flux_err = prf_flux_err[:, : flux.shape[1], : flux.shape[2]]
+                        if prf_flux_err.shape != flux.shape:
+                            prf_flux_err = None
+                    except Exception:
                         prf_flux_err = None
-                except Exception:
-                    prf_flux_err = None
 
-                for prf_k in range(n_use):
-                    source_label = source_labels[prf_k] if source_labels is not None else f"target{prf_k+1}"
-                    # Prefer the subpixel WCS position for Gaia-defined targets;
-                    # fall back to the image seed if WCS conversion is unavailable.
-                    prf_row, prf_col = map(float, seeds[prf_k])
-                    try:
-                        if target_coords is not None and target_coords[prf_k] is not None:
-                            xpix, ypix = tpf.wcs.world_to_pixel(target_coords[prf_k])
-                            if (np.isfinite(xpix) and np.isfinite(ypix) and
-                                    -float(args.prf_neighbor_margin) <= xpix <= mean_img.shape[1] - 1 + float(args.prf_neighbor_margin) and
-                                    -float(args.prf_neighbor_margin) <= ypix <= mean_img.shape[0] - 1 + float(args.prf_neighbor_margin)):
-                                prf_row, prf_col = float(ypix), float(xpix)
-                    except Exception:
-                        pass
+                    for prf_k in range(n_use):
+                        source_label = source_labels[prf_k] if source_labels is not None else f"target{prf_k+1}"
+                        # Prefer the subpixel WCS position for Gaia-defined targets;
+                        # fall back to the image seed if WCS conversion is unavailable.
+                        prf_row, prf_col = map(float, seeds[prf_k])
+                        try:
+                            if target_coords is not None and target_coords[prf_k] is not None:
+                                xpix, ypix = tpf.wcs.world_to_pixel(target_coords[prf_k])
+                                if (np.isfinite(xpix) and np.isfinite(ypix) and
+                                        -float(args.prf_neighbor_margin) <= xpix <= mean_img.shape[1] - 1 + float(args.prf_neighbor_margin) and
+                                        -float(args.prf_neighbor_margin) <= ypix <= mean_img.shape[0] - 1 + float(args.prf_neighbor_margin)):
+                                    prf_row, prf_col = float(ypix), float(xpix)
+                        except Exception:
+                            pass
 
-                    sat_info = assess_saturation(
-                        mean_img,
-                        tessmag=tessmag,
-                        absolute_threshold=float(args.sat_thresh),
-                        source_row=prf_row,
-                        source_column=prf_col,
-                        local_radius=max(8.0, float(args.prf_fit_radius)),
-                        flux_unit=flux_unit,
-                        product_type="TESSCUT" if tesscut_product else "TPF",
-                    )
-                    if sat_info.get("saturated", False):
-                        print(
-                            f"  [WARN] PRF photometry skipped for target {prf_k+1}: "
-                            "saturation/bleeding is not represented by the engineering PRF. "
-                            + "; ".join(sat_info.get("reasons", []))
+                        sat_info = assess_saturation(
+                            mean_img,
+                            tessmag=tessmag,
+                            absolute_threshold=float(args.sat_thresh),
+                            source_row=prf_row,
+                            source_column=prf_col,
+                            local_radius=max(8.0, float(args.prf_fit_radius)),
+                            flux_unit=flux_unit,
+                            product_type="TESSCUT" if tesscut_product else "TPF",
                         )
-                        continue
-
-                    requested_scene = str(args.prf_scene_mode).strip().lower()
-                    scene_sources = [SceneSource(
-                        prf_row, prf_col, source_label,
-                        sid[prf_k] if sid is not None else None,
-                        gmag[prf_k] if gmag is not None else None,
-                        "target",
-                    )]
-                    actual_scene = "single"
-                    if requested_scene == "gaia":
-                        if use_gaia and gaia_tab is not None and sid is not None:
-                            scene_sources = build_gaia_prf_scene(
-                                tpf, gaia_tab,
-                                target_source_id=sid[prf_k], target_label=source_label,
-                                target_gmag=gmag[prf_k], target_row=prf_row,
-                                target_column=prf_col, shape=mean_img.shape,
-                                margin_pixels=float(args.prf_neighbor_margin),
-                                max_delta_mag=float(args.prf_neighbor_dmag),
-                                max_sources=int(args.prf_max_scene_sources),
-                            )
-                            actual_scene = "gaia" if len(scene_sources) > 1 else "single"
+                        if sat_info.get("saturated", False):
                             print(
-                                f"  [PRF] Target {prf_k+1} Gaia scene: "
-                                f"{len(scene_sources)} candidate source(s), including target."
+                                f"  [WARN] PRF photometry skipped for target {prf_k+1}: "
+                                "saturation/bleeding is not represented by the engineering PRF. "
+                                + "; ".join(sat_info.get("reasons", []))
                             )
-                            for scene_j, src in enumerate(scene_sources[:10]):
-                                role = "target" if scene_j == 0 else "neighbor"
-                                magtxt = f"{src.magnitude:.3f}" if src.magnitude is not None and np.isfinite(src.magnitude) else "nan"
+                            continue
+
+                        requested_scene = str(args.prf_scene_mode).strip().lower()
+                        scene_sources = [SceneSource(
+                            prf_row, prf_col, source_label,
+                            sid[prf_k] if sid is not None else None,
+                            gmag[prf_k] if gmag is not None else None,
+                            "target",
+                        )]
+                        actual_scene = "single"
+                        if requested_scene == "gaia":
+                            if use_gaia and gaia_tab is not None and sid is not None:
+                                scene_sources = build_gaia_prf_scene(
+                                    tpf, gaia_tab,
+                                    target_source_id=sid[prf_k], target_label=source_label,
+                                    target_gmag=gmag[prf_k], target_row=prf_row,
+                                    target_column=prf_col, shape=mean_img.shape,
+                                    margin_pixels=float(args.prf_neighbor_margin),
+                                    max_delta_mag=float(args.prf_neighbor_dmag),
+                                    max_sources=int(args.prf_max_scene_sources),
+                                )
+                                actual_scene = "gaia" if len(scene_sources) > 1 else "single"
                                 print(
-                                    f"  [PRF]   [{scene_j+1}] {role} {src.label} "
-                                    f"G={magtxt} row={src.row:.2f} col={src.column:.2f}"
+                                    f"  [PRF] Target {prf_k+1} Gaia scene: "
+                                    f"{len(scene_sources)} candidate source(s), including target."
                                 )
-                        else:
-                            print("  [WARN] Gaia PRF scene requested but Gaia data are unavailable; using single-source mode.")
-
-                    try:
-                        prf_cfg = PRFPhotometryConfig(
-                            backend=args.prf_backend,
-                            motion_source=args.prf_motion_source,
-                            background=args.prf_background,
-                            saturation_absolute_threshold=float(args.sat_thresh),
-                            min_prf_weight=float(args.prf_min_weight),
-                            fit_radius=float(args.prf_fit_radius),
-                            shift_quantization=float(args.prf_shift_quantization),
-                            max_abs_shift=float(args.prf_max_shift),
-                            allow_gaussian_fallback=(not args.prf_no_gaussian_fallback),
-                            scene_mode=actual_scene,
-                            neighbor_treatment=str(args.prf_neighbor_treatment),
-                            source_output_mode=str(args.prf_source_output),
-                            neighbor_min_contribution_fraction=float(args.prf_min_neighbor_fraction),
-                            save_diagnostics=(not args.prf_no_diagnostics),
-                        )
-                        prf_result = extract_jitter_aware_prf(
-                            time, flux, scene_sources,
-                            config=prf_cfg,
-                            tpf_obj=tpf,
-                            tpf_path=tpf_path,
-                            cadence_indices=keep_idx,
-                            flux_err_cube=prf_flux_err,
-                        )
-                        output_indices = list(map(
-                            int, prf_result.metadata.get("extracted_source_indices", [0])
-                        ))
-                        if not output_indices:
-                            output_indices = [0]
-                        resolve_prf_scene_output_names(tpf, prf_result, output_indices)
-
-                        for msg in prf_result.metadata.get("backend_messages", []):
-                            print(f"  [PRF] {msg}")
-                        scene_info = prf_result.metadata.get("reference_scene", {})
-                        written_csvs = []
-                        for scene_index in output_indices:
-                            source = prf_result.sources[scene_index]
-                            is_primary_output = scene_index == 0
-                            if is_primary_output:
-                                prf_output_stem = "preferred_lc_" + build_output_stem(
-                                    sector_tag, source_label, prf_k + 1, "prf"
-                                )
+                                for scene_j, src in enumerate(scene_sources[:10]):
+                                    role = "target" if scene_j == 0 else "neighbor"
+                                    magtxt = f"{src.magnitude:.3f}" if src.magnitude is not None and np.isfinite(src.magnitude) else "nan"
+                                    print(
+                                        f"  [PRF]   [{scene_j+1}] {role} {src.label} "
+                                        f"G={magtxt} row={src.row:.2f} col={src.column:.2f}"
+                                    )
                             else:
-                                file_label = build_prf_scene_output_label(source, is_primary=False)
-                                prf_output_stem = (
-                                    f"preferred_lc_{sanitize_token(sector_tag)}_"
-                                    f"{file_label}_parenttarget{prf_k + 1}_"
-                                    f"scene{scene_index + 1}_prf"
-                                )
+                                print("  [WARN] Gaia PRF scene requested but Gaia data are unavailable; using single-source mode.")
 
-                            paths_written = save_prf_products(
-                                prf_result, mean_img, outdir, prf_output_stem,
-                                source_index=scene_index,
-                                extra_columns={
-                                    "target_label": source.label,
-                                    "target_index": prf_k + 1,
-                                    "scene_source_index": scene_index,
-                                    "scene_source_role": "primary" if is_primary_output else "neighbor",
-                                    "method": "prf",
-                                    "sector": sector_tag,
-                                    "tpf_name": tpf_path.name,
-                                    "gaia_source_id": source.source_id or "",
-                                    "gaia_g_mag": source.magnitude if source.magnitude is not None else np.nan,
-                                },
-                                extra_metadata={
-                                    "tpf_path": str(tpf_path),
-                                    "watershed_extractor": True,
-                                    "single_source_fit": len(prf_result.sources) == 1,
-                                    "requested_prf_scene_mode": requested_scene,
-                                    "actual_prf_scene_mode": prf_result.metadata.get("scene_mode", actual_scene),
-                                    "requested_prf_source_output": str(args.prf_source_output),
-                                    "scene_source_index": int(scene_index),
-                                    "scene_source_role": "primary" if is_primary_output else "neighbor",
-                                    "parent_primary_label": source_label,
-                                    "parent_primary_index": int(prf_k + 1),
-                                },
+                        try:
+                            prf_cfg = PRFPhotometryConfig(
+                                backend=args.prf_backend,
+                                motion_source=args.prf_motion_source,
+                                background=args.prf_background,
+                                saturation_absolute_threshold=float(args.sat_thresh),
+                                min_prf_weight=float(args.prf_min_weight),
+                                fit_radius=float(args.prf_fit_radius),
+                                shift_quantization=float(args.prf_shift_quantization),
+                                max_abs_shift=float(args.prf_max_shift),
+                                allow_gaussian_fallback=(not args.prf_no_gaussian_fallback),
+                                scene_mode=actual_scene,
+                                neighbor_treatment=str(args.prf_neighbor_treatment),
+                                source_output_mode=str(args.prf_source_output),
+                                neighbor_min_contribution_fraction=float(args.prf_min_neighbor_fraction),
                                 save_diagnostics=(not args.prf_no_diagnostics),
-                                save_figure_pickle=SAVE_FIGURE_PICKLES,
                             )
-                            written_csvs.append(paths_written["csv"].name)
-                            coupling_all = prf_result.metadata.get("motion_coupling", [])
-                            coupling = coupling_all[scene_index] if scene_index < len(coupling_all) else {}
-                            quality_ok = coupling.get("quality_pass", True) and scene_info.get("scene_quality_pass", True)
-                            quality = "PASS" if quality_ok else "FLAGGED"
-                            print(
-                                f"  PRF scene source {scene_index + 1}: label={source.label}, "
-                                f"backend={prf_result.backend}, motion={prf_result.motion_source}, "
-                                f"scene={prf_result.metadata.get('scene_mode','single')}, "
-                                f"sources={len(prf_result.sources)}, quality={quality}, "
-                                f"wrote={paths_written['csv'].name}"
+                            prf_result = extract_jitter_aware_prf(
+                                time, flux, scene_sources,
+                                config=prf_cfg,
+                                tpf_obj=tpf,
+                                tpf_path=tpf_path,
+                                cadence_indices=keep_idx,
+                                flux_err_cube=prf_flux_err,
                             )
-                            if not quality_ok:
-                                reasons = (
-                                    coupling.get("quality_reasons", [])
-                                    + scene_info.get("scene_quality_reasons", [])
+                            output_indices = list(map(
+                                int, prf_result.metadata.get("extracted_source_indices", [0])
+                            ))
+                            if not output_indices:
+                                output_indices = [0]
+                            resolve_prf_scene_output_names(tpf, prf_result, output_indices)
+
+                            for msg in prf_result.metadata.get("backend_messages", []):
+                                print(f"  [PRF] {msg}")
+                            scene_info = prf_result.metadata.get("reference_scene", {})
+                            written_csvs = []
+                            for scene_index in output_indices:
+                                source = prf_result.sources[scene_index]
+                                is_primary_output = scene_index == 0
+                                if is_primary_output:
+                                    prf_output_stem = "preferred_lc_" + build_output_stem(
+                                        sector_tag, source_label, prf_k + 1, "prf"
+                                    )
+                                else:
+                                    file_label = build_prf_scene_output_label(source, is_primary=False)
+                                    prf_output_stem = (
+                                        f"preferred_lc_{sanitize_token(sector_tag)}_"
+                                        f"{file_label}_parenttarget{prf_k + 1}_"
+                                        f"scene{scene_index + 1}_prf"
+                                    )
+
+                                paths_written = save_prf_products(
+                                    prf_result, mean_img, outdir, prf_output_stem,
+                                    source_index=scene_index,
+                                    extra_columns={
+                                        "target_label": source.label,
+                                        "target_index": prf_k + 1,
+                                        "scene_source_index": scene_index,
+                                        "scene_source_role": "primary" if is_primary_output else "neighbor",
+                                        "method": "prf",
+                                        "sector": sector_tag,
+                                        "tpf_name": tpf_path.name,
+                                        "gaia_source_id": source.source_id or "",
+                                        "gaia_g_mag": source.magnitude if source.magnitude is not None else np.nan,
+                                    },
+                                    extra_metadata={
+                                        "tpf_path": str(tpf_path),
+                                        "watershed_extractor": True,
+                                        "single_source_fit": len(prf_result.sources) == 1,
+                                        "requested_prf_scene_mode": requested_scene,
+                                        "actual_prf_scene_mode": prf_result.metadata.get("scene_mode", actual_scene),
+                                        "requested_prf_source_output": str(args.prf_source_output),
+                                        "scene_source_index": int(scene_index),
+                                        "scene_source_role": "primary" if is_primary_output else "neighbor",
+                                        "parent_primary_label": source_label,
+                                        "parent_primary_index": int(prf_k + 1),
+                                    },
+                                    save_diagnostics=(not args.prf_no_diagnostics),
+                                    save_figure_pickle=SAVE_FIGURE_PICKLES,
                                 )
+                                written_csvs.append(paths_written["csv"].name)
+                                coupling_all = prf_result.metadata.get("motion_coupling", [])
+                                coupling = coupling_all[scene_index] if scene_index < len(coupling_all) else {}
+                                quality_ok = coupling.get("quality_pass", True) and scene_info.get("scene_quality_pass", True)
+                                quality = "PASS" if quality_ok else "FLAGGED"
                                 print(
-                                    "  [WARN] PRF light curve retained for diagnostics but should be "
-                                    "treated cautiously: " + "; ".join(reasons)
+                                    f"  PRF scene source {scene_index + 1}: label={source.label}, "
+                                    f"backend={prf_result.backend}, motion={prf_result.motion_source}, "
+                                    f"scene={prf_result.metadata.get('scene_mode','single')}, "
+                                    f"sources={len(prf_result.sources)}, quality={quality}, "
+                                    f"wrote={paths_written['csv'].name}"
                                 )
+                                if not quality_ok:
+                                    reasons = (
+                                        coupling.get("quality_reasons", [])
+                                        + scene_info.get("scene_quality_reasons", [])
+                                    )
+                                    print(
+                                        "  [WARN] PRF light curve retained for diagnostics but should be "
+                                        "treated cautiously: " + "; ".join(reasons)
+                                    )
 
-                        skipped = prf_result.metadata.get("skipped_output_sources", [])
-                        for item in skipped:
+                            skipped = prf_result.metadata.get("skipped_output_sources", [])
+                            for item in skipped:
+                                print(
+                                    f"  [PRF] Skipped scene source {int(item.get('scene_index', -1)) + 1} "
+                                    f"({item.get('label', 'unknown')}): {item.get('reason', 'not usable')}"
+                                )
+                            if len(written_csvs) > 1:
+                                print(f"  [PRF] Wrote {len(written_csvs)} constrained scene-source light curves.")
+                        except Exception as exc:
                             print(
-                                f"  [PRF] Skipped scene source {int(item.get('scene_index', -1)) + 1} "
-                                f"({item.get('label', 'unknown')}): {item.get('reason', 'not usable')}"
+                                f"  [WARN] PRF target{prf_k+1} failed "
+                                f"({type(exc).__name__}: {exc}); continuing with aperture extraction."
                             )
-                        if len(written_csvs) > 1:
-                            print(f"  [PRF] Wrote {len(written_csvs)} constrained scene-source light curves.")
-                    except Exception as exc:
-                        print(
-                            f"  [WARN] PRF target{prf_k+1} failed "
-                            f"({type(exc).__name__}: {exc}); continuing with aperture extraction."
-                        )
 
-        # Estimate once from original pixels; PRF fitting above is independent.
-        sky_mask_initial = None
-        sky_initial = None
-        if args.aperture_background == "median" and any(m in {"core", "jump"} for m in methods_to_run):
-            sky_mask_initial = aperture_background_mask(flux, seeds)
-            sky_initial, _ = measure_aperture_background(flux, sky_mask_initial, args.aperture_background_min_pixels)
-            print(f"  Aperture background: source-excluded clipped median; {int(sky_mask_initial.sum())} sky pixels", flush=True)
+            # Estimate once from original pixels; PRF fitting above is independent.
+            sky_mask_initial = None
+            sky_initial = None
+            if args.aperture_background == "median" and any(m in {"core", "jump"} for m in methods_to_run):
+                sky_mask_initial = aperture_background_mask(flux, seeds)
+                sky_initial, _ = measure_aperture_background(flux, sky_mask_initial, args.aperture_background_min_pixels)
+                print(f"  Aperture background: source-excluded clipped median; {int(sky_mask_initial.sum())} sky pixels", flush=True)
 
-        # Per-target processing
-        for k in range(n_use):
-            tag = f"target{k+1}"
-            source_label = source_labels[k] if source_labels is not None else sanitize_token(tag)
-            allowed = (owner == k)
-            if external_aperture_mask is None and not np.any(allowed):
-                print(f"  [WARN] {tag}: empty watershed region; skipping.")
-                continue
+            # Per-target processing
+            for k in range(n_use):
+                tag = f"target{k+1}"
+                source_label = source_labels[k] if source_labels is not None else sanitize_token(tag)
+                allowed = (owner == k)
+                if external_aperture_mask is None and not np.any(allowed):
+                    print(f"  [WARN] {tag}: empty watershed region; skipping.")
+                    continue
 
-            for meth in methods_to_run:
-                aperture_back = None
-                aperture_back_count = None
-                aperture_sky_mask = None
-                photometry_flux = flux
-                if meth in {"core", "jump"} and sky_initial is not None:
-                    photometry_flux = flux - sky_initial[:,None,None]
-                crow = ccol = None
-                active_external_metadata = None
-                quick_metadata = None
-                if meth == "quick":
-                    coordinate = infer_header_target_coord(tpf) if n_use == 1 else None
-                    center_source = "header_coordinate"
-                    if coordinate is None and target_coords is not None:
-                        coordinate = target_coords[k]
-                        center_source = "selected_source_coordinate"
-                    row, col = map(float, seeds[k])
-                    if coordinate is not None:
-                        col, row = map(float, tpf.wcs.world_to_pixel(coordinate))
-                    else:
-                        center_source = "pixel_seed"
-                        print(f"  [WARN] Quick target{k+1}: no sky coordinate; centering on pixel seed {seeds[k]}", flush=True)
-                    if not np.isfinite([row,col]).all():
-                        raise ValueError("Quick aperture center is not finite.")
-                    lc_raw, ap_mask, aperture_sky_mask, aperture_back, aperture_back_count = quick_annular_photometry(flux,row,col)
-                    photometry_flux = flux-aperture_back[:,None,None]
-                    t_g = time
-                    meth_tag = "quick"
-                    quick_metadata = {"method":"annulus_median", "aperture_radius_pixels":2.5,
-                                      "annulus_inner_pixels":5.0, "annulus_outer_pixels":7.0,
-                                      "center_row":row, "center_column":col, "center_source":center_source,
-                                      "extraction_decorrelation":False, "min_pixels":5}
-                    print(f"  Quick aperture: center=({row:.4f}, {col:.4f}); {ap_mask.sum()} aperture pixels, {aperture_sky_mask.sum()} annulus pixels",flush=True)
-                elif meth == "external_aperture":
-                    # Validate against the actual post-read image shape. The
-                    # selected pixels deliberately ignore the watershed owner
-                    # map: the user's text matrix is the complete aperture.
-                    if tuple(external_aperture_mask.shape) != tuple(mean_img.shape):
-                        raise ValueError(
-                            f"External aperture mask shape {tuple(external_aperture_mask.shape)} "
-                            f"does not match the TPF image shape {tuple(mean_img.shape)} for "
-                            f"{tpf_path.name}. Rows and columns are not transposed automatically."
-                        )
-                    ap_mask = external_aperture_mask.copy()
-                    active_external_metadata = dict(external_mask_metadata)
-                    t_g = time
-                    lc_raw, crow, ccol = masked_sum_and_centroid_blockwise(
-                        flux, ap_mask, yy, xx
-                    )
-                    meth_tag = "external_aperture"
-                elif meth == "full_region_sum":
-                    ap_mask = allowed.copy()
-                    t_g = time
-                    lc_raw, crow, ccol = masked_sum_and_centroid_blockwise(flux, ap_mask, yy, xx)
-                    meth_tag = "full_region_sum"
-                elif meth == "jump":
-                    t_g, lc_raw, ap_mask, *_ = grow_aperture_multi_component_in_region(
-                        photometry_flux,
-                        time,
-                        seed_pix=seeds[k],
-                        allowed_mask=allowed,
-                        min_pixels=args.min_pixels,
-                        amp_q_lo=args.amp_q_lo,
-                        amp_q_hi=args.amp_q_hi,
-                        amp_min_frac=args.amp_min_frac,
-                        max_components=args.max_components,
-                        min_seed_frac_of_peak=args.min_seed_frac_of_peak,
-                        min_new_pixels_per_component=args.min_new_pixels_per_component,
-                        max_radius_pix=args.max_radius_pix,
-                    )
-                    meth_tag = "jump"
-                else:
-                    t_g, lc_raw, ap_mask, *_ = grow_aperture_bright_core_preseed(
-                        photometry_flux,
-                        time,
-                        seed_pix=seeds[k],
-                        allowed_mask=allowed,
-                        min_pixels=args.min_pixels,
-                        amp_q_lo=args.amp_q_lo,
-                        amp_q_hi=args.amp_q_hi,
-                        amp_min_frac=args.amp_min_frac,
-                        core_npix=args.core_npix,
-                        core_min_frac_of_peak=args.core_min_frac_of_peak,
-                        max_radius_pix=args.max_radius_pix,
-                    )
-                    meth_tag = "core"
-
-                if meth in {"core", "jump"} and sky_initial is not None:
-                    from scipy.ndimage import binary_dilation
-                    aperture_sky_mask = sky_mask_initial & ~binary_dilation(ap_mask, iterations=2)
-                    aperture_back, aperture_back_count = measure_aperture_background(
-                        flux, aperture_sky_mask, args.aperture_background_min_pixels)
-                    # Final mask cannot overlap the grown aperture or its margin.
-                    # Recompute the sum directly; don't apply a second subtraction.
-                    photometry_flux = flux - aperture_back[:,None,None]
-                    lc_raw = np.nansum(photometry_flux[:, ap_mask], axis=1)
-                    valid_ap = np.sum(np.isfinite(flux[:,ap_mask]), axis=1)
-                    lc_raw[(valid_ap == 0) | ~np.isfinite(aperture_back)] = np.nan
-
-                # Median-normalize raw
-                med = np.nanmedian(lc_raw)
-                lc_rel = lc_raw / med if np.isfinite(med) and med != 0 else lc_raw
-
-                # Flux-weighted centroid in this aperture
-                ap = ap_mask
-                if crow is None or ccol is None:
-                    weights = photometry_flux[:,ap]
-                    if aperture_back is not None:
-                        weights = np.maximum(weights, 0.0)
-                    denom = np.nansum(weights, axis=1)
-                    crow = np.divide(np.nansum(weights*yy[ap][None,:],axis=1), denom, out=np.full(len(time),np.nan), where=denom>0)
-                    ccol = np.divide(np.nansum(weights*xx[ap][None,:],axis=1), denom, out=np.full(len(time),np.nan), where=denom>0)
-
-                # Optional PSF-width proxy
-                psf_sig = None
-                if args.psf_proxy:
-                    psf_sig = psf_width_sigma(np.maximum(photometry_flux,0) if aperture_back is not None else flux, ap, crow, ccol)
-                # Saturated-target correction is gated on morphology only. It
-                # uses measured background and image motion, not sector-specific
-                # orbital information.
-                use_saturated_correction = bool(
-                    args.saturated_systematics_correction
-                    and n_use == 1
-                    and meth != "quick"
-                )
-                if use_saturated_correction:
-                    sat_ok, sat_npix = is_heavily_saturated(mean_img, thresh=args.sat_thresh, min_npix=args.sat_min_npix)
-                    if not sat_ok:
-                        print(
-                            "  [INFO] Saturated-target correction requested but the "
-                            f"saturation gate failed (npix_above_thresh={sat_npix}); using the standard correction."
-                        )
-                        use_saturated_correction = False
-                # Build per-cadence background and apply the same physical
-                # correction used by the saturated-aperture path.
-                back = None
-                saturated_model = None
-                detrend_keep = None
-                saturated_detrend_meta = None
-                if use_saturated_correction:
-                    back = aperture_back if aperture_back is not None else estimate_background_faint_pixels(flux, n_faint=args.back_nfaint)
-                    lc_work, saturated_model, detrend_keep, saturated_detrend_meta = (
-                        detrend_saturated_background_motion(
-                            t_g,
-                            lc_rel,
-                            back,
-                            crow,
-                            ccol,
-                            n_iter=args.robust_iters,
-                            huber_k=args.huber_k,
-                        )
-                    )
-                    print(
-                        "  Saturated background/motion correction: "
-                        f"retained={int(np.count_nonzero(detrend_keep))}/{len(detrend_keep)}, "
-                        f"robust cadence noise={saturated_detrend_meta['cadence_noise_ppm']:.1f} ppm"
-                    )
-                else:
-                    lc_work = lc_rel
-
-                # -----------------------------------------------------------------
-                # Standard position/time decorrelation remains unchanged for
-                # non-saturated workflows. The saturated correction above is
-                # already complete and is not followed by a second fit.
-                # -----------------------------------------------------------------
-                if args.full_region_sum or meth == "quick":
-                    lc_xy = lc_work.copy()
-                else:
-                    if use_saturated_correction:
-                        lc_xy = lc_work.copy()
-                    else:
-                        X = build_design_matrix(
-                            t_g,
-                            ccol,
-                            crow,
-                            knot_spacing_days=args.knot_spacing_days,
-                            psf_sigma=psf_sig,
-                        )
-                        y = lc_work - np.nanmedian(lc_work)
-                        good = np.isfinite(y) & np.all(np.isfinite(X), axis=1)
-                        if good.sum() > 1000:
-                            beta = robust_wls(X[good], y[good], n_iter=args.robust_iters, huber_k=args.huber_k)
-                            lc_xy = (y - (X @ beta)) + np.nanmedian(lc_work)
-                        else:
-                            lc_xy = lc_work.copy()
-
-
-                # Write outputs (flat structure, labeled by sector/source/target/method).
-                output_stem = build_output_stem(sector_tag, source_label, k + 1, meth_tag)
-                output_df = make_lightcurve_dataframe(
-                    t_g, lc_xy, mission, time_system, "flux_detrended_rel"
-                )
-                output_df["sector"] = sector_tag
-                output_df["tpf_name"] = tpf_path.name
-                output_df["tpf_path"] = str(tpf_path)
-                output_df["camera"] = camera_number if camera_number is not None else np.nan
-                output_df["ccd"] = ccd_number if ccd_number is not None else np.nan
-                output_df["saturated_systematics_correction"] = bool(use_saturated_correction)
-                output_df["aperture_background_method"] = "annulus_median" if meth == "quick" else ("source_excluded_clipped_median" if aperture_back is not None else "none")
-                if aperture_back is not None:
-                    output_df["background"] = aperture_back
-                    output_df["background_npix"] = aperture_back_count
-                    output_df["flux_background_subtracted"] = lc_raw
-                    output_df["flux_rel"] = lc_rel
-                    np.save(outdir / f"background_{output_stem}.npy", aperture_back)
-                    np.save(outdir / f"background_mask_{output_stem}.npy", aperture_sky_mask)
-                    with (outdir / f"background_{output_stem}_meta.json").open("w") as stream:
-                        background_metadata = quick_metadata if quick_metadata is not None else {
-                            "method":"source_excluded_clipped_median", "source_threshold_sigma":5,
-                            "source_dilation_pixels":2, "target_exclusion_radius_pixels":5,
-                            "aperture_exclusion_dilation_pixels":2, "clip_sigma":3,
-                            "clip_iterations":3, "min_pixels":args.aperture_background_min_pixels}
-                        background_metadata = dict(background_metadata)
-                        background_metadata.update({"mask_pixels":int(aperture_sky_mask.sum()),
-                                                    "invalid_cadences":int(np.sum(~np.isfinite(lc_raw)))})
-                        json.dump(background_metadata,stream,indent=2)
-                if quick_metadata is not None:
-                    output_df["aperture_definition"] = "fixed_circular_annular_background"
-                    output_df["extraction_decorrelation"] = False
-                    output_df["aperture_center_row"] = quick_metadata["center_row"]
-                    output_df["aperture_center_column"] = quick_metadata["center_column"]
-
-
-                if active_external_metadata is not None:
-                    # Repeated identity columns keep the CSV self-describing;
-                    # full provenance, orientation, and checksum are also
-                    # written once in the companion JSON below.
-                    output_df["aperture_definition"] = "external_text_mask"
-                    output_df["external_mask_file"] = active_external_metadata["source_name"]
-                    output_df["external_mask_sha256"] = active_external_metadata["sha256"]
-                if use_saturated_correction:
-                    output_df["background"] = np.asarray(back, float)
-                    output_df["flux_rel"] = np.asarray(lc_rel, float)
-                    output_df["systematics_model_rel"] = np.asarray(saturated_model, float)
-                    output_df["detrend_keep"] = np.asarray(detrend_keep, bool)
-                    for key, value in saturated_detrend_meta.items():
-                        output_df[f"saturated_detrend_{key}"] = value
-                    np.save(outdir / f"background_{output_stem}.npy", np.asarray(back, float))
-                    np.save(
-                        outdir / f"saturated_systematics_model_{output_stem}.npy",
-                        np.asarray(saturated_model, float),
-                    )
-                    np.save(
-                        outdir / f"detrend_keep_{output_stem}.npy",
-                        np.asarray(detrend_keep, bool),
-                    )
-                output_df.to_csv(outdir / f"preferred_lc_{output_stem}.csv", index=False)
-                if use_saturated_correction:
-                    save_saturated_detrending_plot(
-                        t_g,
-                        lc_rel,
-                        lc_xy,
-                        saturated_model,
-                        detrend_keep,
-                        outdir / f"preferred_lc_{output_stem}.png",
-                        f"{tpf_path.stem} — {source_label} / target{k+1} ({meth_tag})",
-                        time_label=mission_time_axis_label(time_system),
-                    )
-                else:
-                    save_lightcurve_plot(
-                        t_g,
-                        lc_xy,
-                        outdir / f"preferred_lc_{output_stem}.png",
-                        f"{tpf_path.stem} — {source_label} / target{k+1} ({meth_tag})",
-                        time_label=mission_time_axis_label(time_system),
-                    )
-                np.save(outdir / f"aperture_mask_{output_stem}.npy", ap_mask.astype(bool))
-                np.save(outdir / f"centroid_row_{output_stem}.npy", np.asarray(crow, float))
-                np.save(outdir / f"centroid_col_{output_stem}.npy", np.asarray(ccol, float))
-                if active_external_metadata is not None:
-                    product_metadata = dict(active_external_metadata)
-                    product_metadata.update({
-                        "tpf_path": str(tpf_path),
-                        "output_stem": output_stem,
-                        "target_label": source_label,
-                        "target_index": int(k + 1),
-                        "method": meth_tag,
-                        "tpf_shape_rows_columns": [int(mean_img.shape[0]), int(mean_img.shape[1])],
-                    })
-                    metadata_path = outdir / f"external_aperture_meta_{output_stem}.json"
-                    metadata_path.write_text(
-                        json.dumps(product_metadata, indent=2, sort_keys=True) + "\n",
-                        encoding="utf-8",
-                    )
-
-                # Aperture image
-                if not args.no_aperture_plots:
-                    # gmag may be unavailable if Gaia was skipped/unavailable
-                    gtxt = "Gaia G=NA"
+                for meth in methods_to_run:
+                    if args.skip_existing and (str(tpf_path.resolve()), k + 1, meth) in existing_outputs:
+                        print(f"  [RESUME] target{k+1} {meth}: completed CSV exists; skipping", flush=True)
+                        continue
                     try:
-                        if gmag is not None and np.isfinite(float(gmag[k])):
-                            gtxt = f"Gaia G={float(gmag[k]):.2f}"
-                    except Exception:
-                        pass
-                    save_aperture_plot(
-                        mean_img,
-                        ap_mask.astype(bool),
-                        outdir / f"aperture_{output_stem}.png",
-                        (
-                            f"{tpf_path.stem} — {source_label} / target{k+1} ({meth_tag})\n"
-                            + (
-                                f"External mask: {active_external_metadata['source_name']}; "
-                                f"Npix={active_external_metadata['selected_pixels']}"
-                                if active_external_metadata is not None
-                                else gtxt
+                        aperture_back = None
+                        aperture_back_count = None
+                        aperture_sky_mask = None
+                        photometry_flux = flux
+                        if meth in {"core", "jump"} and sky_initial is not None:
+                            photometry_flux = flux - sky_initial[:,None,None]
+                        crow = ccol = None
+                        active_external_metadata = None
+                        quick_metadata = None
+                        if meth == "quick":
+                            coordinate = infer_header_target_coord(tpf) if n_use == 1 else None
+                            center_source = "header_coordinate"
+                            if coordinate is None and target_coords is not None:
+                                coordinate = target_coords[k]
+                                center_source = "selected_source_coordinate"
+                            row, col = map(float, seeds[k])
+                            if coordinate is not None:
+                                col, row = map(float, tpf.wcs.world_to_pixel(coordinate))
+                            else:
+                                center_source = "pixel_seed"
+                                print(f"  [WARN] Quick target{k+1}: no sky coordinate; centering on pixel seed {seeds[k]}", flush=True)
+                            if not np.isfinite([row,col]).all():
+                                raise ValueError("Quick aperture center is not finite.")
+                            lc_raw, ap_mask, aperture_sky_mask, aperture_back, aperture_back_count = quick_annular_photometry(flux,row,col)
+                            photometry_flux = flux-aperture_back[:,None,None]
+                            t_g = time
+                            meth_tag = "quick"
+                            quick_metadata = {"method":"annulus_median", "aperture_radius_pixels":2.5,
+                                              "annulus_inner_pixels":5.0, "annulus_outer_pixels":7.0,
+                                              "center_row":row, "center_column":col, "center_source":center_source,
+                                              "extraction_decorrelation":False, "min_pixels":5}
+                            print(f"  Quick aperture: center=({row:.4f}, {col:.4f}); {ap_mask.sum()} aperture pixels, {aperture_sky_mask.sum()} annulus pixels",flush=True)
+                        elif meth == "external_aperture":
+                            # Validate against the actual post-read image shape. The
+                            # selected pixels deliberately ignore the watershed owner
+                            # map: the user's text matrix is the complete aperture.
+                            if tuple(external_aperture_mask.shape) != tuple(mean_img.shape):
+                                raise ValueError(
+                                    f"External aperture mask shape {tuple(external_aperture_mask.shape)} "
+                                    f"does not match the TPF image shape {tuple(mean_img.shape)} for "
+                                    f"{tpf_path.name}. Rows and columns are not transposed automatically."
+                                )
+                            ap_mask = external_aperture_mask.copy()
+                            active_external_metadata = dict(external_mask_metadata)
+                            t_g = time
+                            lc_raw, crow, ccol = masked_sum_and_centroid_blockwise(
+                                flux, ap_mask, yy, xx
                             )
-                        ),
-                    )
+                            meth_tag = "external_aperture"
+                        elif meth == "full_region_sum":
+                            ap_mask = allowed.copy()
+                            t_g = time
+                            lc_raw, crow, ccol = masked_sum_and_centroid_blockwise(flux, ap_mask, yy, xx)
+                            meth_tag = "full_region_sum"
+                        elif meth == "jump":
+                            t_g, lc_raw, ap_mask, *_ = grow_aperture_multi_component_in_region(
+                                photometry_flux,
+                                time,
+                                seed_pix=seeds[k],
+                                allowed_mask=allowed,
+                                min_pixels=args.min_pixels,
+                                amp_q_lo=args.amp_q_lo,
+                                amp_q_hi=args.amp_q_hi,
+                                amp_min_frac=args.amp_min_frac,
+                                max_components=args.max_components,
+                                min_seed_frac_of_peak=args.min_seed_frac_of_peak,
+                                min_new_pixels_per_component=args.min_new_pixels_per_component,
+                                max_radius_pix=args.max_radius_pix,
+                            )
+                            meth_tag = "jump"
+                        else:
+                            t_g, lc_raw, ap_mask, *_ = grow_aperture_bright_core_preseed(
+                                photometry_flux,
+                                time,
+                                seed_pix=seeds[k],
+                                allowed_mask=allowed,
+                                min_pixels=args.min_pixels,
+                                amp_q_lo=args.amp_q_lo,
+                                amp_q_hi=args.amp_q_hi,
+                                amp_min_frac=args.amp_min_frac,
+                                core_npix=args.core_npix,
+                                core_min_frac_of_peak=args.core_min_frac_of_peak,
+                                max_radius_pix=args.max_radius_pix,
+                            )
+                            meth_tag = "core"
 
-                print(
-                    f"  Wrote {tag} ({meth_tag}): preferred_lc_{output_stem}.csv"
-                    f"  Npix={int(np.count_nonzero(ap_mask))}"
-                )
+                        if meth in {"core", "jump"}:
+                            previous_pixels = int(np.count_nonzero(ap_mask))
+                            ap_mask, minimum_status = enforce_aperture_minimum(
+                                ap_mask, mean_img, owner, k, seeds[k],
+                                min_pixels=args.aperture_min_pixels,
+                                max_radius_pix=args.max_radius_pix,
+                            )
+                            if minimum_status != "already_sufficient":
+                                print(f"  [APERTURE] {meth_tag} target{k+1}: {minimum_status}; "
+                                      f"watershed-owned={int(np.count_nonzero(owner == k))}", flush=True)
+                            if int(ap_mask.sum()) != previous_pixels:
+                                # Recompute the extracted flux and centroids from the final
+                                # mask, even when no aperture-sky subtraction is requested.
+                                lc_raw = np.nansum(photometry_flux[:, ap_mask], axis=1)
+                                crow = ccol = None
+
+                        if meth in {"core", "jump"} and sky_initial is not None:
+                            from scipy.ndimage import binary_dilation
+                            aperture_sky_mask = sky_mask_initial & ~binary_dilation(ap_mask, iterations=2)
+                            aperture_back, aperture_back_count = measure_aperture_background(
+                                flux, aperture_sky_mask, args.aperture_background_min_pixels)
+                            # Final mask cannot overlap the grown aperture or its margin.
+                            # Recompute the sum directly; don't apply a second subtraction.
+                            photometry_flux = flux - aperture_back[:,None,None]
+                            lc_raw = np.nansum(photometry_flux[:, ap_mask], axis=1)
+                            valid_ap = np.sum(np.isfinite(flux[:,ap_mask]), axis=1)
+                            lc_raw[(valid_ap == 0) | ~np.isfinite(aperture_back)] = np.nan
+
+                        # Median-normalize raw
+                        med = np.nanmedian(lc_raw)
+                        lc_rel = lc_raw / med if np.isfinite(med) and med != 0 else lc_raw
+
+                        # Flux-weighted centroid in this aperture
+                        ap = ap_mask
+                        if crow is None or ccol is None:
+                            weights = photometry_flux[:,ap]
+                            if aperture_back is not None:
+                                weights = np.maximum(weights, 0.0)
+                            denom = np.nansum(weights, axis=1)
+                            crow = np.divide(np.nansum(weights*yy[ap][None,:],axis=1), denom, out=np.full(len(time),np.nan), where=denom>0)
+                            ccol = np.divide(np.nansum(weights*xx[ap][None,:],axis=1), denom, out=np.full(len(time),np.nan), where=denom>0)
+
+                        # Optional PSF-width proxy
+                        psf_sig = None
+                        if args.psf_proxy:
+                            psf_sig = psf_width_sigma(np.maximum(photometry_flux,0) if aperture_back is not None else flux, ap, crow, ccol)
+                        # Saturated-target correction is gated on morphology only. It
+                        # uses measured background and image motion, not sector-specific
+                        # orbital information.
+                        use_saturated_correction = bool(
+                            args.saturated_systematics_correction
+                            and n_use == 1
+                            and meth != "quick"
+                        )
+                        if use_saturated_correction:
+                            sat_ok, sat_npix = is_heavily_saturated(mean_img, thresh=args.sat_thresh, min_npix=args.sat_min_npix)
+                            if not sat_ok:
+                                print(
+                                    "  [INFO] Saturated-target correction requested but the "
+                                    f"saturation gate failed (npix_above_thresh={sat_npix}); using the standard correction."
+                                )
+                                use_saturated_correction = False
+                        # Build per-cadence background and apply the same physical
+                        # correction used by the saturated-aperture path.
+                        back = None
+                        saturated_model = None
+                        detrend_keep = None
+                        saturated_detrend_meta = None
+                        if use_saturated_correction:
+                            back = aperture_back if aperture_back is not None else estimate_background_faint_pixels(flux, n_faint=args.back_nfaint)
+                            lc_work, saturated_model, detrend_keep, saturated_detrend_meta = (
+                                detrend_saturated_background_motion(
+                                    t_g,
+                                    lc_rel,
+                                    back,
+                                    crow,
+                                    ccol,
+                                    n_iter=args.robust_iters,
+                                    huber_k=args.huber_k,
+                                )
+                            )
+                            print(
+                                "  Saturated background/motion correction: "
+                                f"retained={int(np.count_nonzero(detrend_keep))}/{len(detrend_keep)}, "
+                                f"robust cadence noise={saturated_detrend_meta['cadence_noise_ppm']:.1f} ppm"
+                            )
+                        else:
+                            lc_work = lc_rel
+
+                        # -----------------------------------------------------------------
+                        # Standard position/time decorrelation remains unchanged for
+                        # non-saturated workflows. The saturated correction above is
+                        # already complete and is not followed by a second fit.
+                        # -----------------------------------------------------------------
+                        if args.full_region_sum or meth == "quick":
+                            lc_xy = lc_work.copy()
+                        else:
+                            if use_saturated_correction:
+                                lc_xy = lc_work.copy()
+                            else:
+                                X = build_design_matrix(
+                                    t_g,
+                                    ccol,
+                                    crow,
+                                    knot_spacing_days=args.knot_spacing_days,
+                                    psf_sigma=psf_sig,
+                                )
+                                y = lc_work - np.nanmedian(lc_work)
+                                good = np.isfinite(y) & np.all(np.isfinite(X), axis=1)
+                                if good.sum() > 1000:
+                                    beta = robust_wls(X[good], y[good], n_iter=args.robust_iters, huber_k=args.huber_k)
+                                    lc_xy = (y - (X @ beta)) + np.nanmedian(lc_work)
+                                else:
+                                    lc_xy = lc_work.copy()
+
+
+                        # Write outputs (flat structure, labeled by sector/source/target/method).
+                        output_stem = build_output_stem(sector_tag, source_label, k + 1, meth_tag)
+                        output_df = make_lightcurve_dataframe(
+                            t_g, lc_xy, mission, time_system, "flux_detrended_rel"
+                        )
+                        output_df["sector"] = sector_tag
+                        output_df["tpf_name"] = tpf_path.name
+                        output_df["tpf_path"] = str(tpf_path)
+                        output_df["camera"] = camera_number if camera_number is not None else np.nan
+                        output_df["ccd"] = ccd_number if ccd_number is not None else np.nan
+                        output_df["saturated_systematics_correction"] = bool(use_saturated_correction)
+                        output_df["aperture_background_method"] = "annulus_median" if meth == "quick" else ("source_excluded_clipped_median" if aperture_back is not None else "none")
+                        if aperture_back is not None:
+                            output_df["background"] = aperture_back
+                            output_df["background_npix"] = aperture_back_count
+                            output_df["flux_background_subtracted"] = lc_raw
+                            output_df["flux_rel"] = lc_rel
+                            np.save(outdir / f"background_{output_stem}.npy", aperture_back)
+                            np.save(outdir / f"background_mask_{output_stem}.npy", aperture_sky_mask)
+                            with (outdir / f"background_{output_stem}_meta.json").open("w") as stream:
+                                background_metadata = quick_metadata if quick_metadata is not None else {
+                                    "method":"source_excluded_clipped_median", "source_threshold_sigma":5,
+                                    "source_dilation_pixels":2, "target_exclusion_radius_pixels":5,
+                                    "aperture_exclusion_dilation_pixels":2, "clip_sigma":3,
+                                    "clip_iterations":3, "min_pixels":args.aperture_background_min_pixels}
+                                background_metadata = dict(background_metadata)
+                                background_metadata.update({"mask_pixels":int(aperture_sky_mask.sum()),
+                                                            "invalid_cadences":int(np.sum(~np.isfinite(lc_raw)))})
+                                json.dump(background_metadata,stream,indent=2)
+                        if quick_metadata is not None:
+                            output_df["aperture_definition"] = "fixed_circular_annular_background"
+                            output_df["extraction_decorrelation"] = False
+                            output_df["aperture_center_row"] = quick_metadata["center_row"]
+                            output_df["aperture_center_column"] = quick_metadata["center_column"]
+
+
+                        if active_external_metadata is not None:
+                            # Repeated identity columns keep the CSV self-describing;
+                            # full provenance, orientation, and checksum are also
+                            # written once in the companion JSON below.
+                            output_df["aperture_definition"] = "external_text_mask"
+                            output_df["external_mask_file"] = active_external_metadata["source_name"]
+                            output_df["external_mask_sha256"] = active_external_metadata["sha256"]
+                        if use_saturated_correction:
+                            output_df["background"] = np.asarray(back, float)
+                            output_df["flux_rel"] = np.asarray(lc_rel, float)
+                            output_df["systematics_model_rel"] = np.asarray(saturated_model, float)
+                            output_df["detrend_keep"] = np.asarray(detrend_keep, bool)
+                            for key, value in saturated_detrend_meta.items():
+                                output_df[f"saturated_detrend_{key}"] = value
+                            np.save(outdir / f"background_{output_stem}.npy", np.asarray(back, float))
+                            np.save(
+                                outdir / f"saturated_systematics_model_{output_stem}.npy",
+                                np.asarray(saturated_model, float),
+                            )
+                            np.save(
+                                outdir / f"detrend_keep_{output_stem}.npy",
+                                np.asarray(detrend_keep, bool),
+                            )
+                        output_df.to_csv(outdir / f"preferred_lc_{output_stem}.csv", index=False)
+                        existing_outputs.add((str(tpf_path.resolve()), k + 1, meth))
+                        if use_saturated_correction:
+                            save_saturated_detrending_plot(
+                                t_g,
+                                lc_rel,
+                                lc_xy,
+                                saturated_model,
+                                detrend_keep,
+                                outdir / f"preferred_lc_{output_stem}.png",
+                                f"{tpf_path.stem} — {source_label} / target{k+1} ({meth_tag})",
+                                time_label=mission_time_axis_label(time_system),
+                            )
+                        else:
+                            save_lightcurve_plot(
+                                t_g,
+                                lc_xy,
+                                outdir / f"preferred_lc_{output_stem}.png",
+                                f"{tpf_path.stem} — {source_label} / target{k+1} ({meth_tag})",
+                                time_label=mission_time_axis_label(time_system),
+                            )
+                        np.save(outdir / f"aperture_mask_{output_stem}.npy", ap_mask.astype(bool))
+                        np.save(outdir / f"centroid_row_{output_stem}.npy", np.asarray(crow, float))
+                        np.save(outdir / f"centroid_col_{output_stem}.npy", np.asarray(ccol, float))
+                        if active_external_metadata is not None:
+                            product_metadata = dict(active_external_metadata)
+                            product_metadata.update({
+                                "tpf_path": str(tpf_path),
+                                "output_stem": output_stem,
+                                "target_label": source_label,
+                                "target_index": int(k + 1),
+                                "method": meth_tag,
+                                "tpf_shape_rows_columns": [int(mean_img.shape[0]), int(mean_img.shape[1])],
+                            })
+                            metadata_path = outdir / f"external_aperture_meta_{output_stem}.json"
+                            metadata_path.write_text(
+                                json.dumps(product_metadata, indent=2, sort_keys=True) + "\n",
+                                encoding="utf-8",
+                            )
+
+                        # Aperture image
+                        if not args.no_aperture_plots:
+                            # gmag may be unavailable if Gaia was skipped/unavailable
+                            gtxt = "Gaia G=NA"
+                            try:
+                                if gmag is not None and np.isfinite(float(gmag[k])):
+                                    gtxt = f"Gaia G={float(gmag[k]):.2f}"
+                            except Exception:
+                                pass
+                            save_aperture_plot(
+                                mean_img,
+                                ap_mask.astype(bool),
+                                outdir / f"aperture_{output_stem}.png",
+                                (
+                                    f"{tpf_path.stem} — {source_label} / target{k+1} ({meth_tag})\n"
+                                    + (
+                                        f"External mask: {active_external_metadata['source_name']}; "
+                                        f"Npix={active_external_metadata['selected_pixels']}"
+                                        if active_external_metadata is not None
+                                        else gtxt
+                                    )
+                                ),
+                            )
+
+                        print(
+                            f"  Wrote {tag} ({meth_tag}): preferred_lc_{output_stem}.csv"
+                            f"  Npix={int(np.count_nonzero(ap_mask))}"
+                        )
+
+                    except Exception as exc:
+                        reason = f"{type(exc).__name__}: {exc}"
+                        print(f"  [WARN] {tpf_path.name} / {source_label} / {meth}: {reason}; skipping this extraction.", flush=True)
+                        batch_failures.append({"file": str(tpf_path), "target": str(source_label), "method": str(meth), "error": reason})
+                        continue
+        except Exception as exc:
+            reason = f"{type(exc).__name__}: {exc}"
+            print(f"  [WARN] Skipping input {tpf_path.name}: {reason}", flush=True)
+            batch_failures.append({"file": str(tpf_path), "target": "(stamp)", "method": "initialization", "error": reason})
+            continue
+
+    if batch_failures:
+        failure_path = output_root / "extraction_batch_failures.csv"
+        pd.DataFrame(batch_failures, columns=["file", "target", "method", "error"]).to_csv(
+            failure_path, index=False
+        )
+        print(f"\n[WARN] Skipped {len(batch_failures)} failed extraction(s). Details: {failure_path}", flush=True)
 
     if saturated_failures:
         failure_summary = output_root / "saturated_aperture_failures.csv"
