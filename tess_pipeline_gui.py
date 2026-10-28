@@ -93,6 +93,7 @@ EXPERT_DEFAULTS = {
     "ex_aperture_fom": "stddiff",
     "ex_simple_aperture_mode": "auto",
     "ex_min_pixels": 10,
+    "ex_skip_existing": False,
     "ex_amp_q_lo": 1.0,
     "ex_amp_q_hi": 99.0,
     "ex_amp_min_frac": 0.01,
@@ -599,6 +600,7 @@ TOOLTIPS = {
     "ex_prf_allow_gaussian_fallback": "Allow a warned Gaussian approximation if neither lkprf nor TESS_PRF is installed or usable.",
     "ex_save_aperture_plots": "Save aperture-overlay PNGs. If unchecked, --no-aperture-plots is added.",
     "ex_extraction_approach": "Choose standard watershed extraction or the single-target saturated aperture. RAW_CNTS is preferred; TESSCut products fall back to calibrated FLUX geometry only when RAW_CNTS is unusable. The saturated mode rejects a stamp when target charge reaches an axial boundary.",
+    "ex_skip_existing": "Resume a batch run: skip completed light-curve CSVs while retaining unfinished target/method products. Existing files are not overwritten.",
     "ex_min_pixels": "Minimum aperture size before growth is allowed to stop just because the metric no longer improves.",
     "ex_amp_q_lo": "Lower percentile used in the aperture-amplitude sanity check.",
     "ex_amp_q_hi": "Upper percentile used in the aperture-amplitude sanity check.",
@@ -1014,6 +1016,7 @@ class TESSGui(tk.Tk):
         self.ex_prf_save_diagnostics = tk.BooleanVar(value=True)
         self.ex_prf_allow_gaussian_fallback = tk.BooleanVar(value=True)
 
+        self.ex_skip_existing = tk.BooleanVar(value=False)
         self.ex_min_pixels = tk.IntVar(value=10)
         self.ex_amp_q_lo = tk.DoubleVar(value=1.0)
         self.ex_amp_q_hi = tk.DoubleVar(value=99.0)
@@ -1267,6 +1270,12 @@ class TESSGui(tk.Tk):
         self._make_checkbutton(out_frame, text="Save aperture plots", variable=self.ex_save_aperture_plots,
                         command=self._update_extractor_command_preview, tooltip_key="ex_save_aperture_plots",
                         row=1, column=1, sticky="w", padx=6, pady=4)
+
+        self._make_checkbutton(out_frame, text="Skip existing completed light curves (resume)",
+                        variable=self.ex_skip_existing,
+                        command=self._update_extractor_command_preview,
+                        tooltip_key="ex_skip_existing", row=1, column=0,
+                        sticky="w", padx=6, pady=4)
 
         # Basic settings contain only the choices needed for routine runs.
         self.ex_basic_settings_frame = ttk.LabelFrame(root, text="Extraction settings")
@@ -1934,7 +1943,7 @@ class TESSGui(tk.Tk):
             self.ex_full_region_sum, self.ex_gaia_region_sum, self.ex_save_aperture_plots,
             self.ex_save_pickled_figures, self.ex_saturated_systematics,
             self.ex_extraction_approach,
-            self.ex_min_pixels, self.ex_amp_q_lo, self.ex_amp_q_hi, self.ex_amp_min_frac,
+            self.ex_skip_existing, self.ex_min_pixels, self.ex_amp_q_lo, self.ex_amp_q_hi, self.ex_amp_min_frac,
             self.ex_max_radius_pix, self.ex_max_components, self.ex_min_seed_frac,
             self.ex_min_new_pixels, self.ex_core_npix, self.ex_core_min_frac,
             self.ex_sat_thresh, self.ex_sat_min_npix, self.ex_back_nfaint,
@@ -2243,6 +2252,9 @@ class TESSGui(tk.Tk):
             cmd.append("--saturated-systematics-correction")
         if saturation_optimized:
             cmd.append("--saturation-optimized-aperture")
+
+        if self.ex_skip_existing.get() and not is_simple:
+            cmd.append("--skip-existing")
 
         cmd += ["--sat-thresh", str(float(self.ex_sat_thresh.get()))]
         cmd += ["--sat-min-npix", str(int(self.ex_sat_min_npix.get()))]
@@ -2698,6 +2710,7 @@ class TESSGui(tk.Tk):
             "ex_saturated_systematics": self.ex_saturated_systematics.get(),
             "ex_extraction_approach": self.ex_extraction_approach.get(),
             "ex_min_pixels": self.ex_min_pixels.get(),
+            "ex_skip_existing": self.ex_skip_existing.get(),
             "ex_amp_q_lo": self.ex_amp_q_lo.get(),
             "ex_amp_q_hi": self.ex_amp_q_hi.get(),
             "ex_amp_min_frac": self.ex_amp_min_frac.get(),
