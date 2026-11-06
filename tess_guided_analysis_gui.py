@@ -283,6 +283,9 @@ TOOLTIPS = {
     "fmin": "Minimum frequency in cycles/day.",
     "fmax": "Maximum frequency in cycles/day.",
     "tess_cap_fmax_to_nyquist": "When enabled, use the smaller of the GUI Fmax value and the TESS Nyquist frequency for the current dataset. This is the default and is especially useful in batch mode.",
+    "uncertainty_mode": "Final guided-analysis fit uncertainties: none, formal covariance (default), or block-bootstrap plus formal.",
+    "uncertainty_boot_n": "Number of full frequency/amplitude refits in bootstrap mode; default 200.",
+    "uncertainty_boot_block_days": "Residual resampling block duration [days], default 0.5.",
     "tess_weight_mode": "TESS cadence weighting: none gives equal weights; formal uses normalized flux errors; sector_rescaled additionally matches each sector's median error to its robust first-difference scatter.",
     "tess_error_floor_frac": "Lower uncertainty floor as a fraction of the median error within each sector/group. A value of 0.25 limits any cadence to at most 16 times the median inverse-variance weight.",
     "tess_grid_mode": "Use the full baseline or the longest contiguous chunk to set the TESS discovery grid.",
@@ -501,6 +504,9 @@ class GuidedAnalysisGUI(tk.Tk):
         self.fmax = tk.DoubleVar(value=50.0)
         self.tess_cap_fmax_to_nyquist = tk.BooleanVar(value=True)
         self.tess_weight_mode = tk.StringVar(value="sector_rescaled")
+        self.uncertainty_mode = tk.StringVar(value="formal")
+        self.uncertainty_boot_n = tk.IntVar(value=200)
+        self.uncertainty_boot_block_days = tk.DoubleVar(value=0.5)
         self.tess_error_floor_frac = tk.DoubleVar(value=0.25)
         self.tess_grid_mode = tk.StringVar(value="full_baseline")
         self.tess_snr_stop = tk.DoubleVar(value=4.0)
@@ -844,6 +850,9 @@ class GuidedAnalysisGUI(tk.Tk):
         self._spin(outdisp, "LSQ verbose", self.lsq_verbose, 0, 5, 2, 0, tooltip_key="lsq_verbose")
         self._combo(outdisp, "TESS error weighting", self.tess_weight_mode, ["none", "formal", "sector_rescaled"], 3, 0, tooltip_key="tess_weight_mode")
         self._entry(outdisp, "TESS error floor / median", self.tess_error_floor_frac, 3, 2, tooltip_key="tess_error_floor_frac")
+        self._combo(outdisp, "Uncertainties (Guided)", self.uncertainty_mode, ["none", "formal", "bootstrap"], 4, 0, tooltip_key="uncertainty_mode")
+        self._spin(outdisp, "Bootstrap draws", self.uncertainty_boot_n, 20, 10000, 4, 2, tooltip_key="uncertainty_boot_n")
+        self._entry(outdisp, "Bootstrap block [days]", self.uncertainty_boot_block_days, 5, 0, tooltip_key="uncertainty_boot_block_days")
 
         main = ttk.LabelFrame(root, text="Main analysis settings")
         main.grid(row=6, column=0, sticky="ew", padx=8, pady=6)
@@ -963,7 +972,7 @@ class GuidedAnalysisGUI(tk.Tk):
             self.guided_script, self.joint_script, self.converter_script, self.ui_mode, self.analysis_mode, self.use_polarimetry,
             self.pol_csv, self.pol_product, self.save_generated_frame, self.generated_analysis_dir,
             self.output_target_subdir, self.outroot, self.show_plots_inline, self.verbose, self.lsq_verbose,
-            self.fmin, self.fmax, self.tess_weight_mode, self.tess_error_floor_frac,
+            self.fmin, self.fmax, self.tess_weight_mode, self.tess_error_floor_frac, self.uncertainty_mode, self.uncertainty_boot_n, self.uncertainty_boot_block_days,
             self.tess_grid_mode, self.tess_snr_stop, self.max_tess_modes,
             self.pol_snr_stop, self.max_pol_modes, self.guided_pol_fmin, self.search_window_mult,
             self.noise_ks, self.noise_bins, self.pol_smooth_enabled, self.pol_smooth_kernel,
@@ -1456,6 +1465,9 @@ class GuidedAnalysisGUI(tk.Tk):
             "fmax": float(self.fmax.get()),
             "tess_cap_fmax_to_nyquist": bool(self.tess_cap_fmax_to_nyquist.get()),
             "tess_weight_mode": self.tess_weight_mode.get().strip(),
+            "uncertainty_mode": self.uncertainty_mode.get().strip(),
+            "uncertainty_boot_n": int(self.uncertainty_boot_n.get()),
+            "uncertainty_boot_block_days": float(self.uncertainty_boot_block_days.get()),
             "tess_error_floor_frac": float(self.tess_error_floor_frac.get()),
             "tess_grid_mode": self.tess_grid_mode.get().strip(),
             "tess_snr_stop": float(self.tess_snr_stop.get()),
@@ -1516,6 +1528,10 @@ class GuidedAnalysisGUI(tk.Tk):
             raise ValueError("Polarimetry CSV path is empty.")
         if not cfg["outroot"]:
             raise ValueError("Output root is empty.")
+        if cfg["uncertainty_mode"] not in {"none", "formal", "bootstrap"}:
+            raise ValueError("Uncertainty mode must be none, formal, or bootstrap.")
+        if cfg["uncertainty_boot_n"] < 20 or cfg["uncertainty_boot_block_days"] <= 0:
+            raise ValueError("Bootstrap draws must be >=20 and block duration positive.")
         if cfg["tess_weight_mode"] not in {"none", "formal", "sector_rescaled"}:
             raise ValueError("TESS error weighting must be none, formal, or sector_rescaled.")
         if cfg["pol_product"] not in {"nm", "resid_nm_pchip", "pw_resid_nm_pchip"}:
@@ -1768,6 +1784,9 @@ def _apply_guided_common_settings(mod, *, outroot_override: Path | None = None, 
     mod.FMAX = float(CFG["fmax"])
     setattr(mod, "TESS_CAP_FMAX_TO_NYQUIST", bool(CFG.get("tess_cap_fmax_to_nyquist", True)))
     setattr(mod, "TESS_WEIGHT_MODE", CFG.get("tess_weight_mode", "sector_rescaled"))
+    mod.UNCERTAINTY_MODE = CFG.get("uncertainty_mode", "formal")
+    mod.UNCERTAINTY_BOOT_N = int(CFG.get("uncertainty_boot_n", 200))
+    mod.UNCERTAINTY_BOOT_BLOCK_DAYS = float(CFG.get("uncertainty_boot_block_days", 0.5))
     setattr(mod, "TESS_ERROR_FLOOR_FRAC", float(CFG.get("tess_error_floor_frac", 0.25)))
     mod.TESS_GRID_MODE = CFG["tess_grid_mode"]
     mod.TESS_SNR_STOP = float(CFG["tess_snr_stop"])
@@ -2370,6 +2389,7 @@ else:
             "generated_analysis_dir", "output_target_subdir", "outroot",
             "show_plots_inline", "verbose", "lsq_verbose", "fmin", "fmax",
             "tess_cap_fmax_to_nyquist", "tess_weight_mode", "tess_error_floor_frac",
+            "uncertainty_mode", "uncertainty_boot_n", "uncertainty_boot_block_days",
             "tess_grid_mode", "tess_snr_stop",
             "max_tess_modes", "pol_snr_stop", "max_pol_modes", "guided_pol_fmin",
             "search_window_mult", "noise_ks", "noise_bins", "pol_smooth_enabled",

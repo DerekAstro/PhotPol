@@ -177,6 +177,14 @@ PHASE_BIN_N = 16             # number of phase bins for overplotted median point
 PHASE_ZERO_MODE = "local_start"  # "local_start" | "btjd_zero" | "custom_btjd"
 PHASE_ZERO_BTJD = 0.0
 
+# --- Uncertainty estimates for final guided-analysis fits ---
+# This setting affects uncertainty reporting, not frequency discovery/selection.
+UNCERTAINTY_MODE = "formal"       # "none" | "formal" | "bootstrap"
+UNCERTAINTY_BOOT_N = 200
+UNCERTAINTY_BOOT_BLOCK_DAYS = 0.5
+UNCERTAINTY_BOOT_SEED = 314159
+UNCERTAINTY_MAX_CONDITION = 1e12
+
 # --- Final global multisinusoid fit ---
 GLOBAL_FREQ_BOUND_MULT = 3.0  # each frequency may move by +/- this x frequency resolution
 GLOBAL_MAX_NFEV = 300
@@ -1888,6 +1896,219 @@ def fit_global_multisin(ts: TimeSeries, seed_freqs: np.ndarray, baseline_matrix:
         "seed_freqs_used": seed_freqs,
         "min_sep": min_sep,
     }
+
+# ----------------------------------------------------------------------
+# Final-fit parameter uncertainties (independent of polarimetry availability)
+# ----------------------------------------------------------------------
+
+_UNCERTAINTY_FIELDS = ["f_err", "amp_err", "phase_err", "uncertainty_status",
+                       "boot_f_p16", "boot_f_p50", "boot_f_p84",
+                       "boot_amp_p16", "boot_amp_p50", "boot_amp_p84",
+                       "boot_phase_err", "boot_n_success"]
+
+
+def _empty_uncertainty_row(status="not_estimated"):
+    return {key: (status if key == "uncertainty_status" else np.nan)
+            for key in _UNCERTAINTY_FIELDS}
+
+
+def _uncertainty_baseline(ts: TimeSeries, channel: str, trend_cfg=None):
+    if channel == "tess":
+        return make_tess_baseline_matrix(ts)
+    if trend_cfg is None:
+        raise ValueError("Polarimetry uncertainty estimate needs night trend configuration")
+    return make_pol_baseline_matrix(ts, trend_cfg)
+
+
+def _formal_uncertainty(ts, fit, baseline):
+    """Linearized joint frequency/sine/cosine/baseline covariance.
+
+    Inverse weighted normal matrix is scaled by residual reduced chi-square;
+    this is conditional on selected modes and assumes independent residuals.
+    """
+    freqs = np.asarray(fit["freqs"], float)
+    beta = np.asarray(fit["beta"], float)
+    n = len(ts.t)
+    m = len(freqs)
+    p = 3 * m + baseline.shape[1]
+    result = [_empty_uncertainty_row("ill_conditioned") for _ in freqs]
+    if not m or n <= p:
+        return result
+    t = np.asarray(ts.t, float)
+    w = signal_weights(ts)
+    sw = np.sqrt(w)
+    X = design_matrix_multi(t, freqs, baseline)
+    freq_cols = []
+    for i, f in enumerate(freqs):
+        ang = 2 * np.pi * f * t
+        freq_cols.append(2 * np.pi * t * (beta[2*i] * np.cos(ang) - beta[2*i+1] * np.sin(ang)))
+    J = np.column_stack(freq_cols + [X[:, j] for j in range(X.shape[1])])
+    J *= sw[:, None]
+    scale = np.linalg.norm(J, axis=0)
+    if np.any(~np.isfinite(scale)) or np.any(scale <= 0):
+        return result
+    # Condition numbers refer to column-normalized Jacobian, avoiding false
+    # alarms caused solely by units (cycles/day vs relative-flux units).
+    try:
+        _, singular, vt = np.linalg.svd(J / scale, full_matrices=False)
+        condition = singular[0] / singular[-1] if singular[-1] > 0 else np.inf
+        if not np.isfinite(condition) or condition > UNCERTAINTY_MAX_CONDITION:
+            return result
+        residual = np.asarray(ts.y, float) - np.asarray(fit["full_model"], float)
+        chi2 = np.sum(w * residual**2)
+        variance_scale = chi2 / (n - p)
+        cov_normal = (vt.T * (1 / singular**2)) @ vt
+        cov = (cov_normal / scale[:, None] / scale[None, :]) * variance_scale
+    except (ValueError, np.linalg.LinAlgError, FloatingPointError):
+        return result
+    for i in range(m):
+        si, ci = m + 2*i, m + 2*i + 1
+        s, c = beta[2*i:2*i+2]
+        amp2 = s*s + c*c
+        if amp2 <= 0:
+            continue
+        grad_amp = np.array([s, c]) / np.sqrt(amp2)
+        grad_phase = np.array([-c, s]) / amp2
+        subcov = cov[np.ix_([si, ci], [si, ci])]
+        df2 = cov[i, i]
+        da2 = grad_amp @ subcov @ grad_amp
+        dp2 = grad_phase @ subcov @ grad_phase
+        if all(np.isfinite(x) and x >= -1e-18 for x in [df2, da2, dp2]):
+            result[i].update(f_err=float(np.sqrt(max(0, df2))),
+                             amp_err=float(np.sqrt(max(0, da2))),
+                             phase_err=float(np.sqrt(max(0, dp2))),
+                             uncertainty_status="ok")
+    return result
+
+
+def _resample_residual_blocks(ts, residual, rng):
+    """Circular block resampling within time-contiguous groups, never across gaps."""
+    t = np.asarray(ts.t, float)
+    residual = np.asarray(residual, float)
+    out = np.empty_like(residual)
+    order = np.argsort(t)
+    tsort = t[order]
+    split = np.flatnonzero(np.diff(tsort) > max(1., UNCERTAINTY_BOOT_BLOCK_DAYS*2)) + 1
+    for segment in np.split(order, split):
+        if not len(segment):
+            continue
+        tt = t[segment]
+        diffs = np.diff(tt)
+        good = diffs[np.isfinite(diffs) & (diffs > 0)]
+        dt = np.median(good) if good.size else UNCERTAINTY_BOOT_BLOCK_DAYS
+        block_n = max(1, min(len(segment), round(UNCERTAINTY_BOOT_BLOCK_DAYS / dt)))
+        positions = []
+        while len(positions) < len(segment):
+            start = int(rng.integers(0, len(segment)))
+            positions.extend(((start + np.arange(block_n)) % len(segment)).tolist())
+        out[segment] = residual[segment[np.asarray(positions[:len(segment)], int)]]
+    return out
+
+
+def _bootstrap_uncertainty(ts, fit, baseline):
+    """Refit all frequencies in each resample; keep mode IDs/order fixed."""
+    freqs = np.asarray(fit["freqs"], float)
+    m = len(freqs)
+    if not m or not _HAVE_LSQ or int(UNCERTAINTY_BOOT_N) < 2:
+        return [_empty_uncertainty_row("bootstrap_unavailable") for _ in freqs]
+    w = signal_weights(ts)
+    sw = np.sqrt(w)
+    residual = np.asarray(ts.y, float) - np.asarray(fit["full_model"], float)
+    model = np.asarray(fit["full_model"], float)
+    rng = np.random.default_rng(UNCERTAINTY_BOOT_SEED)
+    T = max(compute_T_full(ts), 1e-8)
+    halfwidth = max(GLOBAL_FREQ_BOUND_MULT / T, 1e-8)
+    lower = np.maximum(FMIN, freqs - halfwidth)
+    upper = np.minimum(FMAX, freqs + halfwidth)
+    # Original frequencies should be safely interior, including endpoints.
+    lower = np.minimum(lower, freqs - 1e-10)
+    upper = np.maximum(upper, freqs + 1e-10)
+    # At fixed labels, allow nearby optimizations only while preserving ordering.
+    for i in range(m):
+        if i and freqs[i] > freqs[i-1]:
+            mid = (freqs[i] + freqs[i-1]) / 2
+            lower[i] = max(lower[i], mid)
+            upper[i-1] = min(upper[i-1], mid)
+    draws_f, draws_a, draws_p = [], [], []
+    for rep in range(int(UNCERTAINTY_BOOT_N)):
+        yb = model + _resample_residual_blocks(ts, residual, rng)
+        def fun(ff):
+            xx = design_matrix_multi(ts.t, ff, baseline)
+            return (yb - weighted_linear_solve(yb, xx, w)["yhat"]) * sw
+        try:
+            opt = least_squares(fun, freqs, bounds=(lower, upper),
+                                method="trf", max_nfev=GLOBAL_MAX_NFEV,
+                                ftol=1e-8, xtol=1e-8, gtol=1e-8)
+            if not opt.success or not np.all(np.isfinite(opt.x)):
+                continue
+            bb = weighted_linear_solve(yb, design_matrix_multi(ts.t, opt.x, baseline), w)["beta"]
+            amps = np.hypot(bb[:2*m:2], bb[1:2*m:2])
+            phases = np.arctan2(bb[1:2*m:2], bb[:2*m:2])
+            draws_f.append(opt.x)
+            draws_a.append(amps)
+            draws_p.append(phases)
+        except (ValueError, np.linalg.LinAlgError, FloatingPointError):
+            continue
+    if len(draws_f) < max(10, int(UNCERTAINTY_BOOT_N)//2):
+        return [_empty_uncertainty_row("bootstrap_insufficient") for _ in freqs]
+    bf, ba, bp = np.asarray(draws_f), np.asarray(draws_a), np.asarray(draws_p)
+    rows = []
+    for i in range(m):
+        phase0 = float(fit["component_rows"][i]["phase"])
+        delta = np.angle(np.exp(1j * (bp[:, i] - phase0)))
+        row = _empty_uncertainty_row("ok")
+        row.update(dict(zip(("boot_f_p16", "boot_f_p50", "boot_f_p84"),
+                            np.percentile(bf[:, i], (16, 50, 84)))))
+        row.update(dict(zip(("boot_amp_p16", "boot_amp_p50", "boot_amp_p84"),
+                            np.percentile(ba[:, i], (16, 50, 84)))))
+        row["boot_phase_err"] = float(np.std(delta, ddof=1))
+        row["boot_n_success"] = int(len(draws_f))
+        rows.append(row)
+    return rows
+
+
+def attach_fit_uncertainties(ts, fit, table, baseline):
+    """Append uncertainties to the final science table, matched by final frequency.
+
+    With mode 'none' leave existing columns unchanged. Constrained q/u fits use
+    a different parameterization and must not be assigned free-fit errors.
+    """
+    mode = str(UNCERTAINTY_MODE).lower()
+    if mode == "none":
+        return table
+    out = table.copy()
+    if out.empty:
+        for key in _UNCERTAINTY_FIELDS:
+            out[key] = pd.Series(dtype=("object" if key == "uncertainty_status" else "float64"))
+        return out
+    if fit.get("quadrature_mode"):
+        rows = [_empty_uncertainty_row("quadrature_covariance_not_implemented")
+                for _ in fit.get("component_rows", [])]
+    elif "beta" not in fit or not len(fit.get("freqs", [])):
+        rows = []
+    else:
+        rows = _formal_uncertainty(ts, fit, baseline)
+        if mode == "bootstrap":
+            boot = _bootstrap_uncertainty(ts, fit, baseline)
+            for row, b in zip(rows, boot):
+                for key in _UNCERTAINTY_FIELDS:
+                    if key.startswith("boot_"):
+                        row[key] = b[key]
+                if b["uncertainty_status"] != "ok" and row["uncertainty_status"] == "ok":
+                    row["uncertainty_status"] = b["uncertainty_status"]
+    freqs = np.asarray(fit.get("freqs", []), float)
+    # Final tables can have local search order rather than global-fit order.
+    for key in _UNCERTAINTY_FIELDS:
+        values = []
+        for _, rr in out.iterrows():
+            if not len(freqs) or not np.isfinite(rr.get("f", np.nan)):
+                values.append(_empty_uncertainty_row("no_final_mode")[key]); continue
+            idx = int(np.argmin(abs(freqs - float(rr["f"]))))
+            if abs(freqs[idx] - float(rr["f"])) > max(1e-8, 1e-5 / max(compute_T_full(ts), 1e-8)):
+                values.append(_empty_uncertainty_row("frequency_mismatch")[key]); continue
+            values.append(rows[idx][key])
+        out[key] = values
+    return out
 
 # ----------------------------------------------------------------------
 # Extraction logic
@@ -3723,6 +3944,7 @@ def _run_analysis_impl():
     vprint(1, "Starting TESS-only analysis...")
     tess_local_df, tess_global_fit, tess_snapshots, tess_final_resid, freqs_tess, Pte_start, Pte_end = extract_tess_modes(tess_dt)
     tess_table = match_global_components_with_local(tess_local_df, tess_global_fit)
+    tess_table = attach_fit_uncertainties(tess_dt, tess_global_fit, tess_table, make_tess_baseline_matrix(tess_dt))
     tess_table.to_csv(tess_outdir / prefixed_output_name(tess_prefix, "peaks_table.csv"), index=False)
     pd.DataFrame(tess_global_fit["component_rows"]).to_csv(tess_outdir / prefixed_output_name(tess_prefix, "global_components_raw.csv"), index=False)
     show_table("TESS peaks_table", tess_table)
@@ -3806,6 +4028,7 @@ def _run_analysis_impl():
         Ppo_start_full = state["Ppo_start_full"]
         Ppo_end_full = state["Ppo_end_full"]
         search_df.to_csv(outdir / prefixed_output_name(channel_prefix, "matched_search_table.csv"), index=False)
+        final_df = attach_fit_uncertainties(pol_dt[k], global_fit, final_df, make_pol_baseline_matrix(pol_dt[k], trend_cfg))
         final_df.to_csv(outdir / prefixed_output_name(channel_prefix, "peaks_table.csv"), index=False)
         pd.DataFrame(global_fit["component_rows"]).to_csv(outdir / prefixed_output_name(channel_prefix, "global_components_raw.csv"), index=False)
         start_full_smoothed, _ = smooth_polarimetry_periodogram(
